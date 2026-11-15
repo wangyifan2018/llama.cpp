@@ -67,7 +67,10 @@ def main():
     codes, next_hidden, *extra = session.run(outputs, feed)
     scores = np.stack(extra[:16])
     np.testing.assert_array_equal(np.argmax(scores, axis=-1).reshape(1, 16), codes)
-    np.savez(args.output, **feed, codes=codes, next_hidden=next_hidden, scores=scores,
+    # explicit keywords, not **feed: numpy's stub types **kwds against every named
+    # parameter, so an unpacked dict cannot prove it never holds allow_pickle.
+    np.savez(args.output, hidden=hidden, noise=noise, allow_eos=feed["allow_eos"],
+             codes=codes, next_hidden=next_hidden, scores=scores,
              first_local=extra[16], first_decoded=extra[17],
              local_sequence=np.concatenate(extra[16::2], axis=1),
              decoded_steps=np.concatenate([step[:, -1:] for step in extra[17::2]], axis=1))
