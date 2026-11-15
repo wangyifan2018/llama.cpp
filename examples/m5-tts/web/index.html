@@ -180,12 +180,20 @@
       <div class="grow">
         <label class="f" for="language">语言</label>
         <select id="language">
-          <option value="zh">普通话</option>
+          <option value="zh">中文</option>
           <option value="en">英语</option>
           <option value="ja">日语</option>
           <option value="ko">韩语</option>
           <option value="de">德语</option>
           <option value="fr">法语</option>
+        </select>
+      </div>
+      <div class="grow" id="accentField">
+        <label class="f" for="accent">方言</label>
+        <select id="accent">
+          <option value="">普通话</option>
+          <option value="yue">粤语</option>
+          <option value="chuan">四川话</option>
         </select>
       </div>
       <div>
@@ -539,6 +547,8 @@
     const [voice, line] = cockpitScenes[button.dataset.scene];
     $('text').value = line;
     $('language').value = 'zh';
+    $('accent').value = '';
+    updateAccent();
     updateCount();
     const id = 'srv:' + voice;
     if ([...$('voice').options].some(option => option.value === id)) {
@@ -551,7 +561,18 @@
     $('text').focus();
   });
   $('text').addEventListener('input', () => { selectScene(null); updateCount(); });
-  $('language').addEventListener('change', () => selectScene(null));
+  function updateAccent() {
+    const chinese = $('language').value === 'zh';
+    $('accentField').hidden = !chinese;
+    $('accent').disabled = !chinese;
+    if (!chinese) $('accent').value = '';
+  }
+  $('language').addEventListener('change', () => {
+    updateAccent();
+    selectScene(null);
+  });
+  $('accent').addEventListener('change', () => selectScene(null));
+  updateAccent();
   $('voice').addEventListener('change', () => {
     localStorage.setItem(LS_VOICE, $('voice').value);
     selectScene(null);
@@ -650,11 +671,12 @@
     const t0 = performance.now();
 
     const payload = { input: text, language: $('language').value, response_format: requestFormat };
+    if (payload.language === 'zh' && $('accent').value) payload.accent = $('accent').value;
     const caption = $('caption').value.trim();
     if (caption) payload.caption = caption;
     if (voice.server) payload.voice = voice.name;
     else { payload.codes = voice.codes; payload.reference_text = voice.reference_text; }
-    log(`POST /v1/audio/speech  voice=${voice.name}${voice.server ? '' : '（本机）'} lang=${payload.language} fmt=${requestFormat}${caption ? ' caption=' + caption : ''}`);
+    log(`POST /v1/audio/speech  voice=${voice.name}${voice.server ? '' : '（本机）'} lang=${payload.language}${payload.accent ? ' accent=' + payload.accent : ''} fmt=${requestFormat}${caption ? ' caption=' + caption : ''}`);
     try {
       const resp = await fetch(api() + '/v1/audio/speech', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },

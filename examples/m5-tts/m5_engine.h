@@ -81,7 +81,7 @@ public:
 
     // Sets the free-text style/emotion caption (empty = unset).
     void set_caption(const std::string & caption);
-    bool set_language(const std::string & language);
+    bool set_language_and_accent(const std::string & language, const std::string & accent, std::string & error);
     bool validate_text(const std::string & text, std::string & error) const;
 
     // Splits and conditions the text the way M5Engine does.

@@ -57,9 +57,9 @@ constexpr int kNoiseBooks = 16;
 constexpr int kMaxTextCodepoints = 2000;
 constexpr int kMaxSegmentCodepoints = 80;
 
-std::string conditioning_prefix(const std::string & caption, const std::string & language) {
+std::string conditioning_prefix(const std::string & caption, const std::string & language, const std::string & accent) {
     return "<|caption_begin|>" + caption +
-           "<|caption_end|><|accent_begin|><|accent_end|>"
+           "<|caption_end|><|accent_begin|>" + accent + "<|accent_end|>"
            "<|speaker_start|>None<|speaker_end|><|lang_begin|>" + language + "<|lang_end|>";
 }
 
@@ -1168,6 +1168,7 @@ struct Engine::Impl {
     Timings timings;
     std::unique_ptr<JavaRandom> rng;
     std::string language = "Chinese";
+    std::string accent;
     int min_frames = 6;
     int max_sequence = 2048;
     bool opened = false;
@@ -1198,7 +1199,7 @@ bool Engine::Impl::segment(const std::vector<long> & tokens, WavWriter & wav, co
     // for every request on this voice. When the byte-level BPE splits cleanly -
     // the shared ids are a prefix of the full sequence - the stage can keep that
     // block's KV and only prefill the new text plus the reference audio codes.
-    const std::string shared_text = conditioning_prefix(trim(options.caption), language) + trim(voice.reference);
+    const std::string shared_text = conditioning_prefix(trim(options.caption), language, accent) + trim(voice.reference);
     int shared_len = 0;
     if (backbone.supports_prefill()) {
         // Byte-level BPE can merge the reference's last characters with the
@@ -1474,6 +1475,7 @@ bool Engine::open(const Options & options, std::string & error) {
     Impl & impl = *impl_;
     impl.options = options;
     impl.language = "Chinese";
+    impl.accent.clear();
     impl.dump_codes_path = options.dump_codes;
     const std::string root = options.model_dir;
 
@@ -1528,25 +1530,49 @@ std::string Engine::condition(const std::string & text) const {
     const std::string combined = trim(impl_->voice.reference) + trim(text);
     const std::string caption = trim(impl_->options.caption);
     if (has_conditioning_marker(combined) || has_conditioning_marker(caption)) return {};
-    return conditioning_prefix(caption, impl_->language) + combined;
+    return conditioning_prefix(caption, impl_->language, impl_->accent) + combined;
 }
 
 void Engine::set_caption(const std::string & caption) {
     impl_->options.caption = caption;
 }
 
-bool Engine::set_language(const std::string & language) {
-    std::string value = trim(language);
-    for (char & ch : value) {
-        if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
+bool Engine::set_language_and_accent(const std::string & language, const std::string & accent, std::string & error) {
+    const auto normalize = [](std::string value) {
+        value = trim(value);
+        for (char & ch : value) {
+            if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
+        }
+        return value;
+    };
+
+    const std::string value = normalize(language);
+    const char * model_language;
+    if (value == "zh" || value == "chinese") model_language = "Chinese";
+    else if (value == "en" || value == "english") model_language = "English";
+    else if (value == "ja" || value == "japanese") model_language = "Japanese";
+    else if (value == "ko" || value == "korean") model_language = "Korean";
+    else if (value == "de" || value == "german") model_language = "German";
+    else if (value == "fr" || value == "french") model_language = "French";
+    else {
+        error = "language must be zh, en, ja, ko, de or fr (or its English name)";
+        return false;
     }
-    if (value == "zh" || value == "chinese") impl_->language = "Chinese";
-    else if (value == "en" || value == "english") impl_->language = "English";
-    else if (value == "ja" || value == "japanese") impl_->language = "Japanese";
-    else if (value == "ko" || value == "korean") impl_->language = "Korean";
-    else if (value == "de" || value == "german") impl_->language = "German";
-    else if (value == "fr" || value == "french") impl_->language = "French";
-    else return false;
+
+    std::string model_accent = normalize(accent);
+    if (!model_accent.empty()) {
+        if (model_accent != "yue" && model_accent != "chuan") {
+            error = "accent must be empty, yue or chuan";
+            return false;
+        }
+        if (value != "zh" && value != "chinese") {
+            error = "accent requires Chinese (language zh)";
+            return false;
+        }
+    }
+
+    impl_->language = model_language;
+    impl_->accent = std::move(model_accent);
     return true;
 }
 

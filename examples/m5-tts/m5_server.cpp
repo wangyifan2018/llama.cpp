@@ -1183,11 +1183,19 @@ int main(int argc, char ** argv) {
             return;
         }
 
+        std::string accent;
+        size_t accent_at;
+        if (find_key(req.body, "accent", accent_at) &&
+            !parse_json_string(req.body, accent_at, accent)) {
+            send_error(res, 400, "accent must be a string");
+            return;
+        }
+
         const std::string voice_name = voice.empty() ? st.default_voice : voice;
         std::unique_lock<std::mutex> lock(st.render_mutex);
         std::string err;
-        if (!st.engine.set_language(language)) {
-            send_error(res, 400, "language must be zh, en, ja, ko, de or fr (or its English name)");
+        if (!st.engine.set_language_and_accent(language, accent, err)) {
+            send_error(res, 400, err);
             return;
         }
         if (!apply_voice_req(st, req.body, voice, err)) {
@@ -1205,13 +1213,13 @@ int main(int argc, char ** argv) {
             auto stream = std::make_shared<PcmStream>();
             const std::string body = req.body;
             // The HTTP provider owns the stream and joins this worker on release.
-            stream->worker = std::thread([&st, stream = stream.get(), text, voice, body, language] {
+            stream->worker = std::thread([&st, stream = stream.get(), text, voice, body, language, accent] {
                 {
                     std::lock_guard<std::mutex> lock(st.render_mutex);
                     std::string err;
-                    st.engine.set_language(language);
-                    if (!apply_voice_req(st, body, voice, err)) {
-                        fprintf(stderr, "[m5-server] pcm voice apply failed: %s\n", err.c_str());
+                    if (!st.engine.set_language_and_accent(language, accent, err) ||
+                        !apply_voice_req(st, body, voice, err)) {
+                        fprintf(stderr, "[m5-server] pcm request setup failed: %s\n", err.c_str());
                         record_stat(st, make_stat(voice, "pcm", text, m5::Stats(), false));
                         stream->finish();
                         return;
