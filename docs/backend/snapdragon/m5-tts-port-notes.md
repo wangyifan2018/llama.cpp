@@ -1086,7 +1086,9 @@ NDK 28 / clang 19 重编、改成动态链接 libc++、去掉计时插桩都复�
 
 ### Codec 深度量化：ConvTranspose→MatMul + 全 int8 + 融合 Snake（2026-11-14 下午）
 
-三步递进，长句（115 帧、9.10 s 音频、3 线程）实测：
+三步递进，长句（115 帧、9.10 s 音频、3 线程）实测（"三步"是三个概念动作；落到脚本上是
+**四次 ONNX 重写**——int8 权重分两遍做，Conv 一遍、MatMul 一遍，缺一遍体积就对不上，
+命令与体积指纹见 `examples/m5-tts/MODEL_PACKAGE.md` §3）：
 
 | 模型 | 体积 | RTF | codec | depth | 质量（vs fp32） |
 | --- | ---: | ---: | ---: | ---: | --- |
@@ -1095,7 +1097,9 @@ NDK 28 / clang 19 重编、改成动态链接 libc++、去掉计时插桩都复�
 | ctmm-q（+CT→MatMul int8） | 141 MB | 0.873 | 6.08 s | 6.87 s | corr 0.973 / 12.8 dB |
 | **snake（+融合 Snake 算子）** | 141 MB | **0.837** | **4.68 s** | **6.60 s** | 同种子 corr 0.9998 |
 
-构建流水线（全部可复现，`examples/m5-tts/`）：
+构建流水线（全部可复现，`examples/m5-tts/`；完整产物清单、命令与哈希见
+[`examples/m5-tts/MODEL_PACKAGE.md`](../../examples/m5-tts/MODEL_PACKAGE.md)，
+幂等驱动脚本 `examples/m5-tts/reproduce.sh`）：
 
 1. `decompose_convtranspose.py`：6 个 ConvTranspose → 单 MatMul + 交错/pad。
    数学恒等（pad=0/dil=1/group=1，K=S 或 K=2S）：out[b,c,i*S+r] += x[b,:,i]@W[:,c,r]
