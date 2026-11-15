@@ -1,0 +1,25 @@
+warm_hit_1 first=0.410 elapsed=2.445 backbone=0.362
+warm_hit_2 first=0.414 elapsed=3.095 backbone=0.449
+warm_hit_3 first=0.412 elapsed=2.682 backbone=0.388
+warm_hit_4 first=0.412 elapsed=2.814 backbone=0.397
+=== engine prefix-xfer lines ===
+[m5] prefix-xfer sh=32 rs=71 hdr=0.06 shared=1.31 rest=49.00 wait=101.25 total=151.62 ms
+[m5] prefix-xfer sh=32 rs=82 hdr=0.17 shared=3.38 rest=8.86 wait=97.42 total=109.83 ms
+[m5] prefix-xfer sh=32 rs=85 hdr=0.11 shared=2.00 rest=7.01 wait=98.13 total=107.24 ms
+[m5] prefix-xfer sh=32 rs=82 hdr=0.12 shared=2.50 rest=7.82 wait=94.55 total=104.99 ms
+[m5] prefix-xfer sh=32 rs=79 hdr=0.07 shared=2.07 rest=12.41 wait=85.57 total=100.13 ms
+=== stage hit lines ===
+m5-stage prefix hit sh=32 discard_ms=4.275
+m5-stage prefix hit sh=32 discard_ms=2.167
+m5-stage prefix hit sh=32 discard_ms=3.303
+m5-stage prefix hit sh=32 discard_ms=2.153
+=== prefix row stats ===
+[m5] prefix shared=32 of 34 (full 49)
+[m5] prefix shared=32 text=17 codes=65
+[m5] prefix shared=32 of 34 (full 52)
+[m5] prefix shared=32 text=20 codes=65
+[m5] prefix shared=32 of 34 (full 49)
+[m5] prefix shared=32 text=17 codes=65
+[m5] prefix shared=32 of 34 (full 46)
+[m5] prefix shared=32 text=14 codes=65
+DONE

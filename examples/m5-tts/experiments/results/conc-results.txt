@@ -1,0 +1,173 @@
+# Sun Nov 15 07:30:10 CST 2026 host=127.0.0.1:18080 text_len=26
+BATCH tag=wav1r1 conc=1 fmt=wav wall_ms=3736
+REQ tag=wav1r1 conc=1 idx=1 ttfb_total_bytes=3.592997 3.593943 255404 first_pcm=X-M5-RTF,
+0.272 frames=X-M5-RTF,
+69 elapsed=X-M5-RTF,
+3.569
+BATCH tag=wav2r1 conc=2 fmt=wav wall_ms=7397
+REQ tag=wav2r1 conc=2 idx=1 ttfb_total_bytes=3.612141 3.614004 255404 first_pcm=X-M5-RTF,
+0.264 frames=X-M5-RTF,
+69 elapsed=X-M5-RTF,
+3.584
+REQ tag=wav2r1 conc=2 idx=2 ttfb_total_bytes=7.212489 7.213186 255404 first_pcm=X-M5-RTF,
+0.269 frames=X-M5-RTF,
+69 elapsed=X-M5-RTF,
+3.592
+BATCH tag=wav4r1 conc=4 fmt=wav wall_ms=14585
+REQ tag=wav4r1 conc=4 idx=1 ttfb_total_bytes=14.364554 14.366908 255404 first_pcm=X-M5-RTF,
+0.289 frames=X-M5-RTF,
+69 elapsed=X-M5-RTF,
+3.577
+REQ tag=wav4r1 conc=4 idx=2 ttfb_total_bytes=3.615265 3.616141 255404 first_pcm=X-M5-RTF,
+0.272 frames=X-M5-RTF,
+69 elapsed=X-M5-RTF,
+3.581
+REQ tag=wav4r1 conc=4 idx=3 ttfb_total_bytes=7.194685 7.195494 255404 first_pcm=X-M5-RTF,
+0.264 frames=X-M5-RTF,
+69 elapsed=X-M5-RTF,
+3.568
+REQ tag=wav4r1 conc=4 idx=4 ttfb_total_bytes=10.774462 10.775649 255404 first_pcm=X-M5-RTF,
+0.265 frames=X-M5-RTF,
+69 elapsed=X-M5-RTF,
+3.568
+BATCH tag=pcm1r1 conc=1 fmt=pcm wall_ms=3719
+REQ tag=pcm1r1 conc=1 idx=1 ttfb_total_bytes=0.010681 3.581434 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+BATCH tag=pcm2r1 conc=2 fmt=pcm wall_ms=7340
+REQ tag=pcm2r1 conc=2 idx=1 ttfb_total_bytes=0.014723 3.607267 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm2r1 conc=2 idx=2 ttfb_total_bytes=0.015085 7.195791 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+BATCH tag=pcm4r1 conc=4 fmt=pcm wall_ms=14663
+REQ tag=pcm4r1 conc=4 idx=1 ttfb_total_bytes=0.016866 3.621409 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm4r1 conc=4 idx=2 ttfb_total_bytes=3.622753 14.433725 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm4r1 conc=4 idx=3 ttfb_total_bytes=0.017903 10.831935 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm4r1 conc=4 idx=4 ttfb_total_bytes=0.017671 7.216352 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+BATCH tag=pcm8r1 conc=8 fmt=pcm wall_ms=29101
+REQ tag=pcm8r1 conc=8 idx=1 ttfb_total_bytes=3.626303 21.627387 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm8r1 conc=8 idx=2 ttfb_total_bytes=3.621218 18.026943 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm8r1 conc=8 idx=3 ttfb_total_bytes=3.620936 14.429779 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm8r1 conc=8 idx=4 ttfb_total_bytes=10.827807 25.258725 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm8r1 conc=8 idx=5 ttfb_total_bytes=3.624779 7.220750 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm8r1 conc=8 idx=6 ttfb_total_bytes=18.028091 28.861906 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm8r1 conc=8 idx=7 ttfb_total_bytes=0.023210 10.826501 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm8r1 conc=8 idx=8 ttfb_total_bytes=0.023235 3.619408 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+BATCH tag=wav1r2 conc=1 fmt=wav wall_ms=3792
+REQ tag=wav1r2 conc=1 idx=1 ttfb_total_bytes=3.636318 3.639835 255404 first_pcm=X-M5-RTF,
+0.296 frames=X-M5-RTF,
+69 elapsed=X-M5-RTF,
+3.604
+BATCH tag=wav2r2 conc=2 fmt=wav wall_ms=7425
+REQ tag=wav2r2 conc=2 idx=1 ttfb_total_bytes=3.645599 3.647637 255404 first_pcm=X-M5-RTF,
+0.294 frames=X-M5-RTF,
+69 elapsed=X-M5-RTF,
+3.618
+REQ tag=wav2r2 conc=2 idx=2 ttfb_total_bytes=7.255808 7.264504 255404 first_pcm=X-M5-RTF,
+0.289 frames=X-M5-RTF,
+69 elapsed=X-M5-RTF,
+3.607
+BATCH tag=wav4r2 conc=4 fmt=wav wall_ms=14934
+REQ tag=wav4r2 conc=4 idx=1 ttfb_total_bytes=14.528098 14.528905 255404 first_pcm=X-M5-RTF,
+0.277 frames=X-M5-RTF,
+69 elapsed=X-M5-RTF,
+3.625
+REQ tag=wav4r2 conc=4 idx=2 ttfb_total_bytes=10.893403 10.895360 255404 first_pcm=X-M5-RTF,
+0.274 frames=X-M5-RTF,
+69 elapsed=X-M5-RTF,
+3.625
+REQ tag=wav4r2 conc=4 idx=3 ttfb_total_bytes=7.255036 7.260171 255404 first_pcm=X-M5-RTF,
+0.269 frames=X-M5-RTF,
+69 elapsed=X-M5-RTF,
+3.608
+REQ tag=wav4r2 conc=4 idx=4 ttfb_total_bytes=3.640152 3.642226 255404 first_pcm=X-M5-RTF,
+0.273 frames=X-M5-RTF,
+69 elapsed=X-M5-RTF,
+3.605
+BATCH tag=pcm1r2 conc=1 fmt=pcm wall_ms=3765
+REQ tag=pcm1r2 conc=1 idx=1 ttfb_total_bytes=0.014509 3.607544 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+BATCH tag=pcm2r2 conc=2 fmt=pcm wall_ms=7367
+REQ tag=pcm2r2 conc=2 idx=1 ttfb_total_bytes=0.014337 3.618458 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm2r2 conc=2 idx=2 ttfb_total_bytes=0.015085 7.205103 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+BATCH tag=pcm4r2 conc=4 fmt=pcm wall_ms=14714
+REQ tag=pcm4r2 conc=4 idx=1 ttfb_total_bytes=3.628556 10.870078 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm4r2 conc=4 idx=2 ttfb_total_bytes=0.018095 7.246622 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm4r2 conc=4 idx=3 ttfb_total_bytes=3.632198 14.484213 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm4r2 conc=4 idx=4 ttfb_total_bytes=0.017245 3.628119 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+BATCH tag=pcm8r2 conc=8 fmt=pcm wall_ms=29198
+REQ tag=pcm8r2 conc=8 idx=1 ttfb_total_bytes=10.868763 25.349762 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm8r2 conc=8 idx=2 ttfb_total_bytes=0.026507 7.253203 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm8r2 conc=8 idx=3 ttfb_total_bytes=0.029451 18.104342 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm8r2 conc=8 idx=4 ttfb_total_bytes=0.026891 10.868624 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm8r2 conc=8 idx=5 ttfb_total_bytes=0.029276 21.721273 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm8r2 conc=8 idx=6 ttfb_total_bytes=0.029154 3.626186 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm8r2 conc=8 idx=7 ttfb_total_bytes=0.025081 14.481958 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm8r2 conc=8 idx=8 ttfb_total_bytes=21.722237 28.968458 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+BATCH tag=wav1r3 conc=1 fmt=wav wall_ms=3765
+REQ tag=wav1r3 conc=1 idx=1 ttfb_total_bytes=3.632774 3.634468 255404 first_pcm=X-M5-RTF,
+0.271 frames=X-M5-RTF,
+69 elapsed=X-M5-RTF,
+3.603
+BATCH tag=wav2r3 conc=2 fmt=wav wall_ms=7422
+REQ tag=wav2r3 conc=2 idx=1 ttfb_total_bytes=3.638554 3.641169 255404 first_pcm=X-M5-RTF,
+0.271 frames=X-M5-RTF,
+69 elapsed=X-M5-RTF,
+3.607
+REQ tag=wav2r3 conc=2 idx=2 ttfb_total_bytes=7.260273 7.262250 255404 first_pcm=X-M5-RTF,
+0.290 frames=X-M5-RTF,
+69 elapsed=X-M5-RTF,
+3.612
+BATCH tag=wav4r3 conc=4 fmt=wav wall_ms=14718
+REQ tag=wav4r3 conc=4 idx=1 ttfb_total_bytes=3.630186 3.635301 255404 first_pcm=X-M5-RTF,
+0.269 frames=X-M5-RTF,
+69 elapsed=X-M5-RTF,
+3.597
+REQ tag=wav4r3 conc=4 idx=2 ttfb_total_bytes=14.494622 14.497726 255404 first_pcm=X-M5-RTF,
+0.310 frames=X-M5-RTF,
+69 elapsed=X-M5-RTF,
+3.627
+REQ tag=wav4r3 conc=4 idx=3 ttfb_total_bytes=10.857467 10.861072 255404 first_pcm=X-M5-RTF,
+0.272 frames=X-M5-RTF,
+69 elapsed=X-M5-RTF,
+3.617
+REQ tag=wav4r3 conc=4 idx=4 ttfb_total_bytes=7.227494 7.230069 255404 first_pcm=X-M5-RTF,
+0.260 frames=X-M5-RTF,
+69 elapsed=X-M5-RTF,
+3.586
+BATCH tag=pcm1r3 conc=1 fmt=pcm wall_ms=3757
+REQ tag=pcm1r3 conc=1 idx=1 ttfb_total_bytes=0.010795 3.608543 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+BATCH tag=pcm2r3 conc=2 fmt=pcm wall_ms=7407
+REQ tag=pcm2r3 conc=2 idx=1 ttfb_total_bytes=0.011236 7.243910 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm2r3 conc=2 idx=2 ttfb_total_bytes=0.010168 3.625222 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+BATCH tag=pcm4r3 conc=4 fmt=pcm wall_ms=14658
+REQ tag=pcm4r3 conc=4 idx=1 ttfb_total_bytes=0.019744 14.428394 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm4r3 conc=4 idx=2 ttfb_total_bytes=0.019244 7.230937 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm4r3 conc=4 idx=3 ttfb_total_bytes=0.019935 10.825193 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm4r3 conc=4 idx=4 ttfb_total_bytes=0.019025 3.620603 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+BATCH tag=pcm8r3 conc=8 fmt=pcm wall_ms=29215
+REQ tag=pcm8r3 conc=8 idx=1 ttfb_total_bytes=7.230883 25.358883 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm8r3 conc=8 idx=2 ttfb_total_bytes=0.023612 10.849957 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm8r3 conc=8 idx=3 ttfb_total_bytes=0.025388 3.630497 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm8r3 conc=8 idx=4 ttfb_total_bytes=0.025759 14.463685 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm8r3 conc=8 idx=5 ttfb_total_bytes=3.628069 21.745550 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm8r3 conc=8 idx=6 ttfb_total_bytes=0.025288 7.229053 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm8r3 conc=8 idx=7 ttfb_total_bytes=0.027065 18.134363 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+REQ tag=pcm8r3 conc=8 idx=8 ttfb_total_bytes=7.230049 28.982296 255360 first_pcm=X-M5-RTF, frames=X-M5-RTF, elapsed=X-M5-RTF,
+--- wav hashes ---
+wav1 r1 #1 2f30728f4d6f
+wav2 r1 #1 2f30728f4d6f
+wav2 r1 #2 2f30728f4d6f
+wav4 r1 #1 2f30728f4d6f
+wav4 r1 #2 2f30728f4d6f
+wav4 r1 #3 2f30728f4d6f
+wav4 r1 #4 2f30728f4d6f
+wav1 r2 #1 2f30728f4d6f
+wav2 r2 #1 2f30728f4d6f
+wav2 r2 #2 2f30728f4d6f
+wav4 r2 #1 2f30728f4d6f
+wav4 r2 #2 2f30728f4d6f
+wav4 r2 #3 2f30728f4d6f
+wav4 r2 #4 2f30728f4d6f
+wav1 r3 #1 2f30728f4d6f
+wav2 r3 #1 2f30728f4d6f
+wav2 r3 #2 2f30728f4d6f
+wav4 r3 #1 2f30728f4d6f
+wav4 r3 #2 2f30728f4d6f
+wav4 r3 #3 2f30728f4d6f
+wav4 r3 #4 2f30728f4d6f

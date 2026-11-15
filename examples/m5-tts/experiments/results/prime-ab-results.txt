@@ -1,0 +1,43 @@
+=== round 1 cap=0 ===
+r1_s1 cap=0 voice=serena fmt=wav first=0.466 elapsed=4.105 rtf=0.771679 frames=69 sha=405830fa36aa638c
+r1_o1 cap=0 voice=官方样例 fmt=wav first=0.471 elapsed=4.600 rtf=0.761547 frames=78 sha=7e834c986b335e0b
+r1_s2 cap=0 voice=serena fmt=wav first=0.499 elapsed=4.109 rtf=0.772382 frames=69 sha=405830fa36aa638c
+r1_o2 cap=0 voice=官方样例 fmt=wav first=0.462 elapsed=4.568 rtf=0.756365 frames=78 sha=7e834c986b335e0b
+r1_s3 cap=0 voice=serena fmt=wav first=0.500 elapsed=4.147 rtf=0.779458 frames=69 sha=405830fa36aa638c
+r1_ps cap=0 voice=serena fmt=pcm first=0.338 elapsed=3.669 rtf=0.69 frames=69 sha=none
+=== round 2 cap=1 ===
+r2_s1 cap=1 voice=serena fmt=wav first=0.431 elapsed=4.072 rtf=0.765499 frames=69 sha=405830fa36aa638c
+r2_o1 cap=1 voice=官方样例 fmt=wav first=0.466 elapsed=4.561 rtf=0.755163 frames=78 sha=7e834c986b335e0b
+r2_s2 cap=1 voice=serena fmt=wav first=0.528 elapsed=4.094 rtf=0.76961 frames=69 sha=405830fa36aa638c
+r2_o2 cap=1 voice=官方样例 fmt=wav first=0.462 elapsed=4.525 rtf=0.749134 frames=78 sha=7e834c986b335e0b
+r2_s3 cap=1 voice=serena fmt=wav first=0.519 elapsed=4.149 rtf=0.779869 frames=69 sha=405830fa36aa638c
+r2_ps cap=1 voice=serena fmt=pcm first=0.278 elapsed=3.621 rtf=0.681 frames=69 sha=none
+=== round 3 cap=4 ===
+r3_s1 cap=4 voice=serena fmt=wav first=0.425 elapsed=4.077 rtf=0.766442 frames=69 sha=405830fa36aa638c
+r3_o1 cap=4 voice=官方样例 fmt=wav first=0.469 elapsed=4.571 rtf=0.756837 frames=78 sha=7e834c986b335e0b
+r3_s2 cap=4 voice=serena fmt=wav first=0.469 elapsed=4.099 rtf=0.770489 frames=69 sha=405830fa36aa638c
+r3_o2 cap=4 voice=官方样例 fmt=wav first=0.422 elapsed=4.492 rtf=0.74375 frames=78 sha=7e834c986b335e0b
+r3_s3 cap=4 voice=serena fmt=wav first=0.460 elapsed=4.073 rtf=0.765525 frames=69 sha=405830fa36aa638c
+r3_ps cap=4 voice=serena fmt=pcm first=0.276 elapsed=3.61 rtf=0.678 frames=69 sha=none
+=== round 4 cap=4 ===
+r4_s1 cap=4 voice=serena fmt=wav first=0.425 elapsed=4.035 rtf=0.758423 frames=69 sha=405830fa36aa638c
+r4_o1 cap=4 voice=官方样例 fmt=wav first=0.458 elapsed=4.537 rtf=0.75123 frames=78 sha=7e834c986b335e0b
+r4_s2 cap=4 voice=serena fmt=wav first=0.500 elapsed=4.202 rtf=0.789925 frames=69 sha=405830fa36aa638c
+r4_o2 cap=4 voice=官方样例 fmt=wav first=0.452 elapsed=4.467 rtf=0.739641 frames=78 sha=7e834c986b335e0b
+r4_s3 cap=4 voice=serena fmt=wav first=0.465 elapsed=4.084 rtf=0.767648 frames=69 sha=405830fa36aa638c
+r4_ps cap=4 voice=serena fmt=pcm first=0.28 elapsed=3.619 rtf=0.68 frames=69 sha=none
+=== round 5 cap=1 ===
+r5_s1 cap=1 voice=serena fmt=wav first=0.427 elapsed=4.090 rtf=0.768756 frames=69 sha=405830fa36aa638c
+r5_o1 cap=1 voice=官方样例 fmt=wav first=0.472 elapsed=4.552 rtf=0.753593 frames=78 sha=7e834c986b335e0b
+r5_s2 cap=1 voice=serena fmt=wav first=0.509 elapsed=4.109 rtf=0.772348 frames=69 sha=405830fa36aa638c
+r5_o2 cap=1 voice=官方样例 fmt=wav first=0.467 elapsed=4.494 rtf=0.744031 frames=78 sha=7e834c986b335e0b
+r5_s3 cap=1 voice=serena fmt=wav first=0.491 elapsed=4.085 rtf=0.767856 frames=69 sha=405830fa36aa638c
+r5_ps cap=1 voice=serena fmt=pcm first=0.291 elapsed=3.614 rtf=0.679 frames=69 sha=none
+=== round 6 cap=0 ===
+r6_s1 cap=0 voice=serena fmt=wav first=0.468 elapsed=4.152 rtf=0.780393 frames=69 sha=405830fa36aa638c
+r6_o1 cap=0 voice=官方样例 fmt=wav first=0.465 elapsed=4.572 rtf=0.757007 frames=78 sha=7e834c986b335e0b
+r6_s2 cap=0 voice=serena fmt=wav first=0.500 elapsed=4.125 rtf=0.775365 frames=69 sha=405830fa36aa638c
+r6_o2 cap=0 voice=官方样例 fmt=wav first=0.461 elapsed=4.521 rtf=0.748484 frames=78 sha=7e834c986b335e0b
+r6_s3 cap=0 voice=serena fmt=wav first=0.499 elapsed=4.123 rtf=0.774952 frames=69 sha=405830fa36aa638c
+r6_ps cap=0 voice=serena fmt=pcm first=0.334 elapsed=3.672 rtf=0.69 frames=69 sha=none
+DONE

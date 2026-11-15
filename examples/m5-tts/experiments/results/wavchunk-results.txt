@@ -1,0 +1,25 @@
+r1:4/16:1 elapsed=4.164 frames=69 first=0.412 bb=0.600 dp=2.814 cd=2.330 ms_per_frame=60.35 wav=405830fa36aa
+r1:4/16:2 elapsed=3.977 frames=69 first=0.411 bb=0.588 dp=2.687 cd=2.268 ms_per_frame=57.64 wav=405830fa36aa
+r1:4/16:3 elapsed=3.984 frames=69 first=0.408 bb=0.594 dp=2.676 cd=2.254 ms_per_frame=57.74 wav=405830fa36aa
+r1:2/4:1 elapsed=3.607 frames=69 first=0.270 bb=0.618 dp=2.793 cd=2.468 ms_per_frame=52.28 wav=2f30728f4d6f
+r1:2/4:2 elapsed=3.590 frames=69 first=0.272 bb=0.617 dp=2.777 cd=2.454 ms_per_frame=52.03 wav=2f30728f4d6f
+r1:2/4:3 elapsed=3.596 frames=69 first=0.267 bb=0.616 dp=2.784 cd=2.479 ms_per_frame=52.12 wav=2f30728f4d6f
+r1:2/16:1 elapsed=3.976 frames=69 first=0.286 bb=0.603 dp=2.688 cd=2.334 ms_per_frame=57.62 wav=2f30728f4d6f
+r1:2/16:2 elapsed=3.930 frames=69 first=0.287 bb=0.595 dp=2.721 cd=2.259 ms_per_frame=56.96 wav=2f30728f4d6f
+r1:2/16:3 elapsed=3.926 frames=69 first=0.260 bb=0.595 dp=2.747 cd=2.238 ms_per_frame=56.90 wav=2f30728f4d6f
+r1:4/8:1 elapsed=3.733 frames=69 first=0.406 bb=0.596 dp=2.765 cd=2.307 ms_per_frame=54.10 wav=405830fa36aa
+r1:4/8:2 elapsed=3.732 frames=69 first=0.404 bb=0.604 dp=2.758 cd=2.344 ms_per_frame=54.09 wav=405830fa36aa
+r1:4/8:3 elapsed=3.724 frames=69 first=0.403 bb=0.602 dp=2.756 cd=2.309 ms_per_frame=53.97 wav=405830fa36aa
+r2:4/8:1 elapsed=3.804 frames=69 first=0.411 bb=0.606 dp=2.813 cd=2.410 ms_per_frame=55.13 wav=405830fa36aa
+r2:4/8:2 elapsed=3.729 frames=69 first=0.442 bb=0.607 dp=2.751 cd=2.365 ms_per_frame=54.04 wav=405830fa36aa
+r2:4/8:3 elapsed=3.723 frames=69 first=0.402 bb=0.604 dp=2.751 cd=2.371 ms_per_frame=53.96 wav=405830fa36aa
+r2:2/16:1 elapsed=3.991 frames=69 first=0.267 bb=0.590 dp=2.709 cd=2.338 ms_per_frame=57.84 wav=2f30728f4d6f
+r2:2/16:2 elapsed=3.933 frames=69 first=0.275 bb=0.598 dp=2.688 cd=2.230 ms_per_frame=57.00 wav=2f30728f4d6f
+r2:2/16:3 elapsed=3.965 frames=69 first=0.261 bb=0.602 dp=2.715 cd=2.284 ms_per_frame=57.46 wav=2f30728f4d6f
+r2:2/4:1 elapsed=3.619 frames=69 first=0.284 bb=0.623 dp=2.801 cd=2.532 ms_per_frame=52.45 wav=2f30728f4d6f
+r2:2/4:2 elapsed=3.594 frames=69 first=0.259 bb=0.616 dp=2.777 cd=2.455 ms_per_frame=52.09 wav=2f30728f4d6f
+r2:2/4:3 elapsed=3.588 frames=69 first=0.260 bb=0.619 dp=2.775 cd=2.450 ms_per_frame=52.00 wav=2f30728f4d6f
+r2:4/16:1 elapsed=4.034 frames=69 first=0.428 bb=0.597 dp=2.712 cd=2.302 ms_per_frame=58.46 wav=405830fa36aa
+r2:4/16:2 elapsed=4.002 frames=69 first=0.406 bb=0.598 dp=2.695 cd=2.243 ms_per_frame=58.00 wav=405830fa36aa
+r2:4/16:3 elapsed=4.000 frames=69 first=0.402 bb=0.603 dp=2.688 cd=2.229 ms_per_frame=57.97 wav=405830fa36aa
+DONE

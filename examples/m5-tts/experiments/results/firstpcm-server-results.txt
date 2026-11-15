@@ -1,0 +1,13 @@
+--- wav: same voice repeated, then voice switch, then back ---
+wav 01_serena_cold voice=serena first=0.507 elapsed=4.145 frames=69
+wav 02_serena_hit1 voice=serena first=0.426 elapsed=4.046 frames=69
+wav 03_serena_hit2 voice=serena first=0.426 elapsed=4.017 frames=69
+wav 04_serena_othertext voice=serena first=0.436 elapsed=3.401 frames=63
+wav 05_official voice=官方样例 first=0.463 elapsed=4.559 frames=78
+wav 06_back_serena_cold voice=serena first=0.497 elapsed=4.117 frames=69
+wav 07_back_serena_hit voice=serena first=0.416 elapsed=4.050 frames=69
+--- pcm (Web default): cold then repeated ---
+pcm 08_pcm_cold voice=serena first=0.276 elapsed=3.626 frames=69
+pcm 09_pcm_hit1 voice=serena first=0.307 elapsed=3.632 frames=69
+pcm 10_pcm_hit2 voice=serena first=0.301 elapsed=3.612 frames=69
+DONE

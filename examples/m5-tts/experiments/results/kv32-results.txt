@@ -1,0 +1,13 @@
+r1:A_default_kv32 {"audio_s":5.3200,"elapsed_s":3.7238,"rtf":0.7000,"backbone_s":0.723,"depth_s":2.804,"codec_s":2.793,"first_pcm_s":0.399,"frames":69,"segments":2} H=2f30728f4d6f3658,c5166f237f463e09,
+r1:B_pad256 {"audio_s":5.3200,"elapsed_s":4.1539,"rtf":0.7808,"backbone_s":0.713,"depth_s":3.241,"codec_s":2.762,"first_pcm_s":0.375,"frames":69,"segments":2} H=2f30728f4d6f3658,c5166f237f463e09,
+r1:C_nodirectv {"audio_s":5.3200,"elapsed_s":3.8603,"rtf":0.7256,"backbone_s":0.726,"depth_s":2.938,"codec_s":2.705,"first_pcm_s":0.364,"frames":69,"segments":2} H=2f30728f4d6f3658,c5166f237f463e09,
+r2:C_nodirectv {"audio_s":5.3200,"elapsed_s":3.9187,"rtf":0.7366,"backbone_s":0.727,"depth_s":2.997,"codec_s":2.739,"first_pcm_s":0.410,"frames":69,"segments":2} H=2f30728f4d6f3658,c5166f237f463e09,
+r2:B_pad256 {"audio_s":5.3200,"elapsed_s":4.1719,"rtf":0.7842,"backbone_s":0.701,"depth_s":3.276,"codec_s":2.733,"first_pcm_s":0.387,"frames":69,"segments":2} H=2f30728f4d6f3658,c5166f237f463e09,
+r2:A_default_kv32 {"audio_s":5.3200,"elapsed_s":3.7790,"rtf":0.7103,"backbone_s":0.723,"depth_s":2.859,"codec_s":2.852,"first_pcm_s":0.472,"frames":69,"segments":2} H=2f30728f4d6f3658,c5166f237f463e09,
+r3:A_default_kv32 {"audio_s":5.3200,"elapsed_s":3.7714,"rtf":0.7089,"backbone_s":0.728,"depth_s":2.846,"codec_s":2.829,"first_pcm_s":0.439,"frames":69,"segments":2} H=2f30728f4d6f3658,c5166f237f463e09,
+r3:B_pad256 {"audio_s":5.3200,"elapsed_s":4.1855,"rtf":0.7867,"backbone_s":0.715,"depth_s":3.273,"codec_s":2.831,"first_pcm_s":0.436,"frames":69,"segments":2} H=2f30728f4d6f3658,c5166f237f463e09,
+r3:C_nodirectv {"audio_s":5.3200,"elapsed_s":3.8703,"rtf":0.7275,"backbone_s":0.724,"depth_s":2.951,"codec_s":2.699,"first_pcm_s":0.359,"frames":69,"segments":2} H=2f30728f4d6f3658,c5166f237f463e09,
+r4:C_nodirectv {"audio_s":5.3200,"elapsed_s":3.9420,"rtf":0.7410,"backbone_s":0.759,"depth_s":2.989,"codec_s":2.742,"first_pcm_s":0.439,"frames":69,"segments":2} H=2f30728f4d6f3658,c5166f237f463e09,
+r4:B_pad256 {"audio_s":5.3200,"elapsed_s":4.1540,"rtf":0.7808,"backbone_s":0.708,"depth_s":3.250,"codec_s":2.803,"first_pcm_s":0.421,"frames":69,"segments":2} H=2f30728f4d6f3658,c5166f237f463e09,
+r4:A_default_kv32 {"audio_s":5.3200,"elapsed_s":3.7953,"rtf":0.7134,"backbone_s":0.735,"depth_s":2.861,"codec_s":2.811,"first_pcm_s":0.431,"frames":69,"segments":2} H=2f30728f4d6f3658,c5166f237f463e09,
+DONE

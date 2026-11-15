@@ -153,6 +153,13 @@ the offline tutorial copy lives in [learning-hub](learning-hub/index.html).
 The [Chinese blog series](learning-hub/blog/README.md) covers the pipeline, profiling,
 performance and audio quality, and the Serena voice workflow.
 
+The A/B harnesses behind every number above are archived with their raw output
+in [experiments/](experiments/README.md) — one script per log section, including
+the negative results, plus the two WAVs the chunking listening check was done
+on. Model artifacts and HTP profile dumps are deliberately not in the tree;
+[MODEL_PACKAGE.md](MODEL_PACKAGE.md) lists them with hashes and
+[reproduce.sh](reproduce.sh) regenerates them.
+
 ## Bring a voice from another TTS model
 
 Generate a short reference WAV and keep its exact spoken transcript in a
