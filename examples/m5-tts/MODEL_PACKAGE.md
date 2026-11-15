@@ -24,6 +24,9 @@ GitHub 上**没有**权重：上游 `android/.gitignore` 明确忽略 `/outputs/
 Hugging Face（上游仓库的 `android/README.md` §4.1 给的就是 `hf download` 命令）。所以"只拿到 GitHub 代码"能拿到**全部脚本**，但拿不到 **1.3 GB 的
 ONNX 权重**——这是唯一必须先联网的一步。
 
+反过来，**HF 上也没有我们派生的东西**：四步重写后的 codec 和从权重转出来的 gguf/f32。
+这几个走 Release 附件（`reproduce.sh release` 或 CI），仓库里只留脚本和哈希，见 §8。
+
 ---
 
 ## 1. 三个来源的精确坐标
@@ -351,6 +354,7 @@ bash examples/m5-tts/reproduce.sh deploy     # 推包 + 起服务 + 门禁
 | `~/Desktop/M5-TTS` | 上游代码 checkout（含 patch + App 改动） | 1.1 GB | 否（独立仓库） |
 | `~/m5-assets/android_onnx` | HF 模型包 | 1.3 GB | 否，**当前已清，可重下** |
 | `~/m5-assets/model-package` | 本章生成的产物（`reproduce.sh` 输出） | ~1 GB | 否 |
+| `~/m5-assets/model-package/release` | `reproduce.sh release` 打的 Release 附件 | ~370 MB | 否（走 Release） |
 | `~/m5-assets/device-model-backup` | 设备模型包备份（`deploy.sh` 的目标） | 698 MB | 否 |
 | `~/m5-assets/build` | `m5-server` / `m5-engine` / `libm5engine.so` | 81 MB | 否 |
 | `~/m5-assets/stage` | `backbone-resident` + 5 个 .so | 62 MB | 否 |
@@ -360,3 +364,74 @@ bash examples/m5-tts/reproduce.sh deploy     # 推包 + 起服务 + 门禁
 
 > 设备目录里另有一堆实验变体（`codec-qdq-*`、`backbone-Q5_K_M` 等），是日志
 > §7–§30 的对照物，**不属于复现路径**，不需要重建。
+
+---
+
+## 8. 用 Release 分发派生产物（为什么仓库里没有二进制）
+
+判据很简单：**HF 上有的不存、能一条命令重建的不存、只剩"必须生成且生成代价高"的才存**。
+符合最后一条的只有两包，其余 9 个运行时文件都在 HF 原始包里。
+
+### 8.1 各载体的硬上限（2026-11 核对）
+
+| 载体 | 上限 | 对我们的意义 |
+|---|---|---|
+| git 普通文件 | >50 MiB 警告，**>100 MiB 直接拒收**（网页上传 25 MiB） | 单个 ONNX 就 400 MB+，进不去 |
+| 仓库整体 | 建议 <1 GB，**强烈建议 <5 GB** | 当前 pack 486 MB，没有余量再塞 1.3 GB |
+| git LFS | 单文件 2 GB；免费 **10 GiB 存储 + 10 GiB/月流量** | 放得下，但每 clone 一次 1.3 GB，一个月约 7 次就耗尽，之后 LFS 停用 |
+| **Release 附件** | 单文件 ≤2 GB，**总量与带宽不限** | 唯一"放得下又不按流量付费"的地方 |
+
+### 8.2 两个附件
+
+| 附件 | 内容 | 未压缩 |
+|---|---|---:|
+| `m5-codec-int8-<tag>.tar.zst` | `codec_decoder_cached.onnx`（四步链产物） | 140,935,716 B |
+| `m5-models-q4-<tag>.tar.zst` | `backbone-Q8_0.gguf`、`depth-Q4_0.gguf`、`depth-weights.f32`、`tokenizer.bin`、`voices.json` | ≈264 MB |
+
+外加 `SHA256SUMS`（每行 `<sha256>  <name>  <bytes>  reference|drift`）和
+`RELEASE_NOTES.md`（来源坐标、安装步骤、哈希表、许可提醒）。
+
+`manifest.json` / `text_embeddings.npy` / `audio_embeddings.npy` / `codec_cached.json` /
+`codec_encoder.onnx` **不进附件**——它们在 HF 包里原样就有，`fetch` 已经按哈希验过。
+
+### 8.3 本地打包
+
+```sh
+./examples/m5-tts/reproduce.sh release                 # -> $OUT/release/
+./examples/m5-tts/reproduce.sh release --tag m5-v1     # 指定标签
+./examples/m5-tts/reproduce.sh release --upload        # 需要 gh 已登录
+```
+
+`release` 只读产物、不改模型；`--upload` 走 `gh release create`（已存在则 `upload --clobber`）。
+
+### 8.4 CI（`.github/workflows/m5-package.yml`）
+
+手动触发，四个输入：`tag`、`hf_revision`、`upstream_ref`、`upload`（默认 false，
+即只产出 artifact 不建 Release）。流程与 §4.1–§4.2 完全同一条路径：
+
+```
+checkout -> python 3.12 -> clone 上游 M5-TTS@<ref> -> cache HF 包
+  -> fetch（验输入哈希）-> models -> codec（四步）-> package -> release
+  -> 漂移检查 -> upload-artifact -> 可选 gh release
+```
+
+**CI 能证的**：输入包确实是记录在案的那个 revision；四步链跑完；codec 体积落在
+140,935,716 B；每个产物的哈希要么等于参考值（`reference`），要么被标成 `drift`。
+**CI 不能证的**：端到端的 codes/WAV 等价——那需要真机，只能 `reproduce.sh gate`
+在设备上跑（判据见 §5）。
+
+`drift` 不是失败：onnx/onnxruntime 换版本会重编号节点、重算校准区间，字节会变。
+真正要拦的是"某一步静默没生效"——那个用体积指纹（456→362→282→141 MB）和
+codec 下限 100 MB 的断言拦。**drift 的 codec 不要直接配旧的 `voices.json` codes**，
+要重新跑 `prepare_android_voice.py` 编码音色。
+
+### 8.5 为什么不随仓库发模型
+
+- **许可**：`ASLP-lab/M5-TTS` 根目录没有 LICENSE，README 只说"按各 release 附带的条款"，
+  模型卡也没有明确许可字段。再分发权属不清，这一步不该由脚本替用户决定。
+- **权威源**：HF 有 revision 和下载计数，我们镜像一份只会产生第二个"正确版本"。
+  `fetch` 用 12 条 SHA256 保证"拿到的是同一份"，比镜像更可靠。
+- **成本**：克隆要 1.3 GB，而 99% 的读者只想要代码和结论。
+
+真要做离线备份，用私有 HF 仓库（同一套 CLI），别拿 GitHub 当备份盘——
+官方文档原话是 "Git is not designed to serve as a backup tool"。

@@ -7,12 +7,15 @@
 #   ./reproduce.sh codec      # codec 三步链 -> codec_decoder_cached.onnx
 #   ./reproduce.sh binaries   # build_android.sh + docker_build_stage.sh
 #   ./reproduce.sh package    # 把上面产物摆成 device 侧目录结构 $OUT/model
+#   ./reproduce.sh release    # 把派生产物打成 Release 附件（可选 --upload）
 #   ./reproduce.sh deploy     # push + deploy.sh --no-models + 门禁
 #   ./reproduce.sh all        # fetch models codec binaries package deploy
 #
 # Flags:
 #   --force       无视已有哈希，全部重建
 #   --no-device   跳过 deploy 里的设备动作（只生成产物）
+#   --upload      配合 release：用 gh 上传到 GitHub Release
+#   --tag <name>  配合 release：release 标签，默认 m5-v1
 #
 # 每个产物都有已知哈希：哈希对就跳过，不对就重建。二进制没有哈希（工具链
 # 不可逐字节复现），存在即跳过，验它们靠 deploy 阶段的行为门禁。
@@ -201,9 +204,10 @@ cmd_fetch() {
 import os, sys
 from huggingface_hub import snapshot_download
 repo, dest = sys.argv[1], sys.argv[2]
+rev = os.environ.get("HF_REVISION") or None
 os.makedirs(dest, exist_ok=True)
-snapshot_download(repo_id=repo, local_dir=dest)
-print("downloaded to", dest)
+snapshot_download(repo_id=repo, local_dir=dest, revision=rev)
+print("downloaded to", dest, "revision", rev or "default")
 PY
     log "verifying bundle"
     local pair
@@ -425,14 +429,175 @@ cmd_deploy() {
     gate
 }
 
+# ---------------------------------------------------------------- release
+# 只打包「HF 上没有、必须由本脚本生成」的东西：codec 四步链产物，和三个从
+# HF 权重转出来的运行时文件。仓库本身不放二进制——git 单文件 >100 MiB 直接
+# 拒收，LFS 每 clone 一次都算 1.3 GB 流量，而 Release 附件不限总量与带宽
+# （单文件上限 2 GB）。理由与取舍见 MODEL_PACKAGE.md §8。
+RELEASE_DIR=${RELEASE_DIR:-$OUT/release}
+RELEASE_TAG=${RELEASE_TAG:-m5-v1}
+UPLOAD=0
+
+fsize() { wc -c < "$1" | tr -d ' '; }
+
+# archive <base> <tar-args...>；中途可以带 -C，两个目录的文件能进同一个包
+archive() {
+    local base=$1 out; shift
+    mkdir -p "$RELEASE_DIR"
+    if command -v zstd >/dev/null 2>&1; then
+        out=$RELEASE_DIR/$base.tar.zst
+        tar -cf - "$@" | zstd -q -19 -T0 -o "$out" -f
+    else
+        out=$RELEASE_DIR/$base.tar.gz
+        tar -czf "$out" "$@"
+    fi
+    printf '%s\n' "$out"
+}
+
+# 一行哈希：<sha256>  <name>  <bytes>  <reference|drift>
+sum_line() {
+    local f=$1 want=${2:-} name
+    name=$(basename "$f")
+    if [ -n "$want" ] && [ "$(sha "$f")" = "$want" ]; then
+        printf '%s  %s  %s  reference\n' "$(sha "$f")" "$name" "$(fsize "$f")"
+    elif [ -n "$want" ]; then
+        printf '%s  %s  %s  drift\n' "$(sha "$f")" "$name" "$(fsize "$f")"
+    else
+        printf '%s  %s  %s  -\n' "$(sha "$f")" "$name" "$(fsize "$f")"
+    fi
+}
+
+cmd_release() {
+    local model=$OUT/model
+    [ -f "$model/codec_decoder_cached.onnx" ] || die "missing codec: run '$0 codec' first"
+    local f
+    for f in "$model/depth-weights.f32" "$model/tokenizer.bin" "$model/voices.json" \
+             "$OUT/backbone-Q8_0.gguf" "$OUT/depth-Q4_0.gguf"; do
+        [ -f "$f" ] || die "missing $(basename "$f"): run '$0 models' first"
+    done
+
+    log "bundling $RELEASE_TAG -> $RELEASE_DIR"
+    local codec_arc models_arc
+    codec_arc=$(archive "m5-codec-int8-$RELEASE_TAG" -C "$model" codec_decoder_cached.onnx)
+    models_arc=$(archive "m5-models-q4-$RELEASE_TAG" \
+        -C "$OUT" backbone-Q8_0.gguf depth-Q4_0.gguf \
+        -C "$model" depth-weights.f32 tokenizer.bin voices.json)
+    note "$(basename "$codec_arc"): $(fsize "$codec_arc") bytes"
+    note "$(basename "$models_arc"): $(fsize "$models_arc") bytes"
+
+    local commit upstream hf_rev
+    commit=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)
+    upstream=$(git -C "$M5_SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
+    hf_rev=${HF_REVISION:-main}
+
+    {
+        sum_line "$model/codec_decoder_cached.onnx" "$H_CODEC"
+        sum_line "$OUT/backbone-Q8_0.gguf" "$H_BB_GGUF"
+        sum_line "$OUT/depth-Q4_0.gguf" "$H_DEPTH_GGUF"
+        sum_line "$model/depth-weights.f32" "$H_DEPTH_F32"
+        sum_line "$model/tokenizer.bin" "$H_TOKENIZER"
+        sum_line "$model/voices.json" ""
+    } > "$RELEASE_DIR/SHA256SUMS"
+
+    local drift=0
+    awk '$4 == "drift" { n++ } END { exit (n > 0) }' "$RELEASE_DIR/SHA256SUMS" || drift=1
+
+    {
+        cat <<EOF
+# M5-TTS derived artifacts — $RELEASE_TAG
+
+Only the files that cannot be downloaded are here. Everything else comes from
+[Hugging Face](https://huggingface.co/$HF_MODEL); \`reproduce.sh fetch\` verifies
+those against the hashes in \`MODEL_PACKAGE.md\`.
+
+Built from:
+
+| | |
+|---|---|
+| this repo | \`$commit\` |
+| upstream code | \`ASLP-lab/M5-TTS\` @ \`$upstream\` |
+| weights | \`$HF_MODEL\` @ \`$hf_rev\` |
+| toolchain | python 3.12, onnx 1.16.2, onnxruntime 1.18.1 |
+
+| archive | contents | bytes |
+|---|---|---|
+| \`$(basename "$codec_arc")\` | \`codec_decoder_cached.onnx\` (four-step chain applied) | $(fsize "$codec_arc") |
+| \`$(basename "$models_arc")\` | \`backbone-Q8_0.gguf\`, \`depth-Q4_0.gguf\`, \`depth-weights.f32\`, \`tokenizer.bin\`, \`voices.json\` | $(fsize "$models_arc") |
+
+## Install
+
+\`\`\`sh
+V=/data/local/tmp/llama-m5-htp-v73
+adb shell "mkdir -p \$V/model"
+mkdir -p /tmp/m5
+tar -xaf $(basename "$codec_arc")  -C /tmp/m5
+tar -xaf $(basename "$models_arc") -C /tmp/m5
+adb push /tmp/m5/codec_decoder_cached.onnx \$V/model/
+adb push /tmp/m5/depth-weights.f32 /tmp/m5/tokenizer.bin /tmp/m5/voices.json \$V/model/
+adb push /tmp/m5/backbone-Q8_0.gguf /tmp/m5/depth-Q4_0.gguf \$V/
+\`\`\`
+
+\`manifest.json\`, \`text_embeddings.npy\`, \`audio_embeddings.npy\`, \`codec_cached.json\`
+and \`codec_encoder.onnx\` still come from the HF bundle — copy them out of
+\`\$ONNX_DIR\` by hand, or just let \`reproduce.sh package deploy\` do the whole
+layout. Then run the gate: \`reproduce.sh gate\` must report the reference WAV
+hash for the bundled voice.
+
+## Hashes
+
+\`\`\`
+$(cat "$RELEASE_DIR/SHA256SUMS")
+\`\`\`
+
+\`reference\` means byte-identical to the build recorded in \`MODEL_PACKAGE.md\`;
+\`drift\` means the pipeline ran but onnx/onnxruntime renumbered or re-rounded
+something. Drift is not automatically bad — check the size and run the gate —
+but do not mix drifted codec weights with existing \`voices.json\` codes without
+re-encoding them.
+
+## Licence
+
+These are derivatives of \`$HF_MODEL\`. That repository ships no LICENSE file;
+its README defers to "the terms attached to each release". Confirm you may
+redistribute the weights before publishing this release publicly.
+EOF
+    } > "$RELEASE_DIR/RELEASE_NOTES.md"
+
+    note "hashes:"
+    sed 's/^/      /' "$RELEASE_DIR/SHA256SUMS"
+    [ "$drift" = 0 ] || warn "at least one artifact drifted from the reference hash (see above)"
+
+    if [ "$UPLOAD" = 1 ]; then
+        command -v gh >/dev/null 2>&1 || die "gh not found: install it, or upload manually"
+        log "uploading to release '$RELEASE_TAG'"
+        if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$codec_arc" "$models_arc" \
+                "$RELEASE_DIR/SHA256SUMS" "$RELEASE_DIR/RELEASE_NOTES.md" --clobber
+        else
+            gh release create "$RELEASE_TAG" \
+                --title "M5-TTS derived artifacts $RELEASE_TAG" \
+                --notes-file "$RELEASE_DIR/RELEASE_NOTES.md" \
+                "$codec_arc" "$models_arc" "$RELEASE_DIR/SHA256SUMS"
+        fi
+        note "done: $(gh release view "$RELEASE_TAG" --json url -q .url 2>/dev/null || echo "$RELEASE_TAG")"
+    else
+        note "upload skipped; re-run with --upload, or:"
+        note "  gh release create $RELEASE_TAG --notes-file $RELEASE_DIR/RELEASE_NOTES.md \\"
+        note "      $codec_arc $models_arc"
+    fi
+}
+
 # ---------------------------------------------------------------- main
 while [ $# -gt 0 ]; do
     case "$1" in
         --force) FORCE=1 ;;
         --no-device) NO_DEVICE=1 ;;
+        --upload) UPLOAD=1 ;;
+        --tag) shift; RELEASE_TAG=${1:-}; [ -n "$RELEASE_TAG" ] || die "--tag needs a value" ;;
         -h|--help)
             cat <<'EOF'
-usage: reproduce.sh [check|fetch|models|codec|binaries|package|deploy|gate|all] [--force] [--no-device]
+usage: reproduce.sh [check|fetch|models|codec|binaries|package|release|deploy|gate|all]
+                    [--force] [--no-device] [--upload] [--tag NAME]
 
   check     体检：路径、bundle 与已有产物的哈希（不写盘）
   fetch     从 Hugging Face 下 ASLP-lab/M5-TTS-50M-ONNX 到 $ONNX_DIR
@@ -440,12 +605,14 @@ usage: reproduce.sh [check|fetch|models|codec|binaries|package|deploy|gate|all] 
   codec     codec 四步链：Conv QDQ -> CT->MatMul -> MatMul QDQ -> snake_fuse
   binaries  build_android.sh + docker_build_stage.sh
   package   摆成设备侧目录结构 $OUT/model
+  release   打 Release 附件（codec + 派生的 gguf/f32），--upload 直接上传
   deploy    push 模型包 + deploy.sh --no-models + 门禁
   gate      只跑门禁（/health + 固定句子的 wav 哈希）
   all       fetch -> models -> codec -> binaries -> package -> deploy
 
 env overrides: M5_SRC ONNX_DIR OUT VENV M5_BUILD M5_STAGE M5_ORT_ROOT VDIR
                REF_WAV TRANSCRIPT PY ADB FORWARD_PORT HF_MODEL
+               RELEASE_DIR RELEASE_TAG HF_REVISION
 see MODEL_PACKAGE.md
 EOF
             exit 0 ;;
@@ -463,6 +630,7 @@ case "$CMD" in
     codec)    cmd_codec ;;
     binaries) cmd_binaries ;;
     package)  cmd_package ;;
+    release)  cmd_release ;;
     deploy)   cmd_deploy ;;
     gate)     gate ;;
     all)

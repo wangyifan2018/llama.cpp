@@ -1,0 +1,156 @@
+name: m5-tts model package
+
+# Builds the artifacts that Hugging Face does not ship — the four-step codec
+# model and the gguf/f32 files converted from the HF weights — and attaches
+# them to a GitHub release. Nothing is committed: the repo keeps scripts and
+# hashes, the release keeps bytes.
+#
+# Why not git / LFS: a >100 MiB file is rejected outright, and every LFS clone
+# of a 1.3 GB bundle counts against the owner's bandwidth quota. Release assets
+# have no total size and no bandwidth limit (per-file cap follows the LFS
+# per-file limit: 2 GB on Free). See examples/m5-tts/MODEL_PACKAGE.md §8.
+#
+# The phone gate (reference WAV hash) cannot run here. CI proves: the HF bundle
+# matches the recorded input hashes, the four steps ran, and the derived files
+# either match the reference hashes or are flagged as drift.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag; assets are named after it"
+        default: "m5-v1"
+      hf_revision:
+        description: "Revision of ASLP-lab/M5-TTS-50M-ONNX"
+        default: "main"
+      upstream_ref:
+        description: "Commit/tag of ASLP-lab/M5-TTS"
+        default: "4e7cc915"
+      upload:
+        description: "Create or update the GitHub release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: m5-package-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      M5_SRC: ${{ runner.temp }}/M5-TTS
+      ONNX_DIR: ${{ runner.temp }}/onnx
+      OUT: ${{ runner.temp }}/out
+      VENV: ${{ runner.temp }}/pyenv
+      RELEASE_DIR: ${{ runner.temp }}/out/release
+      RELEASE_TAG: ${{ inputs.tag }}
+      HF_REVISION: ${{ inputs.hf_revision }}
+      HF_MODEL: ASLP-lab/M5-TTS-50M-ONNX
+      PIP_INDEX_URL: https://pypi.org/simple
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends zstd
+
+      # prepare_android_voice.py imports infer_onnx / package_model from the
+      # upstream checkout, so the code has to be there even though the weights
+      # come from HF.
+      - name: Check out upstream M5-TTS
+        run: |
+          git init -q "$M5_SRC"
+          git -C "$M5_SRC" remote add origin https://github.com/ASLP-lab/M5-TTS.git
+          git -C "$M5_SRC" fetch -q --depth 1 origin "${{ inputs.upstream_ref }}"
+          git -C "$M5_SRC" checkout -q FETCH_HEAD
+          echo "upstream: $(git -C "$M5_SRC" rev-parse --short HEAD)"
+          ls "$M5_SRC/assets/aslp_default_voice.wav"
+
+      - name: Cache the HF bundle
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/onnx
+          key: onnx-${{ inputs.hf_revision }}-v1
+
+      - name: Fetch and verify the HF bundle
+        run: bash examples/m5-tts/reproduce.sh fetch
+
+      - name: Convert weights (tokenizer, voices, two gguf, depth f32)
+        run: bash examples/m5-tts/reproduce.sh models
+
+      - name: Apply the four-step codec chain
+        run: bash examples/m5-tts/reproduce.sh codec
+
+      - name: Lay out the device model directory
+        run: bash examples/m5-tts/reproduce.sh package
+
+      - name: Build release archives
+        run: bash examples/m5-tts/reproduce.sh release
+
+      - name: Report drift
+        run: |
+          sums="$RELEASE_DIR/SHA256SUMS"
+          cat "$sums"
+          echo
+          if grep -q '  drift$' "$sums"; then
+            echo "::warning::at least one artifact drifted from the reference hash."
+            echo "::warning::Onnx/onnxruntime version drift renumbers nodes; check the"
+            echo "::warning::byte sizes below before publishing. Full reference hashes:"
+            echo "::warning::examples/m5-tts/MODEL_PACKAGE.md §2.1"
+          else
+            echo "::notice::all derived artifacts match the reference hashes"
+          fi
+          for f in "$RELEASE_DIR"/*.tar.*; do
+            printf '%s %s bytes\n' "$(basename "$f")" "$(wc -c < "$f")"
+          done
+          # the codec must be exactly the four-step size; a different number
+          # means a step silently did nothing
+          size=$(wc -c < "$OUT/model/codec_decoder_cached.onnx")
+          if [ "$size" -lt 100000000 ]; then
+            echo "::error::codec_decoder_cached.onnx is $size bytes, expected ~140,935,716"
+            exit 1
+          fi
+          echo "::notice::no device gate in CI — run 'reproduce.sh gate' on a phone"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: m5-tts-${{ inputs.tag }}
+          path: |
+            ${{ runner.temp }}/out/release/m5-codec-int8-${{ inputs.tag }}.tar.zst
+            ${{ runner.temp }}/out/release/m5-models-q4-${{ inputs.tag }}.tar.zst
+            ${{ runner.temp }}/out/release/SHA256SUMS
+            ${{ runner.temp }}/out/release/RELEASE_NOTES.md
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish release
+        if: ${{ inputs.upload }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          assets=(
+            "$RELEASE_DIR/m5-codec-int8-$RELEASE_TAG.tar.zst"
+            "$RELEASE_DIR/m5-models-q4-$RELEASE_TAG.tar.zst"
+            "$RELEASE_DIR/SHA256SUMS"
+          )
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              --title "M5-TTS derived artifacts $RELEASE_TAG" \
+              --notes-file "$RELEASE_DIR/RELEASE_NOTES.md" \
+              "${assets[@]}"
+          fi
+          gh release view "$RELEASE_TAG" --json url -q .url

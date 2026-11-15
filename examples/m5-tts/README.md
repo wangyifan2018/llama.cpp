@@ -158,7 +158,11 @@ in [experiments/](experiments/README.md) — one script per log section, includi
 the negative results, plus the two WAVs the chunking listening check was done
 on. Model artifacts and HTP profile dumps are deliberately not in the tree;
 [MODEL_PACKAGE.md](MODEL_PACKAGE.md) lists them with hashes and
-[reproduce.sh](reproduce.sh) regenerates them.
+[reproduce.sh](reproduce.sh) regenerates them. The artifacts Hugging Face does
+not have (the four-step codec model, the converted gguf/f32 files) ship as
+release assets: `reproduce.sh release` builds them locally, and
+[.github/workflows/m5-package.yml](../../.github/workflows/m5-package.yml)
+rebuilds and optionally publishes them from CI.
 
 ## Bring a voice from another TTS model
 
