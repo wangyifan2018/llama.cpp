@@ -160,6 +160,9 @@ AGENTS.local.md
 # m5-tts web console demo audio (user-generated, not source)
 examples/m5-tts/web/demo-*.wav
 
+# m5-package CI work dir (only present when the workflow runs locally via act)
+.m5-work/
+
 # ...but the experiment archive does keep its raw captures
 !examples/m5-tts/experiments/results/*.log
 !examples/m5-tts/experiments/results/*/*.log

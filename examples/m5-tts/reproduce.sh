@@ -346,8 +346,8 @@ gate() {
     log "gate: /health + one fixed-sentence wav"
     "$ADB" forward "tcp:$FORWARD_PORT" tcp:8080 >/dev/null 2>&1 || true
     local base="http://127.0.0.1:$FORWARD_PORT"
-    local i health=""
-    for i in 1 2 3 4 5 6 7 8 9 10; do
+    local health=""
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
         health=$(curl -s -m 3 "$base/health" || true)
         case "$health" in *ok*) break ;; esac
         sleep 1

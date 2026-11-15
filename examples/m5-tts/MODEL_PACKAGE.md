@@ -420,6 +420,12 @@ checkout -> python 3.12 -> clone 上游 M5-TTS@<ref> -> cache HF 包
 **CI 不能证的**：端到端的 codes/WAV 等价——那需要真机，只能 `reproduce.sh gate`
 在设备上跑（判据见 §5）。
 
+工作目录全在 `$GITHUB_WORKSPACE/.m5-work/` 下（`M5_SRC` / `ONNX_DIR` / `OUT` / `VENV`），
+不落在仓库里，也不会被 checkout 清掉。CI 里多跑一步 `shellcheck`（runner 预装），
+守着 `reproduce.sh` 与 `deploy.sh` 不进 warning；workflow 本身用
+`actionlint .github/workflows/m5-package.yml` 校验（本地一条命令，能抓到
+`runner` 上下文用错这类只在运行时才炸的错误）。
+
 `drift` 不是失败：onnx/onnxruntime 换版本会重编号节点、重算校准区间，字节会变。
 真正要拦的是"某一步静默没生效"——那个用体积指纹（456→362→282→141 MB）和
 codec 下限 100 MB 的断言拦。**drift 的 codec 不要直接配旧的 `voices.json` codes**，

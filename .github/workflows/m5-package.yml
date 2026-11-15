@@ -43,11 +43,14 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
-      M5_SRC: ${{ runner.temp }}/M5-TTS
-      ONNX_DIR: ${{ runner.temp }}/onnx
-      OUT: ${{ runner.temp }}/out
-      VENV: ${{ runner.temp }}/pyenv
-      RELEASE_DIR: ${{ runner.temp }}/out/release
+      # runner context is not available in job-level env, so every path hangs
+      # off the workspace (and stays inside it, where upload-artifact is happy)
+      WORK: ${{ github.workspace }}/.m5-work
+      M5_SRC: ${{ github.workspace }}/.m5-work/M5-TTS
+      ONNX_DIR: ${{ github.workspace }}/.m5-work/onnx
+      OUT: ${{ github.workspace }}/.m5-work/out
+      VENV: ${{ github.workspace }}/.m5-work/pyenv
+      RELEASE_DIR: ${{ github.workspace }}/.m5-work/out/release
       RELEASE_TAG: ${{ inputs.tag }}
       HF_REVISION: ${{ inputs.hf_revision }}
       HF_MODEL: ASLP-lab/M5-TTS-50M-ONNX
@@ -66,6 +69,11 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends zstd
 
+      # shellcheck ships with the runner image; keep the two product scripts
+      # (not the archived experiments) warning-clean.
+      - name: Shellcheck
+        run: shellcheck -S warning examples/m5-tts/reproduce.sh examples/m5-tts/deploy.sh
+
       # prepare_android_voice.py imports infer_onnx / package_model from the
       # upstream checkout, so the code has to be there even though the weights
       # come from HF.
@@ -81,7 +89,7 @@ jobs:
       - name: Cache the HF bundle
         uses: actions/cache@v4
         with:
-          path: ${{ runner.temp }}/onnx
+          path: ${{ github.workspace }}/.m5-work/onnx
           key: onnx-${{ inputs.hf_revision }}-v1
 
       - name: Fetch and verify the HF bundle
@@ -128,10 +136,10 @@ jobs:
         with:
           name: m5-tts-${{ inputs.tag }}
           path: |
-            ${{ runner.temp }}/out/release/m5-codec-int8-${{ inputs.tag }}.tar.zst
-            ${{ runner.temp }}/out/release/m5-models-q4-${{ inputs.tag }}.tar.zst
-            ${{ runner.temp }}/out/release/SHA256SUMS
-            ${{ runner.temp }}/out/release/RELEASE_NOTES.md
+            ${{ github.workspace }}/.m5-work/out/release/m5-codec-int8-${{ inputs.tag }}.tar.zst
+            ${{ github.workspace }}/.m5-work/out/release/m5-models-q4-${{ inputs.tag }}.tar.zst
+            ${{ github.workspace }}/.m5-work/out/release/SHA256SUMS
+            ${{ github.workspace }}/.m5-work/out/release/RELEASE_NOTES.md
           if-no-files-found: error
           retention-days: 14
 
