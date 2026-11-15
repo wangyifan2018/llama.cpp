@@ -1175,20 +1175,41 @@ int main(int argc, char ** argv) {
             return;
         }
 
+        std::string language = "Chinese";
+        size_t language_at;
+        if (find_key(req.body, "language", language_at) &&
+            !parse_json_string(req.body, language_at, language)) {
+            send_error(res, 400, "language must be a string");
+            return;
+        }
+
+        const std::string voice_name = voice.empty() ? st.default_voice : voice;
+        std::unique_lock<std::mutex> lock(st.render_mutex);
+        std::string err;
+        if (!st.engine.set_language(language)) {
+            send_error(res, 400, "language must be zh, en, ja, ko, de or fr (or its English name)");
+            return;
+        }
+        if (!apply_voice_req(st, req.body, voice, err)) {
+            if (format == "wav") record_stat(st, make_stat(voice_name, format, text, m5::Stats(), false));
+            send_error(res, 404, err);
+            return;
+        }
+        if (!st.engine.validate_text(text, err)) {
+            send_error(res, 400, err);
+            return;
+        }
+
         if (format == "pcm") {
-            // Fail fast on a bad voice before starting the stream.
-            {
-                std::lock_guard<std::mutex> lock(st.render_mutex);
-                std::string err;
-                if (!apply_voice_req(st, req.body, voice, err)) { send_error(res, 404, err); return; }
-            }
+            lock.unlock();
             auto stream = std::make_shared<PcmStream>();
             const std::string body = req.body;
             // The HTTP provider owns the stream and joins this worker on release.
-            stream->worker = std::thread([&st, stream = stream.get(), text, voice, body] {
+            stream->worker = std::thread([&st, stream = stream.get(), text, voice, body, language] {
                 {
                     std::lock_guard<std::mutex> lock(st.render_mutex);
                     std::string err;
+                    st.engine.set_language(language);
                     if (!apply_voice_req(st, body, voice, err)) {
                         fprintf(stderr, "[m5-server] pcm voice apply failed: %s\n", err.c_str());
                         record_stat(st, make_stat(voice, "pcm", text, m5::Stats(), false));
@@ -1241,14 +1262,6 @@ int main(int argc, char ** argv) {
         }
 
         // wav: synthesize fully in memory (no temp file; stats ride in headers).
-        std::lock_guard<std::mutex> lock(st.render_mutex);
-        std::string err;
-        const std::string voice_name = voice.empty() ? st.default_voice : voice;
-        if (!apply_voice_req(st, req.body, voice, err)) {
-            record_stat(st, make_stat(voice_name, "wav", text, m5::Stats(), false));
-            send_error(res, 404, err);
-            return;
-        }
         // 2/4 keeps the codec and depth branches overlapped: the old 4/16 split
         // was tuned when codec was the bottleneck, but after the depth KV32
         // change 16-frame codec bursts leave the pipeline idling (4.00 s vs

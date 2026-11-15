@@ -54,9 +54,25 @@ constexpr int kHop = 1920;
 constexpr int kTail = 2400;
 constexpr int kMaxFrames = 500;
 constexpr int kNoiseBooks = 16;
-constexpr const char * kConditionPrefix =
-    "<|caption_begin|><|caption_end|><|accent_begin|><|accent_end|>"
-    "<|speaker_start|>None<|speaker_end|><|lang_begin|>Chinese<|lang_end|>";
+constexpr int kMaxTextCodepoints = 2000;
+constexpr int kMaxSegmentCodepoints = 80;
+
+std::string conditioning_prefix(const std::string & caption, const std::string & language) {
+    return "<|caption_begin|>" + caption +
+           "<|caption_end|><|accent_begin|><|accent_end|>"
+           "<|speaker_start|>None<|speaker_end|><|lang_begin|>" + language + "<|lang_end|>";
+}
+
+bool has_conditioning_marker(const std::string & text) {
+    static constexpr const char * markers[] = {
+        "<|caption_begin|>", "<|caption_end|>", "<|accent_begin|>", "<|accent_end|>",
+        "<|speaker_start|>", "<|speaker_end|>", "<|lang_begin|>", "<|lang_end|>",
+    };
+    for (const char * marker : markers) {
+        if (text.find(marker) != std::string::npos) return true;
+    }
+    return false;
+}
 
 double now_s() {
     using clock = std::chrono::steady_clock;
@@ -1043,11 +1059,13 @@ private:
     std::string memory_;
 };
 
-// UTF-8 split into segments, mirroring M5Engine.splitText.
+// Split near sentence or word boundaries, with a hard cap on UTF-8 code points.
 std::vector<std::string> split_text(const std::string & text) {
     std::vector<std::string> out;
     std::string part;
     int count = 0;
+    size_t word_break = std::string::npos;
+    int word_break_count = 0;
     for (size_t i = 0; i < text.size();) {
         unsigned char c = (unsigned char) text[i];
         size_t len = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : 4;
@@ -1058,12 +1076,29 @@ std::vector<std::string> split_text(const std::string & text) {
         count++;
         const bool break_here = cp == "\xE3\x80\x82" || cp == "\xEF\xBC\x81" || cp == "\xEF\xBC\x9F" ||
                                 cp == "!" || cp == "?" || cp == ";" || cp == "\xEF\xBC\x9B" || cp == "\n";
-        if (count >= 80 || break_here) {
+        const bool dot_boundary = cp == "." && (i == text.size() || text[i] == ' ' || text[i] == '\t');
+        if (cp == " " || cp == "\t") {
+            word_break = part.size();
+            word_break_count = count;
+        }
+        if (count >= kMaxSegmentCodepoints && !break_here && !dot_boundary &&
+            word_break != std::string::npos && word_break_count >= kMaxSegmentCodepoints / 2 &&
+            i < text.size() && text[i] != ' ' && text[i] != '\t') {
+            size_t b = part.find_first_not_of(" \t\r\n");
+            size_t e = part.find_last_not_of(" \t\r\n", word_break - 1);
+            if (e != std::string::npos && b <= e) out.push_back(part.substr(b, e - b + 1));
+            part.erase(0, word_break);
+            count -= word_break_count;
+            word_break = std::string::npos;
+            continue;
+        }
+        if (count >= kMaxSegmentCodepoints || break_here || dot_boundary) {
             size_t b = part.find_first_not_of(" \t\r\n");
             size_t e = part.find_last_not_of(" \t\r\n");
             if (b != std::string::npos) out.push_back(part.substr(b, e - b + 1));
             part.clear();
             count = 0;
+            word_break = std::string::npos;
         }
     }
     size_t b = part.find_first_not_of(" \t\r\n");
@@ -1132,6 +1167,7 @@ struct Engine::Impl {
     Codec codec;
     Timings timings;
     std::unique_ptr<JavaRandom> rng;
+    std::string language = "Chinese";
     int min_frames = 6;
     int max_sequence = 2048;
     bool opened = false;
@@ -1162,10 +1198,7 @@ bool Engine::Impl::segment(const std::vector<long> & tokens, WavWriter & wav, co
     // for every request on this voice. When the byte-level BPE splits cleanly -
     // the shared ids are a prefix of the full sequence - the stage can keep that
     // block's KV and only prefill the new text plus the reference audio codes.
-    std::string shared_text = std::string("<|caption_begin|>") + trim(options.caption) +
-                              "<|caption_end|><|accent_begin|><|accent_end|>"
-                              "<|speaker_start|>None<|speaker_end|><|lang_begin|>Chinese<|lang_end|>" +
-                              trim(voice.reference);
+    const std::string shared_text = conditioning_prefix(trim(options.caption), language) + trim(voice.reference);
     int shared_len = 0;
     if (backbone.supports_prefill()) {
         // Byte-level BPE can merge the reference's last characters with the
@@ -1440,6 +1473,7 @@ Engine::~Engine() = default;
 bool Engine::open(const Options & options, std::string & error) {
     Impl & impl = *impl_;
     impl.options = options;
+    impl.language = "Chinese";
     impl.dump_codes_path = options.dump_codes;
     const std::string root = options.model_dir;
 
@@ -1493,20 +1527,44 @@ void Engine::close() { impl_->close(); }
 std::string Engine::condition(const std::string & text) const {
     const std::string combined = trim(impl_->voice.reference) + trim(text);
     const std::string caption = trim(impl_->options.caption);
-    static const char * kReserved[] = {"<|caption_begin|>", "<|caption_end|>", "<|accent_begin|>",
-                                       "<|accent_end|>", "<|speaker_start|>", "<|speaker_end|>",
-                                       "<|lang_begin|>", "<|lang_end|>"};
-    for (const char * token : kReserved)
-        if (combined.find(token) != std::string::npos) return {};
-    for (const char * token : kReserved)
-        if (caption.find(token) != std::string::npos) return {};
-    return std::string("<|caption_begin|>") + caption +
-           "<|caption_end|><|accent_begin|><|accent_end|>"
-           "<|speaker_start|>None<|speaker_end|><|lang_begin|>Chinese<|lang_end|>" + combined;
+    if (has_conditioning_marker(combined) || has_conditioning_marker(caption)) return {};
+    return conditioning_prefix(caption, impl_->language) + combined;
 }
 
 void Engine::set_caption(const std::string & caption) {
     impl_->options.caption = caption;
+}
+
+bool Engine::set_language(const std::string & language) {
+    std::string value = trim(language);
+    for (char & ch : value) {
+        if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
+    }
+    if (value == "zh" || value == "chinese") impl_->language = "Chinese";
+    else if (value == "en" || value == "english") impl_->language = "English";
+    else if (value == "ja" || value == "japanese") impl_->language = "Japanese";
+    else if (value == "ko" || value == "korean") impl_->language = "Korean";
+    else if (value == "de" || value == "german") impl_->language = "German";
+    else if (value == "fr" || value == "french") impl_->language = "French";
+    else return false;
+    return true;
+}
+
+bool Engine::validate_text(const std::string & text, std::string & error) const {
+    if (codepoint_count(text) > kMaxTextCodepoints) {
+        error = "text is longer than " + std::to_string(kMaxTextCodepoints) + " characters";
+        return false;
+    }
+    if (Tokenizer::is_blank(text)) {
+        error = "text must not be blank";
+        return false;
+    }
+    if (has_conditioning_marker(text) || has_conditioning_marker(impl_->voice.reference) ||
+        has_conditioning_marker(impl_->options.caption)) {
+        error = "text or conditioning contains a reserved marker";
+        return false;
+    }
+    return true;
 }
 
 void Engine::set_chunking(int first_frames, int chunk_frames) {
@@ -1604,7 +1662,7 @@ bool Engine::render_text(const std::string & text, const std::string & wav_path,
     Impl & impl = *impl_;
     if (!impl.opened) { error = "engine is not open"; return false; }
     if (!impl.options.stages) { error = "engine opened without stages"; return false; }
-    if (codepoint_count(text) > 2000) { error = "text is longer than 2000 characters"; return false; }
+    if (!validate_text(text, error)) return false;
     const std::vector<std::vector<long>> segments = encode_segments(text);
     if (segments.empty()) { error = "text is empty or contains a reserved marker"; return false; }
 

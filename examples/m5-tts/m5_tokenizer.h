@@ -23,6 +23,8 @@ public:
     // Encodes one request body. BOS/EOS are added here, matching Java.
     std::vector<long> encode(const std::string & text) const;
 
+    static bool is_blank(const std::string & text);
+
     int bos() const { return bos_; }
     int eos() const { return eos_; }
 

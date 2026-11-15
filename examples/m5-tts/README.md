@@ -171,12 +171,24 @@ Endpoints (details in the `m5_server.cpp` header comment):
 
 ```
 GET  /health  /metrics  /v1/models  /v1/voices
-POST /v1/audio/speech   {"input","voice"?,"response_format"?:"wav"|"pcm"}
+POST /v1/audio/speech   {"input","voice"?,"language"?,"response_format"?:"wav"|"pcm"}
 POST /v1/voices/clone   {"name","reference_text","codes":[[16]xT]}
 POST /v1/voices/encode  {"name","reference_text","wav_base64"}
 ```
 
-The console defaults to Serena and streaming pcm. Cloning runs only on
+The optional `language` field sets the language conditioning for the entire
+request. Accepted values are `zh`, `en`, `ja`, `ko`, `de`, `fr`, or their
+English names (case-insensitive). Omission uses Chinese. For example, use
+`{"input":"Turn right in three hundred meters.","language":"en"}`. This API
+does not normalize numbers or switch languages within a request.
+
+Both formats return HTTP 400 for blank input, more than 2000 Unicode code
+points, or reserved conditioning markers. Sentence punctuation and nearby
+spaces guide splitting at the 80-code-point segment cap.
+
+The console defaults to Serena, Chinese and streaming PCM. Its language
+selector applies to both output formats. The cockpit example buttons select
+Chinese for their sample text. Cloning runs only on
 `/v1/voices/encode` (the server runs `codec_encoder.onnx` itself); synthesis
 never clones, and browser-recorded voices stay in the browser (localStorage),
 with zero server-side state.

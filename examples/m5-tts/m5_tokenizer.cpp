@@ -287,6 +287,15 @@ std::vector<std::pair<size_t, size_t>> Tokenizer::split(const char * text, size_
     return pieces;
 }
 
+bool Tokenizer::is_blank(const std::string & text) {
+    for (size_t i = 0; i < text.size();) {
+        const Codepoint cp = decode(text.data() + i, text.size() - i);
+        if (!is_space(cp.value)) return false;
+        i += cp.bytes;
+    }
+    return true;
+}
+
 void Tokenizer::encode_piece(const char * text, size_t length, std::vector<long> & out) const {
     if (length == 0) return;
     std::string mapped;
