@@ -22,3 +22,14 @@ unresolved-reference = "ignore"
 import-not-found = "ignore"
 missing-attribute = "ignore"
 missing-union-attribute = "ignore"
+
+# examples/m5-tts runs against the pinned conversion venv described in
+# examples/m5-tts/reproduce.sh (onnx 1.16 / onnxruntime 1.18 on python 3.12)
+# plus an ASLP-lab/M5-TTS checkout, neither of which
+# requirements/requirements-all.txt installs. Only the missing-module
+# diagnostics are silenced; everything else is still checked.
+[[overrides]]
+include = ["./examples/m5-tts/**"]
+
+[overrides.rules]
+import-not-found = "ignore"

@@ -56,7 +56,7 @@ class PipeDepth(PipeBackbone):
         if not np.isfinite(hidden).all() or not np.isfinite(noise).all() or np.any(noise <= 0):
             raise ValueError("expected finite hidden and positive finite sampling noise")
 
-        self.process.stdin.write(struct.pack("<I", 0))
+        self.stdin.write(struct.pack("<I", 0))
         self.position = 0
         codes = [sample((hidden @ self.heads[0])[0], noise[0], allow_eos)]
         local = np.concatenate((hidden @ self.projection, self.projected[codes]), axis=0)[None]

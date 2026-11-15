@@ -11,6 +11,15 @@ import numpy as np
 import onnxruntime as ort
 
 
+def sha256_of(path: Path) -> str:
+    """hashlib.file_digest is 3.11+; page it in by hand to keep the 3.10 floor."""
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("m5_source", type=Path)
@@ -26,9 +35,8 @@ def main():
 
     encoder = args.model / "codec_encoder.onnx"
     identity = json.loads((args.model / "codec_identity.json").read_text())["encoder_sha256"]
-    with encoder.open("rb") as source:
-        if hashlib.file_digest(source, "sha256").hexdigest() != identity:
-            raise ValueError("codec encoder SHA256 mismatch")
+    if sha256_of(encoder) != identity:
+        raise ValueError("codec encoder SHA256 mismatch")
     transcript = args.transcript.strip()
     if not transcript:
         raise ValueError("reference transcript is empty")
