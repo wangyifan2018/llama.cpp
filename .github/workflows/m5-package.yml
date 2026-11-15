@@ -59,10 +59,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # workflow_dispatch is registered from the default branch, but the tree it
+      # needs lives on the feature branch. Catch "ran it on master" here instead
+      # of three steps later on a missing file.
+      - name: Check the dispatched ref has the m5-tts tree
+        run: |
+          if [ ! -f examples/m5-tts/reproduce.sh ]; then
+            echo "::error::branch '${GITHUB_REF_NAME}' has no examples/m5-tts — pick codex/m5-tts-htp in the Run workflow dropdown"
+            exit 1
+          fi
+          echo "ref: $GITHUB_REF_NAME @ ${GITHUB_SHA::8}"
+
       - uses: actions/setup-python@v5
         with:
+          # no pip cache on purpose: the repo's requirements.txt belongs to
+          # llama.cpp (numpy/ninja/sentencepiece), not to this job's
+          # onnx/onnxruntime set, so the cache key would never match.
           python-version: "3.12"
-          cache: pip
 
       - name: Install tooling
         run: |
@@ -79,6 +92,7 @@ jobs:
       # come from HF.
       - name: Check out upstream M5-TTS
         run: |
+          mkdir -p "$WORK"
           git init -q "$M5_SRC"
           git -C "$M5_SRC" remote add origin https://github.com/ASLP-lab/M5-TTS.git
           git -C "$M5_SRC" fetch -q --depth 1 origin "${{ inputs.upstream_ref }}"

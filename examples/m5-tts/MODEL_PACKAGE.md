@@ -410,7 +410,7 @@ bash examples/m5-tts/reproduce.sh deploy     # 推包 + 起服务 + 门禁
 即只产出 artifact 不建 Release）。流程与 §4.1–§4.2 完全同一条路径：
 
 ```
-checkout -> python 3.12 -> clone 上游 M5-TTS@<ref> -> cache HF 包
+checkout -> 分支守卫 -> python 3.12 -> clone 上游 M5-TTS@<ref> -> cache HF 包
   -> fetch（验输入哈希）-> models -> codec（四步）-> package -> release
   -> 漂移检查 -> upload-artifact -> 可选 gh release
 ```
@@ -420,11 +420,24 @@ checkout -> python 3.12 -> clone 上游 M5-TTS@<ref> -> cache HF 包
 **CI 不能证的**：端到端的 codes/WAV 等价——那需要真机，只能 `reproduce.sh gate`
 在设备上跑（判据见 §5）。
 
+**run 按钮从哪来**：`workflow_dispatch` 只认**默认分支**上的 workflow 文件，所以
+这个 yml 必须同时存在于 `master`（本仓库的默认分支），否则 Actions 列表里根本
+不会出现它。`master` 上只放这一个文件，`examples/m5-tts/` 仍只在
+`codex/m5-tts-htp` 上——因此点 `Run workflow` 时**必须在分支下拉里选
+`codex/m5-tts-htp`**；选错由第一步的分支守卫直接给出可读的 `::error::`，不会
+拖到第三步才报"文件不存在"。
+
 工作目录全在 `$GITHUB_WORKSPACE/.m5-work/` 下（`M5_SRC` / `ONNX_DIR` / `OUT` / `VENV`），
-不落在仓库里，也不会被 checkout 清掉。CI 里多跑一步 `shellcheck`（runner 预装），
-守着 `reproduce.sh` 与 `deploy.sh` 不进 warning；workflow 本身用
+留在 workspace 内部是刻意的：`upload-artifact` 对 workspace 外的绝对路径行为不一致。
+该目录已进 `.gitignore`，本地用 `act` 跑也不会脏树。CI 里多跑一步 `shellcheck`
+（runner 预装），守着 `reproduce.sh` 与 `deploy.sh` 不进 warning；workflow 本身用
 `actionlint .github/workflows/m5-package.yml` 校验（本地一条命令，能抓到
 `runner` 上下文用错这类只在运行时才炸的错误）。
+
+`models` 那步会把 `soundfile` / `scipy` / `tokenizers` 按需装进 venv：这三个不是
+codec 链的依赖，而是 `prepare_android_voice.py` → 上游 `infer_onnx` 的 import 链带来
+的（纯 codec 运行不会碰它们，所以没塞进 `PIP_PKGS` 的默认值）。
+
 
 `drift` 不是失败：onnx/onnxruntime 换版本会重编号节点、重算校准区间，字节会变。
 真正要拦的是"某一步静默没生效"——那个用体积指纹（456→362→282→141 MB）和

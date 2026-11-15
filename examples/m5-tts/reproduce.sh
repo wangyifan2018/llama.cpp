@@ -135,6 +135,23 @@ require_py() {
     "$PY" -c 'import numpy, onnx, onnxruntime' || die "python env at $VENV is unusable"
 }
 
+# prepare_android_voice.py 并不读上游的权重，但它借用上游的 read_reference /
+# export_tokenizer；import infer_onnx 会连带 soundfile + scipy + tokenizers，
+# 而 codec 链本身不需要这三个。按需装，纯 codec 运行就不必付这份体积。
+MODEL_PKGS=${MODEL_PKGS:-"soundfile scipy tokenizers"}
+
+require_models_py() {
+    "$PY" -c 'import soundfile, scipy.signal, tokenizers' 2>/dev/null && return 0
+    log "installing the upstream-inference deps ($MODEL_PKGS)"
+    # shellcheck disable=SC2086
+    "$VENV/bin/pip" install -q $MODEL_PKGS || {
+        warn "pip install failed; pin MODEL_PKGS to what your mirror serves"
+        note "packages: $MODEL_PKGS"
+        exit 1
+    }
+    "$PY" -c 'import soundfile, scipy.signal, tokenizers' || die "models deps are unusable"
+}
+
 require_onnx_dir() {
     [ -f "$ONNX_DIR/backbone.onnx" ] && [ -f "$ONNX_DIR/depth_frame.onnx" ] || {
         warn "model bundle not found in $ONNX_DIR"
@@ -223,6 +240,7 @@ PY
 cmd_models() {
     require_onnx_dir
     require_py
+    require_models_py
     mkdir -p "$OUT"
 
     if need "$OUT/tokenizer.bin" "$H_TOKENIZER" "tokenizer.bin + voices.json"; then
@@ -612,7 +630,7 @@ usage: reproduce.sh [check|fetch|models|codec|binaries|package|release|deploy|ga
 
 env overrides: M5_SRC ONNX_DIR OUT VENV M5_BUILD M5_STAGE M5_ORT_ROOT VDIR
                REF_WAV TRANSCRIPT PY ADB FORWARD_PORT HF_MODEL
-               RELEASE_DIR RELEASE_TAG HF_REVISION
+               RELEASE_DIR RELEASE_TAG HF_REVISION PIP_PKGS MODEL_PKGS
 see MODEL_PACKAGE.md
 EOF
             exit 0 ;;
