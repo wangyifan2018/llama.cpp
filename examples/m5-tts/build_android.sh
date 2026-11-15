@@ -10,8 +10,7 @@
 #
 # Produces libm5engine.so (JNI), m5-engine (CLI), m5-server (HTTP) and the
 # ring transport benchmarks.
-# CMake is used when available because it links libc++ statically, so the .so
-# needs nothing beyond libonnxruntime; the direct clang++ path is the fallback.
+# Both build paths link libc++ statically.
 set -e
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -51,7 +50,7 @@ mkdir -p "$out"
 # armv8.2-a+fp16+fp16fml unlocks the f16 depth-head dot product in m5_engine.cpp; the
 # SM6650's cores all support it and older cores fall back to the f32 kernel.
 flags="-std=c++17 -O2 -fPIC -march=armv8.2-a+fp16+fp16fml -I$here -I$M5_ORT_ROOT/headers"
-libs="-L$M5_ORT_ROOT/jni/arm64-v8a -lonnxruntime -llog -landroid -pthread"
+libs="-static-libstdc++ -L$M5_ORT_ROOT/jni/arm64-v8a -lonnxruntime -llog -landroid -pthread"
 
 $CXX $flags -shared -o "$out/libm5engine.so" \
     "$here/m5_engine.cpp" "$here/m5_tokenizer.cpp" "$here/m5_jni.cpp" $libs
@@ -60,8 +59,8 @@ $CXX $flags -o "$out/m5-engine" \
 $CXX $flags -I"$here/../../vendor/cpp-httplib" -o "$out/m5-server" \
     "$here/m5_server.cpp" "$here/m5_engine.cpp" "$here/m5_tokenizer.cpp" \
     "$here/../../vendor/cpp-httplib/httplib.cpp" $libs
-$CXX $flags -o "$out/ring-stub" "$here/ring_stub.cpp"
-$CXX $flags -o "$out/ring-bench" "$here/ring_bench.cpp"
+$CXX $flags -static-libstdc++ -o "$out/ring-stub" "$here/ring_stub.cpp"
+$CXX $flags -static-libstdc++ -o "$out/ring-bench" "$here/ring_bench.cpp"
 
-echo "built with clang++ (needs libc++_shared.so at runtime)"
+echo "built with clang++"
 ls -l "$out"

@@ -44,6 +44,8 @@ done
 M5_BUILD=${M5_BUILD:-$HOME/m5-assets/build}
 M5_STAGE=${M5_STAGE:-$HOME/m5-assets/stage}
 M5_WEB=${M5_WEB:-$HERE/web/index.html}
+M5_ORT_ROOT=${M5_ORT_ROOT:-$HOME/m5-assets/ort-aar}
+ORT_LIB=$M5_ORT_ROOT/jni/arm64-v8a/libonnxruntime.so
 PORT=${PORT:-8080}
 FORWARD_PORT=${FORWARD_PORT:-18080}
 # Optional depth stage override for A/B. The stage binaries now carry the
@@ -61,20 +63,32 @@ ADB=${ADB:-$(command -v adb || echo "$HOME/Library/Android/sdk/platform-tools/ad
 
 M5_STAGE_LIBS="libllama.so libggml.so libggml-base.so libggml-cpu.so libggml-hexagon.so libggml-htp-v73.so"
 
-for f in "$M5_BUILD/m5-server" "$M5_BUILD/m5-engine" "$M5_STAGE/backbone-resident" "$M5_WEB"; do
+for f in "$M5_BUILD/m5-server" "$M5_BUILD/m5-engine" "$M5_BUILD/libm5engine.so" \
+    "$M5_STAGE/backbone-resident" "$M5_WEB" "$ORT_LIB"; do
     [ -f "$f" ] || { echo "missing artifact: $f" >&2; exit 1; }
 done
 for lib in $M5_STAGE_LIBS; do
     [ -f "$M5_STAGE/$lib" ] || { echo "missing stage library: $M5_STAGE/$lib" >&2; exit 1; }
 done
 
-echo "==> stopping old server and stages"
-# pidof, not pkill -f: a pattern that matches the shell's own command line
-# would kill the invoking shell (been there).
-$ADB shell 'for p in $(pidof m5-server); do kill $p; done; sleep 2;
-    for n in backbone-resident depth-resident; do
-        for p in $(pidof $n 2>/dev/null); do kill $p; done
-    done; sleep 1' || true
+echo "==> stopping the server in $VDIR"
+"$ADB" shell "if [ -d '$VDIR' ]; then
+    cd '$VDIR' || exit
+    exe=\$(pwd -P)/m5-server
+    for pid in \$(pidof m5-server); do
+        if [ \"\$(readlink /proc/\$pid/exe 2>/dev/null)\" = \"\$exe\" ]; then
+            kill \"\$pid\" || exit
+            for i in 1 2 3 4 5; do
+                [ \"\$(readlink /proc/\$pid/exe 2>/dev/null)\" = \"\$exe\" ] || break
+                sleep 1
+            done
+            if [ \"\$(readlink /proc/\$pid/exe 2>/dev/null)\" = \"\$exe\" ]; then
+                echo 'previous instance did not stop' >&2
+                exit 1
+            fi
+        fi
+    done
+fi"
 
 echo "==> device dir: $VDIR"
 $ADB shell "mkdir -p $VDIR/model"
@@ -84,6 +98,7 @@ $ADB push "$M5_BUILD/m5-server" "$VDIR/m5-server" >/dev/null
 $ADB push "$M5_BUILD/m5-engine" "$VDIR/m5-engine" >/dev/null
 $ADB push "$M5_BUILD/libm5engine.so" "$VDIR/libm5engine.so" >/dev/null
 $ADB push "$M5_STAGE/backbone-resident" "$VDIR/backbone-resident" >/dev/null
+$ADB push "$ORT_LIB" "$VDIR/libonnxruntime.so" >/dev/null
 echo "==> pushing Hexagon stage libraries"
 for lib in $M5_STAGE_LIBS; do
     $ADB push "$M5_STAGE/$lib" "$VDIR/$lib" >/dev/null
@@ -117,21 +132,24 @@ fi
 # the HMX matmul path that is slower for the 512-wide heads on this silicon.
 # M5_KV_PAD / M5_HVX_DIRECT_V are compiled-in defaults; prefix them in
 # M5_DEPTH_CMD to override for A/B.
-$ADB shell "cd $VDIR && D=\$PWD; \
+$ADB shell "cd '$VDIR' || exit; D=\$PWD; \
     export LD_LIBRARY_PATH=\$D ADSP_LIBRARY_PATH=\$D \
            GGML_HEXAGON_NHMX=0 GGML_HEXAGON_OPPOLL=1; \
     nohup ./m5-server model --port $PORT --cwd \$D --threads 3 \
         $DEPTH_ARGS $VOICE_ARGS \
-        --voice-encoder \$D/codec_encoder.onnx > \$D/m5-server.log 2>&1 &"
+        --voice-encoder \$D/codec_encoder.onnx > \$D/m5-server.log 2>&1 < /dev/null & echo \$! > '$VDIR/m5-server.pid'"
 sleep 3
-$ADB shell "pidof m5-server" >/dev/null || { echo "server did not start; see $VDIR/m5-server.log" >&2; exit 1; }
+"$ADB" shell "cd '$VDIR' && pid=\$(cat m5-server.pid) &&
+    [ \"\$(readlink /proc/\$pid/exe)\" = \"\$(pwd -P)/m5-server\" ]" ||
+    { echo "server did not start; see $VDIR/m5-server.log" >&2; exit 1; }
 
 echo "==> browser forward tcp:$FORWARD_PORT -> tcp:$PORT"
 $ADB forward --remove "tcp:$FORWARD_PORT" >/dev/null 2>&1 || true
 $ADB forward "tcp:$FORWARD_PORT" "tcp:$PORT" >/dev/null
 
 echo "==> health check"
-curl -fsS --noproxy '*' "http://127.0.0.1:$FORWARD_PORT/health" >/dev/null && echo "ok"
+curl -fsS --noproxy '*' --max-time 5 "http://127.0.0.1:$FORWARD_PORT/health" >/dev/null
+echo "ok"
 cat <<EOF
 
 m5-server is up.

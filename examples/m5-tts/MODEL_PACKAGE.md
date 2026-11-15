@@ -5,6 +5,8 @@
 性能结论见[优化日志 §1–§30](../../docs/backend/snapdragon/m5-tts-optimization-log.md)，
 移植细节见 [port notes](../../docs/backend/snapdragon/m5-tts-port-notes.md)。
 
+[公开 Release 权重](https://github.com/wangyifan2018/llama.cpp/releases/tag/m5-repro-v1)可直接解包到 `$OUT`。当前 `reproduce.sh` 固定上游 ONNX revision 为 `6a009494173b36257c1dc8611625956de08b27f3`，并按 SHA256 校验每个需要的上游文件。四个派生权重都匹配时，`fetch` 只取运行和准备音色所需的七个文件。
+
 配套脚本：[`reproduce.sh`](reproduce.sh)（幂等，按哈希决定是否重建）。
 本文里所有路径都是本机实际路径，换机器时按 `reproduce.sh` 顶部的环境变量覆盖。
 
@@ -283,9 +285,8 @@ bash examples/m5-tts/reproduce.sh deploy     # 推包 + 起服务 + 门禁
 #   M5_DEFAULT_VOICE='官方样例' ./examples/m5-tts/deploy.sh --no-models
 ```
 
-`deploy.sh` **只推二进制和 web 控制台，不推模型**（它做的是反向备份：
-把设备上的模型包 pull 到 `~/m5-assets/device-model-backup`）。模型包要自己 push，
-这是最容易踩的一步。`/data/local/tmp` 在设备重启后会被清空，重启后要重跑。
+`deploy.sh` 推二进制、ARM64 ORT 运行库和 web 控制台，模型由 `reproduce.sh deploy` 推送（它做的是反向备份：
+把设备上的模型包 pull 到 `~/m5-assets/device-model-backup`）。直接调用 `deploy.sh` 时，先准备设备上的模型文件。`/data/local/tmp` 在设备重启后会被清空，重启后要重跑。
 
 ---
 
@@ -295,7 +296,7 @@ bash examples/m5-tts/reproduce.sh deploy     # 推包 + 起服务 + 门禁
 
 1. **文件级**：§2.1 的 5 个派生哈希全对（2 个 gguf、`depth-weights.f32`、
    `tokenizer.bin`、codec）→ 权重与改写链没问题。
-2. **服务级**（`reproduce.sh gate` 全自动做这两条）：
+2. **服务级**（`reproduce.sh gate` 检查 HTTP、PCM 格式和指标，并报告参考输出差异）：
 
    ```sh
    adb forward tcp:18080 tcp:8080
@@ -311,8 +312,8 @@ bash examples/m5-tts/reproduce.sh deploy     # 推包 + 起服务 + 门禁
    所以不指定 `voice` 时走的是 serena）。
    换音色（serena）会得到 87 帧 / `10b0bdc1…`——**音色不同帧数自然不同**，
    这不是失败。
-3. **听感级**：抽 2–3 句人耳试听。哈希对但听着不对，说明量化档位或 codec 链
-   出了问题（见 §3 的欺骗性症状）。
+   博客的 69 帧导航样句用 `reproduce.sh benchmark` 复跑，流程见 [README](README.md#reproduce-the-android-server-and-the-69-frame-benchmark)。
+3. **听感级**：抽 2–3 句人耳试听。逐字节相同表示复现了参考 WAV。试听另外检查参考本身的底噪、破音与韵律。
 
 失败时的判定树：
 
@@ -420,12 +421,7 @@ checkout -> 分支守卫 -> python 3.12 -> clone 上游 M5-TTS@<ref> -> cache HF
 **CI 不能证的**：端到端的 codes/WAV 等价——那需要真机，只能 `reproduce.sh gate`
 在设备上跑（判据见 §5）。
 
-**run 按钮从哪来**：`workflow_dispatch` 只认**默认分支**上的 workflow 文件，所以
-这个 yml 必须同时存在于 `master`（本仓库的默认分支），否则 Actions 列表里根本
-不会出现它。`master` 上只放这一个文件，`examples/m5-tts/` 仍只在
-`codex/m5-tts-htp` 上——因此点 `Run workflow` 时**必须在分支下拉里选
-`codex/m5-tts-htp`**；选错由第一步的分支守卫直接给出可读的 `::error::`，不会
-拖到第三步才报"文件不存在"。
+**运行入口**：在 GitHub Actions 的 `m5-tts model package` 页面从默认分支 `master` 运行。该分支包含脚本与 workflow。默认生成 CI artifact；开启 `upload` 会创建或更新公开 Release。
 
 工作目录全在 `$GITHUB_WORKSPACE/.m5-work/` 下（`M5_SRC` / `ONNX_DIR` / `OUT` / `VENV`），
 留在 workspace 内部是刻意的：`upload-artifact` 对 workspace 外的绝对路径行为不一致。
@@ -449,7 +445,7 @@ codec 下限 100 MB 的断言拦。**drift 的 codec 不要直接配旧的 `voic
 - **许可**：`ASLP-lab/M5-TTS` 根目录没有 LICENSE，README 只说"按各 release 附带的条款"，
   模型卡也没有明确许可字段。再分发权属不清，这一步不该由脚本替用户决定。
 - **权威源**：HF 有 revision 和下载计数，我们镜像一份只会产生第二个"正确版本"。
-  `fetch` 用 12 条 SHA256 保证"拿到的是同一份"，比镜像更可靠。
+  `fetch` 核对已记录的上游文件 SHA256，比镜像更可靠。
 - **成本**：克隆要 1.3 GB，而 99% 的读者只想要代码和结论。
 
 真要做离线备份，用私有 HF 仓库（同一套 CLI），别拿 GitHub 当备份盘——

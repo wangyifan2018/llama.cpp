@@ -22,10 +22,10 @@ on:
         default: "m5-v1"
       hf_revision:
         description: "Revision of ASLP-lab/M5-TTS-50M-ONNX"
-        default: "main"
+        default: "6a009494173b36257c1dc8611625956de08b27f3"
       upstream_ref:
         description: "Commit/tag of ASLP-lab/M5-TTS"
-        default: "4e7cc915"
+        default: "4e7cc91545ad5ecd368d7726129cefb41fc6e1d7"
       upload:
         description: "Create or update the GitHub release"
         type: boolean
@@ -54,18 +54,17 @@ jobs:
       RELEASE_TAG: ${{ inputs.tag }}
       HF_REVISION: ${{ inputs.hf_revision }}
       HF_MODEL: ASLP-lab/M5-TTS-50M-ONNX
+      M5_UPSTREAM_REF: ${{ inputs.upstream_ref }}
       PIP_INDEX_URL: https://pypi.org/simple
 
     steps:
       - uses: actions/checkout@v4
 
-      # workflow_dispatch is registered from the default branch, but the tree it
-      # needs lives on the feature branch. Catch "ran it on master" here instead
-      # of three steps later on a missing file.
+      # Older refs may predate the M5-TTS example.
       - name: Check the dispatched ref has the m5-tts tree
         run: |
           if [ ! -f examples/m5-tts/reproduce.sh ]; then
-            echo "::error::branch '${GITHUB_REF_NAME}' has no examples/m5-tts — pick codex/m5-tts-htp in the Run workflow dropdown"
+            echo "::error::branch '${GITHUB_REF_NAME}' has no examples/m5-tts — pick master in the Run workflow dropdown"
             exit 1
           fi
           echo "ref: $GITHUB_REF_NAME @ ${GITHUB_SHA::8}"
@@ -95,7 +94,7 @@ jobs:
           mkdir -p "$WORK"
           git init -q "$M5_SRC"
           git -C "$M5_SRC" remote add origin https://github.com/ASLP-lab/M5-TTS.git
-          git -C "$M5_SRC" fetch -q --depth 1 origin "${{ inputs.upstream_ref }}"
+          git -C "$M5_SRC" fetch -q --depth 1 origin "$M5_UPSTREAM_REF"
           git -C "$M5_SRC" checkout -q FETCH_HEAD
           echo "upstream: $(git -C "$M5_SRC" rev-parse --short HEAD)"
           ls "$M5_SRC/assets/aslp_default_voice.wav"

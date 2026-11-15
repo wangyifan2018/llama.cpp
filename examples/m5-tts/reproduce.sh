@@ -34,8 +34,10 @@ M5_BUILD=${M5_BUILD:-$HOME/m5-assets/build}            # m5-server/m5-engine/lib
 M5_STAGE=${M5_STAGE:-$HOME/m5-assets/stage}            # backbone-resident + 5 个 .so
 M5_ORT_ROOT=${M5_ORT_ROOT:-$HOME/m5-assets/ort-aar}    # 解包的 onnxruntime-android.aar
 VDIR=${VDIR:-/data/local/tmp/llama-m5-htp-v73}         # 设备目录
+PORT=${PORT:-8080}
 FORWARD_PORT=${FORWARD_PORT:-18080}
 HF_MODEL=${HF_MODEL:-ASLP-lab/M5-TTS-50M-ONNX}
+HF_REVISION=${HF_REVISION:-6a009494173b36257c1dc8611625956de08b27f3}
 REF_WAV=${REF_WAV:-$M5_SRC/assets/aslp_default_voice.wav}
 TRANSCRIPT=${TRANSCRIPT:-猪携带该疾病，然后通过蚊子传染给人类。}
 PY=${PY:-$VENV/bin/python}
@@ -55,13 +57,18 @@ H_ENCODER=ae0364957dd52df283e88baea8ea09d1f1f34b579cd53d2806b38290ebc03b57
 H_TEXT_EMB=39c3849c8bbad6c94bb8e33784453d0af069335ac85da353419d7b41144afdb5
 H_AUDIO_EMB=5c0e175c1feae525d66931dd81d727cb4f244f70121504c5d014f250afc51551
 H_MANIFEST=17818a7d9e695c3953cdb5b05302df103981c94815b937a4db5c553067901dcd
+H_FP32_CODEC=8de33020e2add01361c05bf6ab6b9a0a2a11ba5a924deaa933e27b844e0a845d
+H_CODEC_META=2098e7439145aec44b6ae334610c8e97ccc29521f153944eebcb84e4cb59ca2a
+H_HF_TOKENIZER=c8e344fb99b05f0a3f8a126a137d6a21a4af73470548c1a4031c89935e67713d
+H_CODEC_IDENTITY=295c4e2fe834b73c8a6523dde1bf316b2c8fb5784773f9e423a85e427c861d68
 H_BB_GGUF=379a89db4c03245720ad1edd834a09c468e7c861821f940cb79c5458cf2808c2
 H_DEPTH_GGUF=45ae171494281f5466a11da9cd29b9e4508322125929b1a9117984630a993fc5
 H_DEPTH_F32=9e38455b6180c1db3f56e73d35f78955a5fc2aa30a71297e427def131f2e4bc2
 H_TOKENIZER=e3edd1c94d1cbcfa2af2dfe2bec21a60279e6c6640cd6d7160ed1b2e40458c42
 H_CODEC=ac3045a87ef9d485701977f8187eb0e27adc0d029488bc717c5b8da4a016f252
 
-GATE_TEXT=${GATE_TEXT:-今天的天气很好，我们一起去公园散步，看看路边的花，听听树上的鸟叫。}
+SMOKE_TEXT=今天的天气很好，我们一起去公园散步，看看路边的花，听听树上的鸟叫。
+GATE_TEXT=${GATE_TEXT:-$SMOKE_TEXT}
 
 FORCE=0
 NO_DEVICE=0
@@ -127,12 +134,12 @@ require_py() {
             exit 1
         }
     fi
-    "$PY" -c 'import numpy, onnx, onnxruntime' 2>/dev/null || {
+    "$PY" -c 'import numpy, onnx, onnxruntime, huggingface_hub' 2>/dev/null || {
         warn "python env is missing numpy/onnx/onnxruntime; installing"
         # shellcheck disable=SC2086
         "$VENV/bin/pip" install -q $PIP_PKGS || die "pip install failed; packages: $PIP_PKGS"
     }
-    "$PY" -c 'import numpy, onnx, onnxruntime' || die "python env at $VENV is unusable"
+    "$PY" -c 'import numpy, onnx, onnxruntime, huggingface_hub' || die "python env at $VENV is unusable"
 }
 
 # prepare_android_voice.py 并不读上游的权重，但它借用上游的 read_reference /
@@ -144,16 +151,16 @@ require_models_py() {
     "$PY" -c 'import soundfile, scipy.signal, tokenizers' 2>/dev/null && return 0
     log "installing the upstream-inference deps ($MODEL_PKGS)"
     # shellcheck disable=SC2086
-    "$VENV/bin/pip" install -q $MODEL_PKGS || {
+    "$VENV/bin/pip" install -q $PIP_PKGS $MODEL_PKGS || {
         warn "pip install failed; pin MODEL_PKGS to what your mirror serves"
         note "packages: $MODEL_PKGS"
         exit 1
     }
-    "$PY" -c 'import soundfile, scipy.signal, tokenizers' || die "models deps are unusable"
+    "$PY" -c 'import onnxruntime, soundfile, scipy.signal, tokenizers' || die "models deps are unusable"
 }
 
 require_onnx_dir() {
-    [ -f "$ONNX_DIR/backbone.onnx" ] && [ -f "$ONNX_DIR/depth_frame.onnx" ] || {
+    [ -f "$ONNX_DIR/manifest.json" ] || {
         warn "model bundle not found in $ONNX_DIR"
         note "run: $0 fetch     (hf download $HF_MODEL)"
         exit 1
@@ -183,7 +190,8 @@ cmd_check() {
     local pair
     for pair in "backbone.onnx:$H_BB_ONNX" "depth_frame.onnx:$H_DEPTH_ONNX" \
                 "codec_encoder.onnx:$H_ENCODER" "text_embeddings.npy:$H_TEXT_EMB" \
-                "audio_embeddings.npy:$H_AUDIO_EMB" "manifest.json:$H_MANIFEST"; do
+                "audio_embeddings.npy:$H_AUDIO_EMB" "manifest.json:$H_MANIFEST" \
+                "codec_identity.json:$H_CODEC_IDENTITY"; do
         local name=${pair%%:*} want=${pair##*:}
         if [ ! -f "$ONNX_DIR/$name" ]; then note "$name: MISSING"
         elif [ "$(sha "$ONNX_DIR/$name")" = "$want" ]; then note "$name: ok"
@@ -211,28 +219,50 @@ cmd_check() {
 
 # ---------------------------------------------------------------- fetch
 cmd_fetch() {
-    require_py
-    if [ -f "$ONNX_DIR/depth_frame.onnx" ] && [ ! "$FORCE" = 1 ]; then
-        note "bundle already in $ONNX_DIR (use --force to re-download)"
+    local pair name want
+    local files=() pairs=(
+        "codec_encoder.onnx:$H_ENCODER" "manifest.json:$H_MANIFEST"
+        "text_embeddings.npy:$H_TEXT_EMB" "audio_embeddings.npy:$H_AUDIO_EMB"
+        "codec_identity.json:$H_CODEC_IDENTITY" "codec_cached.json:$H_CODEC_META"
+        "tokenizer.json:$H_HF_TOKENIZER"
+    )
+    if [ "$FORCE" = 1 ] || ! matches "$OUT/backbone-Q8_0.gguf" "$H_BB_GGUF"; then
+        pairs+=("backbone.onnx:$H_BB_ONNX")
+    fi
+    if [ "$FORCE" = 1 ] || ! matches "$OUT/depth-Q4_0.gguf" "$H_DEPTH_GGUF" ||
+       ! matches "$OUT/depth-weights.f32" "$H_DEPTH_F32"; then
+        pairs+=("depth_frame.onnx:$H_DEPTH_ONNX")
+    fi
+    if [ "$FORCE" = 1 ] || ! matches "$OUT/codec_decoder_cached.onnx" "$H_CODEC"; then
+        pairs+=("codec_decoder_cached.onnx:$H_FP32_CODEC")
+    fi
+    for pair in "${pairs[@]}"; do
+        name=${pair%%:*}
+        want=${pair##*:}
+        if [ "$FORCE" = 1 ] || ! matches "$ONNX_DIR/$name" "$want"; then
+            files+=("$name")
+        fi
+    done
+    if [ "${#files[@]}" = 0 ]; then
+        note "reference inputs already in $ONNX_DIR"
         return 0
     fi
-    log "downloading $HF_MODEL -> $ONNX_DIR"
-    "$PY" - "$HF_MODEL" "$ONNX_DIR" <<'PY'
-import os, sys
-from huggingface_hub import snapshot_download
-repo, dest = sys.argv[1], sys.argv[2]
-rev = os.environ.get("HF_REVISION") or None
-os.makedirs(dest, exist_ok=True)
-snapshot_download(repo_id=repo, local_dir=dest, revision=rev)
-print("downloaded to", dest, "revision", rev or "default")
-PY
-    log "verifying bundle"
-    local pair
-    for pair in "backbone.onnx:$H_BB_ONNX" "depth_frame.onnx:$H_DEPTH_ONNX" \
-                "codec_encoder.onnx:$H_ENCODER" "manifest.json:$H_MANIFEST"; do
-        local name=${pair%%:*} want=${pair##*:}
-        [ "$(sha "$ONNX_DIR/$name")" = "$want" ] || die "$name does not match the reference revision"
-        note "$name: ok"
+
+    require_py
+    log "downloading $HF_MODEL @ $HF_REVISION -> $ONNX_DIR"
+    "$PY" - "$HF_MODEL" "$ONNX_DIR" "$HF_REVISION" "${files[@]}" <<'PYFETCH'
+import sys
+from huggingface_hub import hf_hub_download
+
+repo, dest, revision, *files = sys.argv[1:]
+for name in files:
+    hf_hub_download(repo, name, revision=revision, local_dir=dest, force_download=True)
+PYFETCH
+    for pair in "${pairs[@]}"; do
+        name=${pair%%:*}
+        want=${pair##*:}
+        matches "$ONNX_DIR/$name" "$want" ||
+            die "$name does not match the reference SHA256 at $HF_REVISION"
     done
 }
 
@@ -243,7 +273,7 @@ cmd_models() {
     require_models_py
     mkdir -p "$OUT"
 
-    if need "$OUT/tokenizer.bin" "$H_TOKENIZER" "tokenizer.bin + voices.json"; then
+    if [ ! -s "$OUT/voices.json" ] || need "$OUT/tokenizer.bin" "$H_TOKENIZER" "tokenizer.bin + voices.json"; then
         log "prepare_android_voice.py"
         "$PY" "$HERE/prepare_android_voice.py" "$M5_SRC" "$ONNX_DIR" "$REF_WAV" "$TRANSCRIPT" "$OUT"
     fi
@@ -271,12 +301,13 @@ cmd_codec() {
     require_onnx_dir
     require_py
     mkdir -p "$OUT"
-    [ -f "$ONNX_DIR/codec_decoder_cached.onnx" ] || die "bundle has no codec_decoder_cached.onnx in $ONNX_DIR"
     [ -f "$OUT/voices.json" ] || die "voices.json missing: run '$0 models' first (calibration needs codes)"
 
     if ! need "$OUT/codec_decoder_cached.onnx" "$H_CODEC" "codec_decoder_cached.onnx"; then
         return 0
     fi
+
+    [ -f "$ONNX_DIR/codec_decoder_cached.onnx" ] || die "bundle has no codec_decoder_cached.onnx in $ONNX_DIR"
 
     # 四步，顺序不能换：先量化 Conv，再把 ConvTranspose 折成 MatMul，
     # 然后单独补一遍 MatMul 量化，最后融合 Snake。中间产物的体积是指纹：
@@ -336,10 +367,26 @@ cmd_package() {
     cp -f "$ONNX_DIR/manifest.json" "$ONNX_DIR/text_embeddings.npy" \
           "$ONNX_DIR/audio_embeddings.npy" "$ONNX_DIR/codec_cached.json" "$OUT/model/"
     # files we generate
-    cp -f "$OUT/tokenizer.bin" "$OUT/voices.json" "$OUT/depth-weights.f32" \
-          "$OUT/codec_decoder_cached.onnx" "$OUT/model/"
+    cp -f "$OUT/tokenizer.bin" "$OUT/depth-weights.f32" \
+        "$OUT/codec_decoder_cached.onnx" "$OUT/model/"
+    # Keep Serena out of the input used by the codec calibration step.
+    python3 - "$OUT/voices.json" "$HERE/voices/serena/voices.json" "$OUT/model/voices.json" <<'PYVOICE'
+import json
+import sys
+from pathlib import Path
+
+calibration, archived, output = map(Path, sys.argv[1:])
+voices = json.loads(calibration.read_text(encoding="utf-8"))
+serena = json.loads(archived.read_text(encoding="utf-8"))
+if voices["encoder_sha256"] == serena["encoder_sha256"]:
+    names = {voice["name"] for voice in voices["voices"]}
+    voices["voices"].extend(voice for voice in serena["voices"] if voice["name"] not in names)
+else:
+    print("Serena skipped: encoder SHA256 differs from the reference model", file=sys.stderr)
+output.write_text(json.dumps(voices, ensure_ascii=False), encoding="utf-8")
+PYVOICE
     # top-level files the stages and the clone endpoint expect
-    cp -f "$ONNX_DIR/codec_encoder.onnx" "$OUT/"
+    cp -f "$ONNX_DIR/codec_encoder.onnx" "$ONNX_DIR/codec_identity.json" "$OUT/"
     for f in backbone-Q8_0.gguf depth-Q4_0.gguf; do
         [ -f "$OUT/$f" ] || die "missing $f: run '$0 models' first"
     done
@@ -347,8 +394,7 @@ cmd_package() {
 }
 
 # ---------------------------------------------------------------- gate
-# 设备上 voices.json 的第一个音色名；deploy.sh 用它做 --voice（不然默认 serena
-# 在新包上根本不存在，server 会 open 失败）。读不到就返回空。
+# Use the first packaged voice for the deployment smoke test.
 first_voice() {
     command -v python3 >/dev/null 2>&1 || return 0
     "$ADB" shell "cat $VDIR/model/voices.json" 2>/dev/null \
@@ -359,14 +405,15 @@ except Exception:
     pass' 2>/dev/null || true
 }
 
-gate() {
+gate() (
+    local mode=${1:-smoke}
     [ "$NO_DEVICE" = 1 ] && { note "gate skipped (--no-device)"; return 0; }
     log "gate: /health + one fixed-sentence wav"
-    "$ADB" forward "tcp:$FORWARD_PORT" tcp:8080 >/dev/null 2>&1 || true
+    "$ADB" forward "tcp:$FORWARD_PORT" "tcp:$PORT" >/dev/null
     local base="http://127.0.0.1:$FORWARD_PORT"
     local health=""
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-        health=$(curl -s -m 3 "$base/health" || true)
+        health=$(curl -fsS --noproxy '*' -m 3 "$base/health" || true)
         case "$health" in *ok*) break ;; esac
         sleep 1
     done
@@ -375,53 +422,77 @@ gate() {
         *) die "server did not answer on $base/health (check adb forward and m5-server)" ;;
     esac
 
-    # 第一个音色的名字决定期望值（prepare_android_voice 用参考 wav 的文件名）
-    local voice="" exp_frames="" exp_sha=""
-    voice=$(first_voice)
-    case "$voice" in
-        aslp_default_voice|官方样例) exp_frames=94; exp_sha=f6a5f5f48b73e8d8f0e510405bac98d8d6313289faf513ab8b15c46b55a089d5 ;;
-        serena) exp_frames=87; exp_sha=10b0bdc1e6e9d8de82d396983fc9292cf94edd16201cdae1c2bbaef33c2108f3 ;;
-        "") warn "cannot read the first voice name; hash check disabled" ;;
-        *) warn "voice '$voice' has no reference hash; hash check disabled" ;;
-    esac
-    note "voice: ${voice:-<server default>}"
-
-    local hdr=/tmp/m5-gate-headers.txt wav=/tmp/m5-gate.wav
-    local body
-    if [ -n "$voice" ]; then
-        body=$(printf '{"input":"%s","voice":"%s","response_format":"wav"}' "$GATE_TEXT" "$voice")
+    local voice="" exp_frames="" exp_sha="" text=$GATE_TEXT
+    if [ "$mode" = benchmark ]; then
+        voice=serena
+        text=前方三百米右转，随后靠左行驶。别着急，我们还有时间。
+        exp_frames=69
+        exp_sha=2f30728f4d6f36585858a85aa64aa117891d41bb3a633e69c1c0753d55cc1b87
     else
-        body=$(printf '{"input":"%s","response_format":"wav"}' "$GATE_TEXT")
-    fi
-    curl -s -m 120 -D "$hdr" -o "$wav" -H 'Content-Type: application/json' -d "$body" "$base/v1/audio/speech"
-
-    local frames elapsed rtf first
-    frames=$(sed -n 's/.*X-M5-Frames: *\([0-9]*\).*/\1/p' "$hdr" | tr -d '\r')
-    elapsed=$(sed -n 's/.*X-M5-Elapsed-S: *\([0-9.]*\).*/\1/p' "$hdr" | tr -d '\r')
-    rtf=$(sed -n 's/.*X-M5-RTF: *\([0-9.]*\).*/\1/p' "$hdr" | tr -d '\r')
-    first=$(sed -n 's/.*X-M5-First-Pcm-S: *\([0-9.]*\).*/\1/p' "$hdr" | tr -d '\r')
-    [ -f "$wav" ] || die "no wav returned (see $hdr)"
-
-    note "frames=$frames elapsed=${elapsed}s rtf=$rtf first_pcm=${first}s"
-    note "wav sha256: $(sha "$wav")"
-
-    if [ -n "$exp_frames" ] && [ "$frames" != "$exp_frames" ]; then
-        warn "expected $exp_frames frames for voice '$voice', got '$frames'"
-        note "  frames differ => codes differ => weights, quantisation or codec model changed"
-    fi
-    if [ -n "$exp_sha" ]; then
-        if [ "$(sha "$wav")" = "$exp_sha" ]; then
-            note "wav is byte-identical to the reference build"
-        else
-            warn "wav differs from the reference build (listening may still be fine)"
-            note "  check: codes (gguf/voices), codec chain (3 steps), threads, seed"
+        voice=$(first_voice)
+        if [ "$text" = "$SMOKE_TEXT" ]; then
+            case "$voice" in
+                aslp_default_voice|官方样例) exp_frames=94; exp_sha=f6a5f5f48b73e8d8f0e510405bac98d8d6313289faf513ab8b15c46b55a089d5 ;;
+                serena) exp_frames=87; exp_sha=10b0bdc1e6e9d8de82d396983fc9292cf94edd16201cdae1c2bbaef33c2108f3 ;;
+            esac
         fi
     fi
-    case "$rtf" in
-        "") note "no RTF header (streaming response?)" ;;
-        *) awk -v v="$rtf" 'BEGIN { if (v + 0 > 1.0) { printf "  ! RTF %s > 1: check the codec chain and --threads\n", v } }' ;;
-    esac
-}
+    note "voice: ${voice:-<server default>}"
+
+    local tmp body
+    tmp=$(mktemp -d)
+    trap 'rm -rf -- "$tmp"' EXIT
+    body=$(python3 -c 'import json, sys
+text, voice = sys.argv[1:]
+payload = {"input": text, "response_format": "wav"}
+if voice:
+    payload["voice"] = voice
+print(json.dumps(payload))' "$text" "$voice")
+    curl -fsS --noproxy '*' -m 120 -D "$tmp/headers" -o "$tmp/audio.wav" \
+        -H 'Content-Type: application/json' -d "$body" "$base/v1/audio/speech"
+
+    python3 - "$tmp" "$mode" "$exp_frames" "$exp_sha" <<'PYGATE'
+import hashlib
+import sys
+import wave
+from pathlib import Path
+
+directory, mode, expected_frames, expected_sha = sys.argv[1:]
+directory = Path(directory)
+headers = {}
+for line in (directory / "headers").read_text().splitlines():
+    key, sep, value = line.partition(":")
+    if sep:
+        headers[key.lower()] = value.strip()
+wav = directory / "audio.wav"
+try:
+    with wave.open(str(wav), "rb") as audio:
+        if audio.getnchannels() != 1 or audio.getframerate() != 24000 or audio.getsampwidth() != 2:
+            raise ValueError("expected mono 24 kHz PCM16")
+        if not audio.getnframes() or len(audio.readframes(audio.getnframes())) != audio.getnframes() * 2:
+            raise ValueError("empty or truncated audio")
+    frames = int(headers["x-m5-frames"])
+    elapsed, rtf, first = (float(headers[f"x-m5-{key}"]) for key in
+                           ("elapsed-s", "rtf", "first-pcm-s"))
+    if frames <= 0 or not 0 < first <= elapsed < float("inf") or not 0 < rtf < float("inf"):
+        raise ValueError("invalid frame count or timing")
+except (EOFError, KeyError, ValueError, wave.Error) as exc:
+    sys.exit(f"Response validation failed: {exc}")
+
+digest = hashlib.sha256(wav.read_bytes()).hexdigest()
+print(f"frames={frames} elapsed={elapsed:.3f}s rtf={rtf:.3f} first_pcm={first:.3f}s")
+print(f"wav sha256: {digest}")
+if mode == "benchmark":
+    print("SM6650 reference: 69 frames, ~3.60s elapsed, 0.677 RTF, ~0.27s first PCM")
+if expected_sha:
+    matches = frames == int(expected_frames) and digest == expected_sha
+    print(f"reference output: {'match' if matches else 'differs'}")
+    if not matches:
+        print(f"expected frames={expected_frames} wav sha256={expected_sha}", file=sys.stderr)
+        if mode == "benchmark":
+            sys.exit(1)
+PYGATE
+)
 
 # ---------------------------------------------------------------- deploy
 cmd_deploy() {
@@ -430,18 +501,23 @@ cmd_deploy() {
     "$ADB" get-state >/dev/null 2>&1 || die "no device attached (adb devices)"
     [ -f "$OUT/model/manifest.json" ] || die "package missing: run '$0 package' first"
 
+    [ -f "$M5_ORT_ROOT/jni/arm64-v8a/libonnxruntime.so" ] || die "extract the ORT Android AAR and set M5_ORT_ROOT"
+
     log "pushing model package to $VDIR"
     "$ADB" shell "mkdir -p $VDIR/model" >/dev/null
     "$ADB" push "$OUT/model/." "$VDIR/model/" >/dev/null
     "$ADB" push "$OUT/backbone-Q8_0.gguf" "$OUT/depth-Q4_0.gguf" "$OUT/codec_encoder.onnx" "$VDIR/" >/dev/null
+    if [ -f "$OUT/codec_identity.json" ]; then
+        "$ADB" push "$OUT/codec_identity.json" "$VDIR/" >/dev/null
+    fi
 
     log "deploying binaries (deploy.sh --no-models)"
-    # deploy.sh 的默认音色是 serena；新包里没有它，server 会 open 失败。
-    # 用包里实际存在的第一个音色（读不到就交给 server 的默认 voice 0）。
+    # Also support packages that only contain the official voice.
     local voice
     voice=$(first_voice)
     note "default voice: ${voice:-<server default>}"
-    M5_BUILD="$M5_BUILD" M5_STAGE="$M5_STAGE" M5_DEFAULT_VOICE="$voice" \
+    ADB="$ADB" M5_BUILD="$M5_BUILD" M5_STAGE="$M5_STAGE" M5_ORT_ROOT="$M5_ORT_ROOT" \
+        PORT="$PORT" FORWARD_PORT="$FORWARD_PORT" M5_DEFAULT_VOICE="$voice" \
         bash "$HERE/deploy.sh" "$VDIR" --no-models
 
     gate
@@ -506,7 +582,7 @@ cmd_release() {
     local commit upstream hf_rev
     commit=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)
     upstream=$(git -C "$M5_SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
-    hf_rev=${HF_REVISION:-main}
+    hf_rev=$HF_REVISION
 
     {
         sum_line "$model/codec_decoder_cached.onnx" "$H_CODEC"
@@ -614,7 +690,7 @@ while [ $# -gt 0 ]; do
         --tag) shift; RELEASE_TAG=${1:-}; [ -n "$RELEASE_TAG" ] || die "--tag needs a value" ;;
         -h|--help)
             cat <<'EOF'
-usage: reproduce.sh [check|fetch|models|codec|binaries|package|release|deploy|gate|all]
+usage: reproduce.sh [check|fetch|models|codec|binaries|package|release|deploy|gate|benchmark|all]
                     [--force] [--no-device] [--upload] [--tag NAME]
 
   check     体检：路径、bundle 与已有产物的哈希（不写盘）
@@ -625,11 +701,12 @@ usage: reproduce.sh [check|fetch|models|codec|binaries|package|release|deploy|ga
   package   摆成设备侧目录结构 $OUT/model
   release   打 Release 附件（codec + 派生的 gguf/f32），--upload 直接上传
   deploy    push 模型包 + deploy.sh --no-models + 门禁
-  gate      只跑门禁（/health + 固定句子的 wav 哈希）
+  gate      检查服务、PCM 格式与合成指标（报告输出差异）
+  benchmark 复跑 Serena 69 帧参考（输出不匹配时失败）
   all       fetch -> models -> codec -> binaries -> package -> deploy
 
 env overrides: M5_SRC ONNX_DIR OUT VENV M5_BUILD M5_STAGE M5_ORT_ROOT VDIR
-               REF_WAV TRANSCRIPT PY ADB FORWARD_PORT HF_MODEL
+               REF_WAV TRANSCRIPT PY ADB PORT FORWARD_PORT HF_MODEL
                RELEASE_DIR RELEASE_TAG HF_REVISION PIP_PKGS MODEL_PKGS
 see MODEL_PACKAGE.md
 EOF
@@ -651,6 +728,7 @@ case "$CMD" in
     release)  cmd_release ;;
     deploy)   cmd_deploy ;;
     gate)     gate ;;
+    benchmark) gate benchmark ;;
     all)
         cmd_fetch
         cmd_models

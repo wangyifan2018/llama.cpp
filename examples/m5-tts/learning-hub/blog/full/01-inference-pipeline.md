@@ -1,6 +1,6 @@
 # M5-TTS 端侧推理实战（01）｜认识 M5-TTS：一帧音频是怎么来的
 
-开源仓库：[wangyifan2018/llama.cpp](https://github.com/wangyifan2018/llama.cpp) · [M5-TTS 代码与运行说明](https://github.com/wangyifan2018/llama.cpp/tree/master/examples/m5-tts)
+开源仓库：[wangyifan2018/llama.cpp](https://github.com/wangyifan2018/llama.cpp) · [M5-TTS 代码与运行说明](https://github.com/wangyifan2018/llama.cpp/tree/master/examples/m5-tts) · [模型权重与真机复现](https://github.com/wangyifan2018/llama.cpp/releases/tag/m5-repro-v1)
 
 从文本和参考音色开始，沿着 backbone、depth 和 codec 走完整条生成链。
 
