@@ -178,7 +178,7 @@ cmd_check() {
         elif [ -f "$OUT/$name" ]; then warn "$name: hash mismatch"
         else note "$name: missing"; fi
     done
-    if matches "$OUT/codec_decoder_cached.onnx" "$H_CODEC"; then note "codec_decoder_cached.onnx: ok (three-step chain applied)"
+    if matches "$OUT/codec_decoder_cached.onnx" "$H_CODEC"; then note "codec_decoder_cached.onnx: ok (four-step chain applied)"
     elif [ -f "$OUT/codec_decoder_cached.onnx" ]; then warn "codec_decoder_cached.onnx: hash mismatch (missing snake_fuse?)"
     else note "codec_decoder_cached.onnx: missing"; fi
 
