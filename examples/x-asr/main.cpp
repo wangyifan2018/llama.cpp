@@ -39,6 +39,7 @@ int main(int argc, char ** argv) {
     params.device = argv[2];
     bool realtime = false;
     bool concurrent = false;
+    int hold_ms = 0;
     std::vector<const char *> waves;
     for (int i = 3; i < argc; ++i) {
         if (std::strcmp(argv[i], "--realtime") == 0) {
@@ -51,6 +52,8 @@ int main(int argc, char ** argv) {
             params.n_streams = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--concurrent") == 0) {
             concurrent = true;
+        } else if (std::strcmp(argv[i], "--hold-ms") == 0 && i + 1 < argc) {
+            hold_ms = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--joiner-device") == 0) {
             params.joiner_on_device = true;
         } else if (std::strcmp(argv[i], "--joiner-host") == 0) {
@@ -92,6 +95,14 @@ int main(int argc, char ** argv) {
             }
             const auto start = xasr_clock::now();
             ma_uint64 frames = 0;
+            ma_uint64 total = 0;
+            if (ma_decoder_get_length_in_pcm_frames(audio.get(), &total) != MA_SUCCESS || total == 0) {
+                total = 0;
+            }
+            const ma_uint64 split = total > (ma_uint64) (hold_ms * 16) ? total - (ma_uint64) (hold_ms * 16) : total;
+            std::vector<double> endpoint_ms((size_t) n, 0.0);
+            std::vector<std::string> texts((size_t) n);
+            bool split_done = false;
             for (;;) {
                 float samples[320];
                 ma_uint64 n_read = 0;
@@ -105,9 +116,22 @@ int main(int argc, char ** argv) {
                     if (realtime) {
                         std::this_thread::sleep_until(start + std::chrono::microseconds(frames * 1000000 / 16000));
                     }
-                    for (auto & stream : streams) {
-                        if (!xasr_append(stream.get(), samples, static_cast<int>(n_read))) {
+                    // Until the split, every stream receives audio. After it only
+                    // the last stream does, while the others are committed.
+                    const int active = (hold_ms > 0 && frames > split && split_done) ? 1 : n;
+                    for (int i = n - active; i < n; ++i) {
+                        if (!xasr_append(streams[(size_t) i].get(), samples, static_cast<int>(n_read))) {
                             return 6;
+                        }
+                    }
+                    if (hold_ms > 0 && !split_done && frames >= split) {
+                        split_done = true;
+                        const auto ep = xasr_clock::now();
+                        for (int i = 0; i < n - 1; ++i) {
+                            if (!xasr_commit(streams[(size_t) i].get(), texts[(size_t) i])) {
+                                return 7;
+                            }
+                            endpoint_ms[(size_t) i] = std::chrono::duration<double, std::milli>(xasr_clock::now() - ep).count();
                         }
                     }
                 }
@@ -116,15 +140,14 @@ int main(int argc, char ** argv) {
                 }
             }
             const auto endpoint = xasr_clock::now();
-            for (int i = 0; i < n; ++i) {
-                std::string text;
-                if (!xasr_commit(streams[(size_t) i].get(), text)) {
+            for (int i = (hold_ms > 0 ? n - 1 : 0); i < n; ++i) {
+                if (!xasr_commit(streams[(size_t) i].get(), texts[(size_t) i])) {
                     return 7;
                 }
-                const auto done = xasr_clock::now();
-                printf("%s\tstream=%d\tendpoint_to_final_ms=%.3f\tcommit_ms=%.3f\t%s\n", wave, i,
-                       std::chrono::duration<double, std::milli>(done - endpoint).count(),
-                       std::chrono::duration<double, std::milli>(done - endpoint).count(), text.c_str());
+                endpoint_ms[(size_t) i] = std::chrono::duration<double, std::milli>(xasr_clock::now() - endpoint).count();
+            }
+            for (int i = 0; i < n; ++i) {
+                printf("%s\tstream=%d\tendpoint_to_final_ms=%.3f\t%s\n", wave, i, endpoint_ms[(size_t) i], texts[(size_t) i].c_str());
             }
             rusage usage{};
             getrusage(RUSAGE_SELF, &usage);

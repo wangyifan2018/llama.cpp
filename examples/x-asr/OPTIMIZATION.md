@@ -378,6 +378,12 @@ Text is identical on every stream, and a second and third wave in the same
 process, including a Chinese to English switch, reproduce the same numbers, so
 the slots are cleared on reuse. About 17 MB and 20 ms of init per extra slot.
 
+With staggered endpoints the picture changes. Three streams end 1.5 s before the
+fourth on a 10 s clip: 171.4, 343.2 and 514.9 ms for the three, and 269.6 ms for
+the stream that kept recording, against 265 ms for that clip alone. Two streams
+with a 3 s stagger: 171.9 and 268.9 ms. The continuing stream pays nothing for
+the other commits because the DSP drains them while it is still receiving audio.
+
 **What it does not cover.** The worker is single threaded and the streams are
 serialized, so the four-way simultaneous endpoint costs one commit per stream,
 683 ms for the last one. Interleaving chunks between streams does not change the

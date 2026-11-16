@@ -295,11 +295,27 @@ and third wave in one process, including a language change, so the per-stream
 state is cleared on reuse. Cost per extra slot is about 17 MB of memory and 20 ms
 of model init.
 
-What this does not do: the streams are serialized. Total work for four aligned
-endpoints is four commits, so the last stream waits for the other three. Cutting
-that needs the encoder batched across streams, which needs a graph with a stream
-dimension through the attention and its per-stream left context. Until then the
-four-way simultaneous endpoint number is 683 ms, not 170 ms.
+Staggered endpoints, same device and settings. `--hold-ms T` stops feeding every
+stream except the last at `T` before the end, then commits the finished ones
+while the last one keeps recording. The short streams therefore transcribe a
+truncated utterance; only their latency is comparable.
+
+| Case | endpoint to final (ms) | last stream's own single-stream cost |
+|---|---|---|
+| 4 aligned, zh 2.65 s | 169.6, 339.5, 510.1, 680.7 | 170 |
+| 3 end at 8.5 s, 1 records to 10 s | 171.4, 343.2, 514.9, **269.6** | 265 |
+| 2 streams, 3 s stagger, 10 s clip | 171.9, **268.9** | 265 |
+
+When the endpoints do not collide, the continuing stream pays nothing for the
+other commits: the DSP drains them while it is still receiving audio, and its
+endpoint to final is its own single-stream cost (269.6 against 265, 268.9
+against 265). The head-of-line penalty appears only when endpoints are aligned.
+That is the case the four-way number above measures, and the reason the next step
+is encoder batching rather than scheduling.
+
+What batching needs: a stream dimension through the attention and its per-stream
+left context. The feed-forward, convolution and pointwise blocks can be widened
+across streams without that, so a partial batch is possible first.
 
 ## Reproduce on Android
 
