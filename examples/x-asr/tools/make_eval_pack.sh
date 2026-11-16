@@ -17,6 +17,7 @@ HERE=$(dirname "$0")
 ZH_VOICE=${ZH_VOICE:-Flo (中文（中国大陆）)}
 EN_VOICE=${EN_VOICE:-Samantha}
 NOISE=${NOISE:-}
+TEXTS=${XASR_EVAL_TEXTS:-"$HERE/eval_texts.tsv"}
 mkdir -p "$OUT"
 : > "$OUT/manifest.tsv"
 
@@ -37,6 +38,6 @@ while IFS="$(printf '	')" read -r name lang text; do
     else
         printf '%s\t%s\t%s\n' "${name}.wav" "$lang" "$text" >> "$OUT/manifest.tsv"
     fi
-done < "$HERE/eval_texts.tsv"
+done < "$TEXTS"
 
 echo "wrote $(wc -l < "$OUT/manifest.tsv") entries to $OUT/manifest.tsv"

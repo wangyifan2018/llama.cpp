@@ -501,3 +501,29 @@ question instead of rediscovering them.
 4. **Prove batching on service traffic.** Separate shared weights and graph metadata from per-stream encoder caches and predictor state. Start with batch size 1 and 2, then measure 4. Use ready chunks to fill a batch and prefer committed streams when their remaining chunks are ready. Compare no intentional batch wait with a bounded batching window. Preserve stream order, ensure ongoing streams get service, and test cancel, reset, and reuse for state leakage. Replay staggered arrivals, four simultaneous endpoints, and three endpoints while another stream keeps recording. Record queue wait, commit-to-final, endpoint-to-final P50/P95/P99, throughput, CPU time, and memory. Report sample count and run long enough to include thermal steady state. Compare with the current single-stream HTP and the shared-weight CPU ONNX scheduler before enabling batching by default.
 
 5. **Revisit model variants after the latency breakdown.** Keep Q8_0 as the reference. A shorter chunk is a separate model geometry experiment with different left context, invocation frequency, and endpoint behavior. A lower-precision variant is a separate accuracy experiment. Compare both with Q8_0 on identical VAD cuts under road noise, music, and overlapping speech. Use Chinese CER, English WER, entity accuracy, and command success to decide if the measured tail reduction is acceptable.
+
+
+## Cabin acceptance cases
+
+The service target caps a physical inference batch at four. Test B=1, B=2,
+and B=4 with independent session start offsets. In addition to aligned starts,
+`bench_service.py --scenarios stagger-start4` feeds lengths 20 s, 10 s, and
+two short commands at offsets 0, 10,000, 17,100, and 17,400 ms. The clips
+overlap and end within about 300 ms of each other. Include mixed endpoints as
+a separate case. Preserve per-stream ordering and compare endpoint-to-final
+and completed-request throughput at the same arrival schedule.
+
+The command classes are windows, climate, seats, and cabin lights. Judge each
+recognized command against the intended action, target or position, value and
+unit, and polarity. For multi-action requests require every action and count
+any extra action as a semantic error. Include front/rear and left/right
+confusion pairs, one/two/three levels, off versus leave on, and non-command
+speech. Report Chinese CER and English WER alongside those checks.
+
+`tools/vehicle_commands.tsv` and the evaluation generator provide a synthetic
+starting set. Keep an independent set of real cabin VAD cuts for accuracy
+decisions. Before adding a bias list, measure which names, actions, or values
+are missed. For recurring entity misses, A/B a bounded, session-scoped phrase
+bias at token selection and verify it with negatives and confusable targets.
+Test the same bias with and without HTP joiner execution. Avoid rewriting
+recognized actions, positions, numbers, or negation at the text layer.
