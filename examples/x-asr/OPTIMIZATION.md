@@ -468,6 +468,28 @@ pattern, are the next step. The CPU engine also steals cycles from the predictor
 and the feature extractor that run inside the device engine's commits, which the
 numbers above already include.
 
+### H7. OpenCL GPU as a third engine (rejected)
+
+**Idea.** The device exposes an Adreno 810 through the OpenCL backend, and the
+hybrid result showed that a second processor nearly doubles capacity. A third
+engine could take a third of the commits.
+
+**Test.** `llama-x-asr ... GPUOpenCL zh.wav` on the device. The backend loads
+about 300 kernels on first use; with a 20 s timeout the process was still in
+kernel loading and never reached the encoder. The device names `OpenCL`, `GPU`
+and `MTL0` do not resolve, so `GPUOpenCL` is the backend's device name and the
+blocker is compilation, not discovery.
+
+**Why it is not worth pursuing here.** Even with a warm kernel cache the encoder
+would have to place all 2,877 nodes on OpenCL, because the engine rejects
+fallback: the graph contains a depthwise convolution, `ssm_conv`, argmax and a
+large number of tiny elementwise ops whose per-dispatch cost on a GPU is worse
+than on the DSP. The two-engine split already reaches 8.3 times real time, and
+the third engine would have to beat a 1.0 s saturated tail to matter.
+
+Recorded so the next attempt starts from the kernel cache and the op coverage
+question instead of rediscovering them.
+
 ## Next experiments
 
 1. **Measure where the remaining tail goes.** In [`run_chunks`](xasr.cpp#L746) time feature and mask uploads, scheduled compute and completion, and encoder projection readback. In [`stream_accept`](xasr.cpp#L1018) time fbank, predictor/joiner, and text finalization. Tag each chunk with its phase (audio arrival or commit), sequence position, and number of DSP submissions. Collect a separate per-op profile using the [benchmark command](BENCHMARK.md#optional-htp-operator-profile). This distinguishes DSP kernel time from host submission and waiting. Compare CPU, HTP waiting, and HTP polling under both idle and representative CPU load.

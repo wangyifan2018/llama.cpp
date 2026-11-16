@@ -394,6 +394,44 @@ sequence and many more repetitions before any scheduling change is judged.
 
 
 
+## Capacity and saturation
+
+Throughput is measured unpaced: the client sends each clip as fast as the socket
+accepts, so the number is engine capacity, not a latency test. One process per
+cell, 24 clips of 2.65 s per cell, audio seconds per wall second.
+
+| Engines | 1 session | 2 sessions | 4 sessions |
+|---|---:|---:|---:|
+| HTP x4 | 4.23 | 4.27 | 4.28 |
+| HTP x2 + CPU x2 | 4.23 | 6.65 | 8.27 |
+
+One HTP engine saturates at 4.3 times real time no matter how many sessions feed
+it, because the DSP is the only worker. Adding the CPU engine lifts the same
+device to 8.3 times real time at four sessions, which is the capacity the hybrid
+split is buying. A single session still lands on the device engine and is
+unchanged.
+
+Saturation latency, four sessions unpaced, five consecutive blocks of 72 clips
+(about 4.5 minutes of sustained load):
+
+| Block | endpoint to final p50 | p95 | max |
+|---|---:|---:|---:|
+| 1 | 709 | 1243 | 1248 |
+| 2 | 1028 | 1247 | 1307 |
+| 3 | 1036 | 1247 | 1252 |
+| 4 | 1035 | 1252 | 1282 |
+| 5 | 1026 | 1247 | 1255 |
+
+Driven at capacity the service settles at about 1.0 s p50 and 1.25 s p95 and does
+not drift across the blocks, so there is no thermal degradation visible in
+service latency over this window. The first block is faster because the queues
+start empty. One block's wall time was far above the others (156 s against 23 s)
+while its per-request latencies matched the rest; the stall sits in the unpaced
+client path, four threads pushing through `adb forward`, not in the engine, so
+the per-request rows are the ones to read.
+
+Peak RSS for the hybrid server is 313 MB, measured on the device.
+
 ## Reproduce on Android
 
 Run these blocks from the repository root in the same Bash session. The [Snapdragon toolchain guide](../../docs/backend/snapdragon/README.md) covers Docker and ADB setup. Set `ANDROID_SERIAL` if several devices are attached.

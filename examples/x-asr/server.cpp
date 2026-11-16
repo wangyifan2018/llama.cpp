@@ -30,6 +30,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -179,9 +180,14 @@ static void close_session(uint32_t id) {
     sessions.erase(it);
 }
 
+// Bounded queue: a reader that outruns its engine blocks here, which is the
+// backpressure the client sees as a stalled socket.
+static size_t queue_limit = 256;
+
 static void push(engine * eng, request && req) {
     {
-        std::lock_guard<std::mutex> lock(eng->mutex);
+        std::unique_lock<std::mutex> lock(eng->mutex);
+        eng->ready.wait(lock, [eng] { return eng->queue.size() < queue_limit || eng->stopping; });
         eng->queue.push_back(std::move(req));
     }
     eng->ready.notify_one();
@@ -387,7 +393,7 @@ int main(int argc, char ** argv) {
         } else if (std::strcmp(argv[i], "--idle-ms") == 0 && i + 1 < argc) {
             idle_limit_ms = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--queue") == 0 && i + 1 < argc) {
-            (void) std::atoi(argv[++i]);
+            queue_limit = (size_t) std::max(1, std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
             bind_addr = argv[++i];
         } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {

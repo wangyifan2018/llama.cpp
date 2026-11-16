@@ -8,10 +8,11 @@ Server-side queue and commit time are printed from its own log.
 
 import argparse
 import json
+import os
 import statistics
 import subprocess
 import sys
-import os
+import wave
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -45,7 +46,26 @@ def main():
     parser.add_argument("--long2", required=True, help="20 s clip")
     parser.add_argument("--scenarios", default="single,aligned4,stagger4,mixed4")
     parser.add_argument("--out", default=None, help="write raw JSONL here")
+    parser.add_argument("--throughput", action="store_true",
+                        help="unpaced sweep over concurrency: audio seconds per wall second")
+    parser.add_argument("--concurrency", default="1,2,4")
     args = parser.parse_args()
+
+    if args.throughput:
+        import time
+        with wave.open(args.short, "rb") as f:
+            clip_s = f.getnframes() / float(f.getframerate())
+        print("clip %.3f s, unpaced, one process per cell" % clip_s)
+        print("%-6s %8s %10s %12s" % ("sess", "runs", "wall_s", "audio/wall"))
+        for n in [int(x) for x in args.concurrency.split(",")]:
+            reps = max(1, 24 // n)
+            start = time.monotonic()
+            subprocess.run([sys.executable, os.path.join(HERE, "asr_client.py"), "--port", str(args.port),
+                            "--wav", args.short, "--sessions", str(n), "--reps", str(reps), "--json"],
+                           check=True, capture_output=True, text=True)
+            wall = time.monotonic() - start
+            print("%-6d %8d %10.2f %12.2f" % (n, n * reps, wall, n * reps * clip_s / wall))
+        return
 
     rows = []
     for name in args.scenarios.split(","):
