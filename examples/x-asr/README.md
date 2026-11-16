@@ -153,3 +153,5 @@ The example covers the inference path. A server can put a request queue and IPC 
 See [BENCHMARK.md](BENCHMARK.md) for the reproducible device benchmark, fixture hashes, and results. [OPTIMIZATION.md](OPTIMIZATION.md) explains the graph changes, how to isolate each one, and the next experiments. [BUILD.md](BUILD.md) has the host, Android and incremental build steps. [ALIGNMENT.md](ALIGNMENT.md) compares the streaming configuration with sherpa-onnx, and [ONNX-ANALYSIS.md](ONNX-ANALYSIS.md) compares the ONNX graph with this implementation. `tools/` holds the sherpa-onnx control harness, the four-configuration driver and the tail fixture generator.
 
 Use [VEHICLE-EVAL.md](VEHICLE-EVAL.md) to reproduce the window, climate, seat, and cabin-light command baseline.
+
+For encoder-only throughput and numerical checks on HTP, see the [fixed-lane B=2/B=4 probe](BENCHMARK.md#fixed-lane-htp-encoder-batch-probe). The server scheduler continues to execute one stream per graph.

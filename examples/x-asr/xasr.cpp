@@ -106,6 +106,7 @@ struct geom {
 // One stream slot: its own encoder graph, scheduler and state. The model
 // weights are shared by every slot through xasr_context::model.
 struct xasr_slot {
+    int batch_size = 1;
     ggml_cgraph * graph = nullptr;
     ggml_backend_sched_t sched = nullptr;
     std::vector<uint8_t> meta;
@@ -115,6 +116,12 @@ struct xasr_slot {
     ggml_tensor * feats = nullptr;
     ggml_tensor * output = nullptr;
     bool busy = false;
+
+    ~xasr_slot() {
+        if (sched) {
+            ggml_backend_sched_free(sched);
+        }
+    }
 };
 
 struct xasr_context {
@@ -440,8 +447,16 @@ bool load(xasr_model & m, const char * path, ggml_backend_t backend) {
 // ---- graph helpers ---------------------------------------------------------
 
 ggml_tensor * lin(ggml_context * g, ggml_tensor * x, ggml_tensor * w, ggml_tensor * b) {
+    const int64_t time = x->ne[1];
+    const int64_t batch = x->ne[2];
+    if (batch > 1) {
+        x = ggml_reshape_2d(g, x, x->ne[0], time * batch);
+    }
     ggml_tensor * y = ggml_mul_mat(g, w, x);
-    return b ? ggml_add(g, y, b) : y;
+    if (b) {
+        y = ggml_add(g, y, b);
+    }
+    return batch > 1 ? ggml_reshape_3d(g, y, y->ne[0], time, batch) : y;
 }
 
 // Swoosh-L(x) = log(1 + e^(x-4)) - 0.08x - 0.035; Swoosh-R: offset 1, constant 0.313261687.
@@ -465,7 +480,7 @@ ggml_tensor * bias_norm(ggml_context * g, ggml_tensor * x, ggml_tensor * bias, f
     // the sum; for speech the term is below float resolution of the sum.
     sum = ggml_clamp(g, sum, 1e-6f, INFINITY);
     ggml_tensor * denom = ggml_reshape_1d(g, sum, ggml_nelements(sum));
-    denom = ggml_reshape_2d(g, ggml_sqrt(g, denom), 1, x->ne[1]);
+    denom = ggml_reshape_3d(g, ggml_sqrt(g, denom), 1, x->ne[1], x->ne[2]);
     return ggml_scale(g, ggml_div(g, x, denom), scale * std::sqrt(float(x->ne[0])));
 }
 
@@ -480,19 +495,19 @@ ggml_tensor * ffn(ggml_context * g, ggml_tensor * x, ggml_tensor * w1, ggml_tens
 
 // Depthwise correlation over time of (C, Tin) with a (K, C) kernel: out (C, Tin-K+1).
 ggml_tensor * dwconv_valid(ggml_context * g, ggml_tensor * x, ggml_tensor * w) {
-    const int C = (int)x->ne[0], Tin = (int)x->ne[1], K = (int)w->ne[0];
+    const int C = (int)x->ne[0], Tin = (int)x->ne[1];
     ggml_tensor * xt = ggml_cont(g, ggml_transpose(g, x)); // (Tin, C)
-    ggml_tensor * y = ggml_ssm_conv(g, ggml_reshape_3d(g, xt, Tin, C, 1), ggml_reshape_2d(g, w, K, C));
-    return ggml_reshape_2d(g, y, C, Tin - K + 1);
+    ggml_tensor * y = ggml_ssm_conv(g, ggml_reshape_3d(g, xt, Tin, C, x->ne[2]), ggml_reshape_2d(g, w, w->ne[0], C));
+    return y;
 }
 
-// Last n columns of a (R, T) tensor, contiguous.
+// Last n frames of each lane in a (channels, time, batch) tensor.
 ggml_tensor * last_cols(ggml_context * g, ggml_tensor * x, int n) {
-    return ggml_cont(g, ggml_view_2d(g, x, x->ne[0], n, x->nb[1], (size_t)(x->ne[1] - n) * x->nb[1]));
+    return ggml_cont(g, ggml_view_3d(g, x, x->ne[0], n, x->ne[2], x->nb[1], x->nb[2], (size_t)(x->ne[1] - n) * x->nb[1]));
 }
 
 ggml_tensor * rows(ggml_context * g, ggml_tensor * x, int r0, int n) {
-    return ggml_cont(g, ggml_view_2d(g, x, n, x->ne[1], x->nb[1], (size_t)r0 * ggml_element_size(x)));
+    return ggml_cont(g, ggml_view_3d(g, x, n, x->ne[1], x->ne[2], x->nb[1], x->nb[2], (size_t)r0 * ggml_element_size(x)));
 }
 
 // CompactRelPositionalEncoding rows for relative positions -(seq+left-1) .. seq-1.
@@ -579,26 +594,27 @@ ggml_tensor * zipformer_layer(xasr_context * c, ggml_context * g, ggml_cgraph * 
     const auto & hp = c->model.hp;
     const int d = hp.dims[s], H = hp.n_heads[s], qd = hp.qd[s], vd = hp.vd[s], pd = hp.pd[s], K = hp.kernel[s];
     const int hid = 3 * d / 4, pad = K / 2, Tk = left + seq;
+    const auto batch = x->ne[2];
     ggml_tensor * src_orig = x;
 
     // 1. attention weights
     ggml_tensor * in = lin(g, x, L.aw_in_w, L.aw_in_b); // (H*(2qd+pd), seq)
-    ggml_tensor * q = ggml_reshape_3d(g, rows(g, in, 0, H * qd), qd, H, seq);
+    ggml_tensor * q = ggml_reshape_4d(g, rows(g, in, 0, H * qd), qd, H, seq, batch);
     ggml_tensor * k = rows(g, in, H * qd, H * qd);
-    ggml_tensor * p = ggml_reshape_3d(g, rows(g, in, 2 * H * qd, H * pd), pd, H, seq);
-    ggml_tensor * ck = ggml_new_tensor_2d(g, GGML_TYPE_F32, H * qd, left);
+    ggml_tensor * p = ggml_reshape_4d(g, rows(g, in, 2 * H * qd, H * pd), pd, H, seq, batch);
+    ggml_tensor * ck = ggml_new_tensor_3d(g, GGML_TYPE_F32, H * qd, left, batch);
     in_tensor(ck, lname("ck", li));
     ggml_tensor * kfull = ggml_concat(g, ck, k, 1); // (H*qd, Tk)
     out_tensor(gf, last_cols(g, kfull, left), lname("o_ck", li));
     ggml_tensor * Q = ggml_cont(g, ggml_permute(g, q, 0, 2, 1, 3));                                     // (qd, seq, H)
-    ggml_tensor * Kh = ggml_cont(g, ggml_permute(g, ggml_reshape_3d(g, kfull, qd, H, Tk), 0, 2, 1, 3)); // (qd, Tk, H)
+    ggml_tensor * Kh = ggml_cont(g, ggml_permute(g, ggml_reshape_4d(g, kfull, qd, H, Tk, batch), 0, 2, 1, 3)); // (qd, Tk, H)
     ggml_tensor * sc = ggml_mul_mat(g, Kh, Q);                                                          // (Tk, seq, H)
     ggml_tensor * PE = project_positions(c, g, positions, L.aw_pos_w, pd, H);
     ggml_tensor * P = ggml_cont(g, ggml_permute(g, p, 0, 2, 1, 3)); // (pd, seq, H)
     ggml_tensor * ps = ggml_mul_mat(g, PE, P);                      // (L2, seq, H)
     // rel -> abs: out[j, t] = ps[j + seq-1-t, t] (icefall's as_strided)
     ggml_tensor * shifted =
-        ggml_view_3d(g, ps, Tk, seq, H, ps->nb[1] - ps->nb[0], ps->nb[2], (size_t)(seq - 1) * ps->nb[0]);
+        ggml_view_4d(g, ps, Tk, seq, H, batch, ps->nb[1] - ps->nb[0], ps->nb[2], ps->nb[3], (size_t)(seq - 1) * ps->nb[0]);
     sc = ggml_add(g, sc, ggml_cont(g, shifted));
     sc = ggml_add(g, sc, mask);            // (Tk) broadcast: -inf on not-yet-filled left context
     ggml_tensor * W = ggml_soft_max(g, sc); // (Tk, seq, H)
@@ -612,11 +628,11 @@ ggml_tensor * zipformer_layer(xasr_context * c, ggml_context * g, ggml_cgraph * 
         ggml_tensor * sgate = ggml_tanh(g, rows(g, t, 0, hid));
         ggml_tensor * xx = ggml_mul(g, rows(g, t, hid, hid), sgate);
         ggml_tensor * y = rows(g, t, 2 * hid, hid);
-        ggml_tensor * cn = ggml_new_tensor_2d(g, GGML_TYPE_F32, hid, left);
+        ggml_tensor * cn = ggml_new_tensor_3d(g, GGML_TYPE_F32, hid, left, batch);
         in_tensor(cn, lname("cn", li));
         ggml_tensor * xp = ggml_concat(g, cn, xx, 1); // (hid, Tk)
         out_tensor(gf, last_cols(g, xp, left), lname("o_cn", li));
-        ggml_tensor * W0 = ggml_view_2d(g, W, Tk, seq, W->nb[1], 0);
+        ggml_tensor * W0 = ggml_view_3d(g, W, Tk, seq, batch, W->nb[1], W->nb[3], 0);
         ggml_tensor * o = ggml_mul_mat(g, ggml_cont(g, ggml_transpose(g, xp)), W0); // (hid, seq)
         x = ggml_add(g, x, lin(g, ggml_mul(g, o, y), L.na_out_w, L.na_out_b));
     }
@@ -624,20 +640,20 @@ ggml_tensor * zipformer_layer(xasr_context * c, ggml_context * g, ggml_cgraph * 
     auto self_attn = [&](ggml_tensor * xin, ggml_tensor * wi, ggml_tensor * bi, ggml_tensor * wo, ggml_tensor * bo,
                          const char * cname) {
         ggml_tensor * v = lin(g, xin, wi, bi); // (H*vd, seq)
-        ggml_tensor * cv = ggml_new_tensor_2d(g, GGML_TYPE_F32, H * vd, left);
+        ggml_tensor * cv = ggml_new_tensor_3d(g, GGML_TYPE_F32, H * vd, left, batch);
         in_tensor(cv, lname(cname, li));
         ggml_tensor * vf = ggml_concat(g, cv, v, 1); // (H*vd, Tk)
         out_tensor(gf, last_cols(g, vf, left), lname((std::string("o_") + cname).c_str(), li));
-        ggml_tensor * Vt = ggml_cont(g, ggml_permute(g, ggml_reshape_3d(g, vf, vd, H, Tk), 1, 2, 0, 3)); // (Tk, vd, H)
+        ggml_tensor * Vt = ggml_cont(g, ggml_permute(g, ggml_reshape_4d(g, vf, vd, H, Tk, batch), 1, 2, 0, 3)); // (Tk, vd, H)
         ggml_tensor * o = ggml_mul_mat(g, Vt, W);                                                        // (vd, seq, H)
         o = ggml_cont(g, ggml_permute(g, o, 0, 2, 1, 3));                                               // (vd, H, seq)
-        return lin(g, ggml_reshape_2d(g, o, H * vd, seq), wo, bo);
+        return lin(g, ggml_reshape_3d(g, o, H * vd, seq, batch), wo, bo);
     };
 
     auto conv = [&](ggml_tensor * xin, const conv_mod& C, const char * cname) {
         ggml_tensor * t = lin(g, xin, C.in_w, C.in_b); // (2d, seq)
         ggml_tensor * xg = ggml_mul(g, rows(g, t, 0, d), ggml_sigmoid(g, rows(g, t, d, d)));
-        ggml_tensor * cc = ggml_new_tensor_2d(g, GGML_TYPE_F32, d, pad);
+        ggml_tensor * cc = ggml_new_tensor_3d(g, GGML_TYPE_F32, d, pad, batch);
         in_tensor(cc, lname(cname, li));
         ggml_tensor * xc = ggml_concat(g, cc, xg, 1); // (d, pad+seq)
         out_tensor(gf, last_cols(g, xc, pad), lname((std::string("o_") + cname).c_str(), li));
@@ -666,7 +682,7 @@ ggml_tensor * simple_downsample(ggml_context * g, ggml_tensor * x, const std::ve
     const int ds = (int)w.size(), C = (int)x->ne[0], Tout = (int)x->ne[1] / ds;
     ggml_tensor * acc = nullptr;
     for (int j = 0; j < ds; j++) {
-        ggml_tensor * v = ggml_view_2d(g, x, C, Tout, x->nb[1] * ds, (size_t)j * x->nb[1]);
+        ggml_tensor * v = ggml_view_3d(g, x, C, Tout, x->ne[2], x->nb[1] * ds, x->nb[2], (size_t)j * x->nb[1]);
         ggml_tensor * t = ggml_scale(g, ggml_cont(g, v), w[(size_t)j]);
         acc = acc ? ggml_add(g, acc, t) : t;
     }
@@ -677,12 +693,13 @@ ggml_cgraph * build_chunk_graph(xasr_context * c, xasr_slot & slot) {
     auto & m = c->model;
     const auto & hp = m.hp;
     const geom & G = c->g;
+    const int batch = slot.batch_size;
     ggml_init_params ip = {slot.meta.size(), slot.meta.data(), true};
     ggml_context * g = ggml_init(ip);
     ggml_cgraph * gf = ggml_new_graph_custom(g, graph_nodes, false);
     c->building = &slot;
 
-    ggml_tensor * feats = ggml_new_tensor_4d(g, GGML_TYPE_F32, hp.feature_dim, G.T, 1, 1);
+    ggml_tensor * feats = ggml_new_tensor_4d(g, GGML_TYPE_F32, hp.feature_dim, G.T, 1, batch);
     in_tensor(feats, "feats");
     // Conv2dSubsampling: ggml (W=freq, H=time, C, N)
     auto cbias = [&](ggml_tensor * b) { return ggml_reshape_3d(g, b, 1, 1, b->ne[0]); };
@@ -695,25 +712,25 @@ ggml_cgraph * build_chunk_graph(xasr_context * c, xasr_slot & slot) {
     const int Fp = (int)x->ne[0], Tc = (int)x->ne[1], Ch = (int)x->ne[2];
     GGML_ASSERT(Tc == G.chunk + 3);
     // ConvNeXt, streaming: 3 cached time frames on the left, no time padding
-    ggml_tensor * ecache = ggml_new_tensor_3d(g, GGML_TYPE_F32, Fp, 3, Ch);
+    ggml_tensor * ecache = ggml_new_tensor_4d(g, GGML_TYPE_F32, Fp, 3, Ch, batch);
     in_tensor(ecache, "emb_cache");
     ggml_tensor * xcat = ggml_concat(g, ecache, x, 1); // (F', chunk+6, 128)
     out_tensor(gf,
-               ggml_cont(g, ggml_view_3d(g, xcat, Fp, 3, Ch, xcat->nb[1], xcat->nb[2], (size_t)G.chunk * xcat->nb[1])),
+               ggml_cont(g, ggml_view_4d(g, xcat, Fp, 3, Ch, batch, xcat->nb[1], xcat->nb[2], xcat->nb[3], (size_t)G.chunk * xcat->nb[1])),
                "o_emb_cache");
     ggml_tensor * y = ggml_conv_2d_dw_direct(g, m.cnx_dw_w, xcat, 1, 1, 3, 0, 1, 1); // (F', chunk, 128)
     y = ggml_add(g, y, cbias(m.cnx_dw_b));
     y = ggml_cont(g, ggml_permute(g, y, 1, 2, 0, 3)); // (128, F', chunk)
-    y = ggml_reshape_2d(g, y, Ch, Fp * G.chunk);
+    y = ggml_reshape_3d(g, y, Ch, Fp * G.chunk, batch);
     y = lin(g, y, m.cnx_pw1_q8 ? m.cnx_pw1_q8 : ggml_reshape_2d(g, m.cnx_pw1_w, Ch, m.cnx_pw1_w->ne[3]), m.cnx_pw1_b);
     y = swoosh_l(g, y);
     y = lin(g, y, m.cnx_pw2_q8 ? m.cnx_pw2_q8 : ggml_reshape_2d(g, m.cnx_pw2_w, m.cnx_pw2_w->ne[2], Ch), m.cnx_pw2_b); // (128, F'*chunk)
-    ggml_tensor * byp = ggml_view_3d(g, x, Fp, G.chunk, Ch, x->nb[1], x->nb[2], 0);
+    ggml_tensor * byp = ggml_view_4d(g, x, Fp, G.chunk, Ch, batch, x->nb[1], x->nb[2], x->nb[3], 0);
     byp = ggml_cont(g, ggml_permute(g, byp, 1, 2, 0, 3)); // (128, F', chunk)
-    y = ggml_add(g, ggml_reshape_3d(g, y, Ch, Fp, G.chunk), byp);
+    y = ggml_add(g, ggml_reshape_4d(g, y, Ch, Fp, G.chunk, batch), byp);
     // (b, c, t, f) -> (b, t, c*f): feature index c*F' + f
     y = ggml_cont(g, ggml_permute(g, y, 1, 0, 2, 3)); // (F', 128, chunk)
-    y = ggml_reshape_2d(g, y, Fp * Ch, G.chunk);
+    y = ggml_reshape_3d(g, y, Fp * Ch, G.chunk, batch);
     x = lin(g, y, m.emb_out_w, m.emb_out_b);
     x = bias_norm(g, x, m.emb_norm_bias, m.emb_norm_scale); // (dims[0], chunk)
 
@@ -732,13 +749,13 @@ ggml_cgraph * build_chunk_graph(xasr_context * c, xasr_slot & slot) {
         if (ds > 1)
             x = simple_downsample(g, x, m.stacks[(size_t)s].ds_w);
         const auto pe = compact_pe(hp.pos_dim, seq, left);
-        ggml_tensor * mask = ggml_new_tensor_1d(g, GGML_TYPE_F32, left + seq);
+        ggml_tensor * mask = ggml_new_tensor_4d(g, GGML_TYPE_F32, left + seq, 1, 1, batch);
         in_tensor(mask, "mask_" + std::to_string(s));
         for (auto & L : m.stacks[(size_t)s].layers)
             x = zipformer_layer(c, g, gf, s, L, li++, x, pe, mask, seq, left);
         if (ds > 1) {
-            x = ggml_repeat(g, ggml_reshape_3d(g, x, dim, 1, seq), ggml_new_tensor_3d(g, GGML_TYPE_F32, dim, ds, seq));
-            x = ggml_reshape_2d(g, x, dim, G.chunk);
+            x = ggml_repeat(g, ggml_reshape_4d(g, x, dim, 1, seq, batch), ggml_new_tensor_4d(g, GGML_TYPE_F32, dim, ds, seq, batch));
+            x = ggml_reshape_3d(g, x, dim, G.chunk, batch);
             x = bypass(g, src_orig, x, m.stacks[(size_t)s].combiner);
         }
         outs[(size_t)s] = x;
@@ -902,6 +919,29 @@ bool joiner_compute(xasr_context * c, const float * act, const float * pred, int
     return true;
 }
 
+void upload_encoder_lane(xasr_context * c, xasr_slot & slot, const float * feats, int pos, int lane, xasr_stats * st) {
+    const auto & G = c->g;
+    const size_t feature_bytes = ggml_nbytes(slot.feats) / slot.batch_size;
+    auto up = xasr_clock::now();
+    ggml_backend_tensor_set(slot.feats, feats, lane * feature_bytes, feature_bytes);
+    st->feat_up_ms += span_ms(up);
+    for (size_t s = 0; s < slot.masks.size(); ++s) {
+        auto * tensor = slot.masks[s];
+        const int ds = c->model.hp.downsample[s];
+        const int unseen = G.left - pos / 2;
+        up = xasr_clock::now();
+        std::vector<float> mask(ggml_nelements(tensor) / slot.batch_size);
+        for (int j = 0; j * ds < unseen; ++j) {
+            mask[j] = -INFINITY;
+        }
+        st->mask_build_ms += span_ms(up);
+        up = xasr_clock::now();
+        const size_t mask_bytes = mask.size() * sizeof(float);
+        ggml_backend_tensor_set(tensor, mask.data(), lane * mask_bytes, mask_bytes);
+        st->mask_up_ms += span_ms(up);
+    }
+}
+
 bool run_chunks(xasr_context * c, xasr_slot & slot, const float * feats, int n_rows, int & pos,
                 std::vector<float> & enc_out, xasr_stats * st, bool commit_phase, bool single_chunk) {
     const auto & G = c->g;
@@ -911,23 +951,8 @@ bool run_chunks(xasr_context * c, xasr_slot & slot, const float * feats, int n_r
             break;
         }
         const auto chunk_begin = xasr_clock::now();
+        upload_encoder_lane(c, slot, feats + size_t(pos) * c->model.hp.feature_dim, pos, 0, st);
         auto up = xasr_clock::now();
-        ggml_backend_tensor_set(slot.feats, feats + size_t(pos) * c->model.hp.feature_dim, 0, ggml_nbytes(slot.feats));
-        st->feat_up_ms += span_ms(up);
-        for (size_t s = 0; s < slot.masks.size(); ++s) {
-            auto * tensor = slot.masks[s];
-            const int ds = c->model.hp.downsample[s];
-            const int unseen = G.left - pos / 2;
-            up = xasr_clock::now();
-            std::vector<float> mask(ggml_nelements(tensor));
-            for (int j = 0; j * ds < unseen; ++j) {
-                mask[j] = -INFINITY;
-            }
-            st->mask_build_ms += span_ms(up);
-            up = xasr_clock::now();
-            ggml_backend_tensor_set(tensor, mask.data(), 0, ggml_nbytes(tensor));
-            st->mask_up_ms += span_ms(up);
-        }
         double dsp_submit = 0, dsp_wait = 0;
         uint64_t dsp_batches = 0;
         if (c->dsp_stats) {
@@ -1225,11 +1250,6 @@ void xasr_free(xasr_context * c) {
     if (c->joiner.ctx) {
         ggml_free(c->joiner.ctx);
     }
-    for (auto & slot : c->slots) {
-        if (slot->sched) {
-            ggml_backend_sched_free(slot->sched);
-        }
-    }
     c->slots.clear();
     if (c->model.aux_buf) {
         ggml_backend_buffer_free(c->model.aux_buf);
@@ -1487,4 +1507,107 @@ void xasr_stream_free(xasr_stream * s) {
         }
         delete s;
     }
+}
+
+
+bool xasr_probe_encoder_batch(xasr_context * c, const std::vector<std::vector<float>> & audio) {
+    const int batch = static_cast<int>(audio.size());
+    if (!c || (batch != 2 && batch != 4) || c->slots.size() < audio.size()) {
+        return false;
+    }
+    if (std::any_of(c->slots.begin(), c->slots.end(), [](const auto & slot) { return slot->busy; })) {
+        return false;
+    }
+    std::vector<std::vector<float>> feats(batch);
+    int chunks = 0;
+    for (int lane = 0; lane < batch; ++lane) {
+        if (audio[lane].empty() || audio[lane].size() > 16000 * 60) {
+            return false;
+        }
+        xasr_fbank_append(audio[lane], true, feats[lane]);
+        const int frames = static_cast<int>(feats[lane].size() / c->model.hp.feature_dim);
+        const int ready = frames > c->g.T ? (frames - c->g.T - 1) / c->g.decode_chunk_len + 1 : 0;
+        chunks = lane == 0 ? ready : std::min(chunks, ready);
+    }
+    if (chunks < 3) {
+        fprintf(stderr, "xasr: batch probe needs at least three chunks per lane\n");
+        return false;
+    }
+
+    xasr_slot combined;
+    combined.batch_size = batch;
+    combined.meta.resize(ggml_tensor_overhead() * graph_nodes + ggml_graph_overhead_custom(graph_nodes, false));
+    if (!prepare_slot(c, combined)) {
+        return false;
+    }
+    auto reset = [](xasr_slot & slot) {
+        for (auto * cache : slot.caches) {
+            const std::vector<float> zero(ggml_nelements(cache));
+            ggml_backend_tensor_set(cache, zero.data(), 0, ggml_nbytes(cache));
+        }
+    };
+
+    const size_t lane_elements = ggml_nelements(combined.output) / batch;
+    std::vector<float> reference(size_t(chunks) * batch * lane_elements);
+    std::vector<float> actual(batch * lane_elements);
+    std::vector<double> samples[2];
+    double error = 0;
+    double signal = 0;
+    float max_diff = 0;
+    xasr_stats stats;
+    for (int arm = 0; arm < 2; ++arm) {
+        reset(combined);
+        for (int lane = 0; lane < batch; ++lane) {
+            reset(*c->slots[lane]);
+        }
+        for (int index = 0; index < chunks; ++index) {
+            const auto start = xasr_clock::now();
+            const int pos = index * c->g.decode_chunk_len;
+            const size_t offset = size_t(pos) * c->model.hp.feature_dim;
+            float * expected = reference.data() + size_t(index) * actual.size();
+            if (arm == 0) {
+                for (int lane = 0; lane < batch; ++lane) {
+                    auto & slot = *c->slots[lane];
+                    upload_encoder_lane(c, slot, feats[lane].data() + offset, pos, 0, &stats);
+                    if (ggml_backend_sched_graph_compute(slot.sched, slot.graph) != GGML_STATUS_SUCCESS) {
+                        return false;
+                    }
+                    ggml_backend_tensor_get(slot.output, expected + lane * lane_elements, 0, ggml_nbytes(slot.output));
+                }
+            } else {
+                for (int lane = 0; lane < batch; ++lane) {
+                    upload_encoder_lane(c, combined, feats[lane].data() + offset, pos, lane, &stats);
+                }
+                if (ggml_backend_sched_graph_compute(combined.sched, combined.graph) != GGML_STATUS_SUCCESS) {
+                    return false;
+                }
+                ggml_backend_tensor_get(combined.output, actual.data(), 0, ggml_nbytes(combined.output));
+            }
+            if (index >= 2) {
+                samples[arm].push_back(span_ms(start));
+            }
+            if (arm == 1) {
+                for (size_t i = 0; i < actual.size(); ++i) {
+                    if (!std::isfinite(expected[i]) || !std::isfinite(actual[i])) {
+                        return false;
+                    }
+                    const float diff = actual[i] - expected[i];
+                    max_diff = std::max(max_diff, std::abs(diff));
+                    error += double(diff) * diff;
+                    signal += double(expected[i]) * expected[i];
+                }
+            }
+        }
+    }
+    for (auto & values : samples) {
+        std::sort(values.begin(), values.end());
+    }
+    const double relative_rms = std::sqrt(error / std::max(signal, 1e-30));
+    printf("encoder_batch=%d chunks_per_lane=%d serial_median_ms=%.3f batch_median_ms=%.3f max_abs=%.6f relative_rms=%.6g\n",
+           batch, chunks, samples[0][samples[0].size() / 2], samples[1][samples[1].size() / 2], max_diff, relative_rms);
+    if (relative_rms >= 0.01) {
+        fprintf(stderr, "xasr: batch projection relative RMS error exceeds 1%%\n");
+        return false;
+    }
+    return true;
 }

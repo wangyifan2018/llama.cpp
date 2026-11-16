@@ -58,3 +58,7 @@ enum class xasr_step_result { pending, done, error };
 bool xasr_begin_step(xasr_stream * stream, const float * samples, int count, bool commit);
 xasr_step_result xasr_step(xasr_stream * stream, std::string & text);
 void xasr_stream_free(xasr_stream * stream);
+
+// Compare independent B=1 slots with a fixed-lane B=2 or B=4 encoder graph.
+// Uses equally timed chunks up to the end of the shortest lane.
+bool xasr_probe_encoder_batch(xasr_context * context, const std::vector<std::vector<float>> & audio);

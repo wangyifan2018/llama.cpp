@@ -571,6 +571,63 @@ the second engine drains them.
 
 Raw: `/tmp/soak-mixed.jsonl`, `/tmp/soak-mixed2.jsonl`.
 
+## Fixed-lane HTP encoder batch probe
+
+`--probe-encoder-batch` compares independent B=1 slots with one true
+encoder graph for two or four distinct WAV inputs. The graph has a batch
+axis on convolution, attention, masks, and recurrent caches. Linear layers
+fold time and batch into the row dimension of a shared matrix multiplication.
+Choose the batch size by passing two or four WAV files. Each lane uses its own
+state and mask. The probe runs complete chunks up to the shortest lane, with
+no endpoint padding, and reads raw encoder projections for comparison.
+
+The measured unit is the wall time to execute one chunk for every lane,
+including feature and mask upload, encoder execution, and projection readback.
+Fbank, initialization, and the first two chunks are excluded. The reported
+value is the upper middle sample after sorting the remaining chunk times
+within a run. Lane assignment is fixed for this test. No cache movement,
+joiner, server queue, or ADB response time is included.
+
+SM6650 / v73, HTP completion polling enabled, command limit 2048. Values
+below are rounded medians across three launches unless stated otherwise.
+
+| Input setup | B | Chunks per lane | Serial B=1 group | Batched group | Change |
+|---|---:|---:|---:|---:|---:|
+| `zh-10.wav en-20.wav` | 2 | 20 | 168.2 ms | 132.5 ms | 21% less wall time |
+| `zh-10.wav en-20.wav zh.wav en.wav` | 4 | 5 | 337.4 ms | 233.4 ms | 31% less wall time |
+| Four 10–20 s WAVs, one launch | 4 | 20 | 338.7 ms | 233.8 ms | 31% less wall time |
+
+Both batched graphs placed all 2,897 encoder compute nodes on HTP in one
+scheduler split and emitted numerically identical encoder projections to
+serial B=1 on the tested clips. Batch cache sizes in the graph were 8,297,472
+and 16,594,944 bytes. The macOS CPU shape comparison showed about 3%
+relative RMS difference on the short B=2 clips and did not pass the probe's
+1% numerical gate. Treat this as an HTP result. The regular HTP B=1 CLI
+returned the established short-clip transcripts.
+
+Use the [Android build and deployment steps](BUILD.md). Build the
+`llama-x-asr` target, push it to the deployed package, and run:
+
+```sh
+adb shell -T 'cd /data/local/tmp/llama-x-asr &&
+    export LD_LIBRARY_PATH="$PWD/lib" ADSP_LIBRARY_PATH="$PWD/lib" &&
+    export GGML_HEXAGON_DEVICES=HTP0:0 GGML_HEXAGON_OPPOLL=1 GGML_HEXAGON_OPBATCH=2048 &&
+    bin/llama-x-asr x-asr-zh-en-q8_0.gguf HTP0:0 zh-10.wav en-20.wav --probe-encoder-batch'
+```
+
+For B=4 add `zh.wav en.wav` to the positional WAV list. For the long B=4
+test use `zh-10.wav en-20.wav en-10.wav zh-20.wav`. The extra files came
+from the local `cabin-asr-probe/long-perf` cache. Logs, input and device
+library hashes, and the binary hash are in
+`$HOME/Library/Caches/qwen3-asr-htp/xasr-multistream/encoder-batch.MCwTi2`.
+
+The next service experiment needs to measure the remaining budget after
+gathering and scattering arbitrary ready-lane state. The B=2 encoder saves
+about 36 ms per pair before that cost. Start with ready-only batching and
+allow B=1 immediately when no other lane is ready. Verify distinct sequence
+positions, arbitrary lane reuse, and cancel/reset before measuring end-to-final
+P95/P99 under staggered starts and aligned commits.
+
 ## Reproduce on Android
 
 Run these blocks from the repository root in the same Bash session. The [Snapdragon toolchain guide](../../docs/backend/snapdragon/README.md) covers Docker and ADB setup. Set `ANDROID_SERIAL` if several devices are attached.

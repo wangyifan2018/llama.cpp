@@ -12,6 +12,7 @@
 #define MA_API static
 #include "miniaudio/miniaudio.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -32,13 +33,14 @@ static double process_cpu_ms() {
 
 int main(int argc, char ** argv) {
     if (argc < 4) {
-        fprintf(stderr, "usage: %s MODEL.gguf DEVICE WAV... [--realtime] [--pad-ms N] [--threads N] [--streams N] [--joiner-host]\n", argv[0]);
+        fprintf(stderr, "usage: %s MODEL.gguf DEVICE WAV... [--realtime] [--pad-ms N] [--threads N] [--streams N] [--joiner-host] [--probe-encoder-batch]\n", argv[0]);
         return 1;
     }
     xasr_context_params params;
     params.device = argv[2];
     bool realtime = false;
     bool concurrent = false;
+    bool probe_batch = false;
     int hold_ms = 0;
     std::vector<const char *> waves;
     for (int i = 3; i < argc; ++i) {
@@ -50,6 +52,8 @@ int main(int argc, char ** argv) {
             params.n_threads = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--streams") == 0 && i + 1 < argc) {
             params.n_streams = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--probe-encoder-batch") == 0) {
+            probe_batch = true;
         } else if (std::strcmp(argv[i], "--concurrent") == 0) {
             concurrent = true;
         } else if (std::strcmp(argv[i], "--hold-ms") == 0 && i + 1 < argc) {
@@ -65,6 +69,13 @@ int main(int argc, char ** argv) {
     if (waves.empty()) {
         return 1;
     }
+    if (probe_batch) {
+        if (concurrent || realtime || (waves.size() != 2 && waves.size() != 4)) {
+            return 1;
+        }
+        params.n_streams = static_cast<int>(waves.size());
+        params.joiner_on_device = false;
+    }
     ggml_backend_load_all();
     const auto init_begin = xasr_clock::now();
     const std::unique_ptr<xasr_context, decltype(&xasr_free)> model(xasr_init_from_file(argv[1], params), xasr_free);
@@ -72,6 +83,33 @@ int main(int argc, char ** argv) {
         return 2;
     }
     fprintf(stderr, "xasr: init %.1f ms\n", std::chrono::duration<double, std::milli>(xasr_clock::now() - init_begin).count());
+    if (probe_batch) {
+        std::vector<std::vector<float>> pcm;
+        for (const char * path : waves) {
+            ma_decoder wav;
+            auto config = ma_decoder_config_init(ma_format_f32, 1, 16000);
+            if (ma_decoder_init_file(path, &config, &wav) != MA_SUCCESS) {
+                fprintf(stderr, "xasr: cannot decode %s\n", path);
+                return 3;
+            }
+            const std::unique_ptr<ma_decoder, decltype(&ma_decoder_uninit)> audio(&wav, ma_decoder_uninit);
+            auto & samples = pcm.emplace_back();
+            while (samples.size() < 16000 * 60) {
+                float block[4096];
+                ma_uint64 count = 0;
+                const size_t capacity = std::min<size_t>(4096, 16000 * 60 - samples.size());
+                const auto result = ma_decoder_read_pcm_frames(audio.get(), block, capacity, &count);
+                if (result != MA_SUCCESS && result != MA_AT_END) {
+                    return 5;
+                }
+                samples.insert(samples.end(), block, block + count);
+                if (result == MA_AT_END || count == 0) {
+                    break;
+                }
+            }
+        }
+        return xasr_probe_encoder_batch(model.get(), pcm) ? 0 : 8;
+    }
     if (concurrent) {
         // Feed every stream the same packets, then commit them all at the same
         // endpoint. Streams are served in order, so stream i pays the commits of
