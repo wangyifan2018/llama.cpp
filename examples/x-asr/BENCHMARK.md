@@ -91,13 +91,19 @@ text. Three rounds per fixture, so N=3 per cell.
 
 | Config | zh 2.65 s | en 2.71 s | zh 10 s | en 20 s | chunk p50 | chunks | commit chunks |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `onnx-cpu` | 120.2 | 121.0 | 167.2 | 121.1 | 61.8 | 7 / 7 / 23 / 43 | 2 / 2 / 3 / 2 |
-| `gguf-cpu` | 165.6 | 179.0 | 255.0 | 176.5 | 75.1 | same | same |
-| `gguf-htp-wait` | 328.7 | 279.5 | 420.2 | 287.6 | 116.2 | same | same |
-| `gguf-htp-poll` | 200.0 | 200.4 | 303.3 | 200.2 | 100.2 | same | same |
+| `onnx-cpu` | 126.0 | 121.8 | 169.1 | 125.0 | 62.3 | 7 / 7 / 23 / 43 | 2 / 2 / 3 / 2 |
+| `gguf-cpu` | 161.4 | 169.7 | 252.6 | 181.6 | 75.0 | same | same |
+| `gguf-htp-wait` | 296.1 | 259.0 | 380.9 | 270.0 | 122.5 | same | same |
+| `gguf-htp-poll` | 189.4 | 192.3 | 282.3 | 196.4 | 109.2 | same | same |
 
-P95 over the same three samples: ONNX 126.9 / 125.3 / 175.3 / 121.4, GGUF CPU
-172.7 / 179.5 / 255.4 / 176.9, HTP polling 201.1 / 201.2 / 305.6 / 200.5. With
+The joiner projection and its argmax now run on the selected backend for every
+row above, which is [H5](OPTIMIZATION.md#h5-joiner-projection-and-argmax-on-the-selected-backend-kept-now-the-default).
+Compared with the same matrix before that change, HTP polling moved from 200.0 /
+200.4 / 303.3 / 200.2 to the values above; the paired A/B is in H5 because
+device drift between the two sessions is of the same order as the change.
+
+P95 over the same three samples: ONNX 126.7 / 122.5 / 171.8 / 129.6, GGUF CPU
+164.6 / 170.8 / 265.7 / 183.8, HTP polling 191.5 / 193.0 / 282.5 / 196.6. With
 N=3 these are max values, not steady-state percentiles.
 
 The chunk count is identical in all four configurations on all four fixtures:
@@ -112,10 +118,19 @@ Summed over all runs of a configuration, so long clips carry their own weight.
 
 | Config | chunk ms | greedy ms/frame | fbank ms per audio s | submit ms/batch | wait ms/batch | host CPU ms per audio s | append work / audio |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `onnx-cpu` | 62.1 | n/a | n/a | n/a | n/a | n/a | n/a |
-| `gguf-cpu` | 74.5 | 0.695 | 11.7 | n/a | n/a | 374 | 17.8% |
-| `gguf-htp-wait` | 114.4 | 2.571 | 16.2 | 0.27 | 50.45 | 114 | 31.1% |
-| `gguf-htp-poll` | 95.1 | 0.632 | 11.3 | 0.21 | 43.31 | 254 | 22.0% |
+| `onnx-cpu` | 62.5 | n/a | n/a | n/a | n/a | n/a | n/a |
+| `gguf-cpu` | 76.4 | 1.048 | 12.1 | n/a | n/a | 404 | 17.8% |
+| `gguf-htp-wait` | 122.3 | 0.616 | 20.5 | 0.17 | 50.28 | 76 | 31.1% |
+| `gguf-htp-poll` | 97.2 | 0.339 | 11.3 | 0.15 | 42.94 | 253 | 22.0% |
+
+The "greedy" column now contains the backend joiner plus the host predictor
+update, so it is the whole decoder cost, not just the host loop. Summed over the
+whole matrix, one joiner call costs 1.07 ms on `gguf-htp-poll`, 1.74 ms on
+`gguf-htp-wait` (the blocking completion dominates) and 3.56 ms on `gguf-cpu`,
+for 810 calls and 2,880 encoder frames per configuration. The host loop it
+replaced measured 0.64 to 0.70 ms per frame on this device, and one call covers
+about five frames, so the HTP call is roughly three times cheaper and the CPU
+backend call is a wash.
 
 "submit" and "wait" are the host-side cost of handing one DSP command batch to
 the DSP and of collecting its completion, accumulated in the backend and read
@@ -129,20 +144,24 @@ rather than being estimated.
 
 ### Where the tail goes
 
-For the 2.65 s Mandarin clip, every configuration runs 7 chunks, 2 of them after
-commit, so the tail is essentially two encoder chunks plus the decoder for their
-24 encoder frames:
+Every configuration runs 7 chunks on the 2.65 s clip and 2 of them after commit,
+so the tail is two encoder chunks plus the decoder for their 24 encoder frames.
+The commit wall time is within a few milliseconds of the tail on every row below,
+which means the pipeline is not backlogged when the last packet arrives and
+there is no queue to drain.
 
-| Config | 2 commit chunks | 24 frames greedy | sum | measured tail |
-|---|---:|---:|---:|---:|
-| `onnx-cpu` | 116.8 | included in the chunk | 116.8 | 120.2 |
-| `gguf-cpu` | 150.1 | 16.7 | 166.8 | 165.6 |
-| `gguf-htp-poll` | 191.9 | 15.2 | 207.1 | 200.0 |
-| `gguf-htp-wait` | 232.4 | 30.8 | 263.2 | 279.5 to 328.7 |
+| Config | commit p50, zh | commit p50, zh 10 s | commit chunks |
+|---|---:|---:|---:|
+| `onnx-cpu` | 124.2 | 167.3 | 2 / 3 |
+| `gguf-cpu` | 160.8 | 251.2 | 2 / 3 |
+| `gguf-htp-poll` | 180.1 | 278.3 | 2 / 3 |
+| `gguf-htp-wait` | 256.3 | 380.2 | 2 / 3 |
 
-The remaining tail is commit bookkeeping: feature and mask upload are 0.3 ms per
-chunk, the encoder projection read-back is 0.06 ms, detokenisation is 0.05 ms.
-They are not worth optimising at this granularity.
+The per-encoder-chunk DSP cost is measured separately in the operator profile
+(85.7 ms after H2), and the decoder contributes 2 to 3 joiner calls per chunk:
+18.4 ms for 16 calls on the 2.65 s clip in H5. Commit bookkeeping is not visible
+at this scale: feature and mask upload are 0.3 ms per chunk, the encoder
+projection read-back is 0.06 ms, detokenisation is 0.05 ms.
 
 ### HTP op fusion A/B
 
@@ -167,8 +186,11 @@ is in [OPTIMIZATION.md](OPTIMIZATION.md#h1-bounded-wait-instead-of-spin-for-dsp-
 ### Backend placement and DSP batches
 
 All four GGUF runs report `encoder HTP0:0 2877/2877 ops, 1 scheduler splits,
-4148736 bytes of cache`. One scheduler split still produces two DSP command
-batches per chunk (2,048 + 772 ops) at OPBATCH 2048. The completion wait is the
+4148736 bytes of cache` and `joiner HTP0:0 5/5 ops, weight q8_0 512 x 5000, 12
+frames per call`, so the whole encoder and the whole joiner graph are placed on
+the DSP with no fallback. One encoder scheduler split still produces two DSP
+command batches per chunk (2,048 + 483 ops after H2) at OPBATCH 2048. A joiner
+call is a single additional batch. The completion wait is the
 largest single host cost: 43 ms per batch while polling and 50 ms per batch while
 blocked, against roughly 44 ms of DSP work per batch. That gap is the subject of
 the [poll wait experiment](OPTIMIZATION.md#h1-bounded-wait-instead-of-spin-for-dsp-completion-rejected-no-code-kept).

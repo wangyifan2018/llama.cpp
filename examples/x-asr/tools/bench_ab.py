@@ -218,8 +218,8 @@ def build_summary(records, args):
     lines.append("")
     lines.append("## Stage breakdown, median over all runs")
     lines.append("")
-    lines.append("| config | compute | submit | wait | batches | greedy/onnx decode | fbank | feat up | mask build | mask up | readback | detok | cpu_ms | rss |")
-    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    lines.append("| config | compute | submit | wait | batches | greedy | joiner dev | joiner calls | fbank | feat up | mask build | mask up | readback | detok | cpu_ms | rss |")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for config in args.configs:
         rows = by_config.get(config, [])
         if not rows:
@@ -229,7 +229,7 @@ def build_summary(records, args):
             return statistics.median(values) if values else float("nan")
         lines.append(
             f"| {config} | {med('compute_ms'):.1f} | {med('submit_ms'):.1f} | {med('wait_ms'):.1f} | "
-            f"{med('dsp_batches'):.1f} | {med('greedy_ms'):.1f} | {med('fbank_ms'):.1f} | "
+            f"{med('dsp_batches'):.1f} | {med('greedy_ms'):.1f} | {med('joiner_dev_ms'):.1f} | {med('joiner_dev_calls'):.1f} | {med('fbank_ms'):.1f} | "
             f"{med('feat_up_ms'):.2f} | {med('mask_build_ms'):.2f} | {med('mask_up_ms'):.2f} | "
             f"{med('readback_ms'):.2f} | {med('detok_ms'):.2f} | {med('cpu_ms'):.0f} | {med('rss_kib'):.0f} |"
         )

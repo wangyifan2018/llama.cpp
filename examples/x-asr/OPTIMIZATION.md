@@ -202,6 +202,86 @@ batch the DSP cannot start until the host has finished enqueuing, while with
 2,048 the first batch is already running. The power profile makes no measurable
 difference on this SoC. The documented default stays OPBATCH 2048 and burst.
 
+### H5. Joiner projection and argmax on the selected backend (kept, now the default)
+
+**Bottleneck.** After H2 the encoder was fully on the DSP but the transducer
+decoder was still on the host, and it was the second largest host cost.
+Measured on the device with `GGML_HEXAGON_OPPOLL=1`, one 2.65 s utterance:
+`greedy_ms` 53.6 ms over 84 encoder frames, 0.64 ms per frame. The host loop
+reads `join.output_linear.weight` after `to_f32()` expanded it to 10.24 MB of
+f32 per frame; the GGUF itself stores the same tensor as Q8_0, 2.56 MB. On the
+host the same loop costs 3.40 ms per frame against 0.21 ms for onnxruntime
+([ONNX-ANALYSIS.md](ONNX-ANALYSIS.md)), which is the weight traffic, not the
+arithmetic.
+
+**Why HTP.** The joiner is one 5000 x 512 by 512 x T matmul with no activation
+between rows. The DSP runs q8_0 matmuls at about 40 GMAC/s, has an ARGMAX op,
+and the weight tensor is already resident in the model buffer on that backend,
+so there is nothing to move. Batching the 12 encoder frames of a chunk into one
+call amortises the 2.56 MB weight read over 12 columns, and only the 24 KB
+activation goes up and the 1 x 12 token ids come back.
+
+**Change.** `prepare_joiner` builds a five-op graph on the same backend:
+`tanh(add(act, pred))`, `mul_mat(weight, .)`, `add(bias)`, `argmax`. The bias add
+is fused into the matmul by H2. Weight dtype and layout are untouched (Q8_0,
+model buffer); the activation is f32, 512 x 12; the predictor state is f32,
+512 x 1; the output is 1 x 12 int32. `greedy_run_dev` keeps the exact decoding
+rule: frames are scanned in order, at most one symbol per frame, blank and unk
+are never emitted, and an emitted token updates the predictor and discards the
+remaining frames of the block, which are then recomputed with the new state.
+The predictor update itself (`decoder_out`: embedding, grouped convolution,
+relu, 512 x 512 projection) stays on the host; it costs 0.9 ms for the whole
+2.65 s utterance, less than one extra DSP round trip would.
+
+**Reproduce.** Baseline is commit `0456429d5`, experiment adds `xasr_joiner` and
+`--joiner-host` to go back to the host loop.
+
+```sh
+# HTP, both arms, same binary.
+adb shell -T "cd /data/local/tmp/llama.cpp && \
+  export LD_LIBRARY_PATH=\$PWD/lib ADSP_LIBRARY_PATH=\$PWD/lib \
+  GGML_HEXAGON_DEVICES=HTP0:0 GGML_HEXAGON_OPBATCH=2048 GGML_HEXAGON_OPPOLL=1 \
+  GGML_HEXAGON_POWER_MODE=burst XASR_TIMING=1 && \
+  bin/llama-x-asr x-asr-zh-en-q8_0.gguf HTP0:0 zh.wav --realtime && \
+  bin/llama-x-asr x-asr-zh-en-q8_0.gguf HTP0:0 zh.wav --realtime --joiner-host"
+```
+
+**Result.** HTP polling, two paced repetitions per cell, same binary and device.
+
+| Arm | zh flush | zh 10 s flush | zh tail | zh 10 s tail | greedy | joiner on DSP | calls | predictor |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| host joiner | 189.4, 189.7 | 298.0, 298.9 | 200.3, 207.3 | 299.3, 302.1 | 53.6 ms | 0 | 0 | 0 |
+| device joiner | 179.7, 179.6 | 282.1, 282.0 | 191.8, 187.6 | 283.6, 284.4 | 20.9 ms | 18.4 ms | 16 | 0.9 ms |
+
+Per DSP call 1.15 ms, against 0.64 ms per frame on the host times roughly five
+frames per block, so about 2.8 times cheaper, plus the block is computed
+speculatively instead of frame by frame. Endpoint to final improves 5.1 percent
+on the 2.65 s clip and 5.4 percent on the 10 s clip. The four fixtures with the
+device joiner: 178.4, 191.2, 277.9, 191.1 ms, all with the same text as the host
+arm and as the CPU backend.
+
+CPU backend, same device: 157.3, 179.1, 250.4, 172.6 ms against 165.6, 179.0,
+255.0, 176.5 before. On the host CPU the effect is much larger, because the
+host f32 loop is slower there: commit to final 87.1 to 46.7 ms on the 2.65 s
+clip, `greedy_ms` 147.7 to 9.5 ms.
+
+Over the full four-configuration matrix the per-call cost is 1.07 ms on
+`gguf-htp-poll`, 1.74 ms on `gguf-htp-wait` and 3.56 ms on `gguf-cpu`, for 810
+calls and 2,880 encoder frames each. The CPU backend call is a wash against the
+host loop, because its quantised matmul for 12 columns is not faster than the
+f32 loop in cache; the HTP call is about three times cheaper. The default is
+uniform for both backends because the CPU arm is neutral and the graph keeps the
+10.24 MB f32 expansion out of the process.
+
+**What it does not cover.** Host CPU time is almost unchanged on the HTP arm
+(752 to 764 ms for a 3.85 s session) because the polling spin dominates and the
+host joiner was only about 15 ms per second of audio. The gain is latency, not
+host CPU; the CPU gain has to come from Phase 3 overlap. The number of joiner
+calls per chunk follows the emission rate, so a dense-token language or a
+noisier corpus issues more calls; the worst case is one call per frame, which is
+still cheaper per frame than the host loop. Text parity was checked on the four
+fixtures only, plus repeat and language-alternation runs on one context.
+
 ## Next experiments
 
 1. **Measure where the remaining tail goes.** In [`run_chunks`](xasr.cpp#L746) time feature and mask uploads, scheduled compute and completion, and encoder projection readback. In [`stream_accept`](xasr.cpp#L1018) time fbank, predictor/joiner, and text finalization. Tag each chunk with its phase (audio arrival or commit), sequence position, and number of DSP submissions. Collect a separate per-op profile using the [benchmark command](BENCHMARK.md#optional-htp-operator-profile). This distinguishes DSP kernel time from host submission and waiting. Compare CPU, HTP waiting, and HTP polling under both idle and representative CPU load.

@@ -32,7 +32,7 @@ static double process_cpu_ms() {
 
 int main(int argc, char ** argv) {
     if (argc < 4) {
-        fprintf(stderr, "usage: %s MODEL.gguf DEVICE WAV... [--realtime] [--pad-ms N] [--threads N]\n", argv[0]);
+        fprintf(stderr, "usage: %s MODEL.gguf DEVICE WAV... [--realtime] [--pad-ms N] [--threads N] [--joiner-host]\n", argv[0]);
         return 1;
     }
     xasr_context_params params;
@@ -46,6 +46,10 @@ int main(int argc, char ** argv) {
             params.tail_pad_ms = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
             params.n_threads = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--joiner-device") == 0) {
+            params.joiner_on_device = true;
+        } else if (std::strcmp(argv[i], "--joiner-host") == 0) {
+            params.joiner_on_device = false;
         } else {
             waves.push_back(argv[i]);
         }

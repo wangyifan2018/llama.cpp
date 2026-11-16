@@ -11,6 +11,7 @@ struct xasr_context_params {
     int n_threads = 2;
     int tail_pad_ms = 1200; // negative selects the minimal phase-aware tail padding
     int verbosity = 1;
+    bool joiner_on_device = true; // run the joiner projection on the selected backend
 };
 
 // Per-request timing, all in milliseconds of in-process wall time.
@@ -30,6 +31,9 @@ struct xasr_stats {
     int chunks_stream = 0;    // chunks that ran before commit
     int chunks_commit = 0;    // chunks triggered by the tail padding
     int dsp_batches = 0;      // DSP command batches submitted
+    int joiner_dev_calls = 0; // joiner graph runs on the backend
+    double joiner_dev_ms = 0; // time inside those runs
+    double joiner_pred_ms = 0; // predictor updates on the host
     int pad_frames = 0;       // feature frames added by the commit tail padding
     int n_frames = 0;         // feature frames at commit
     std::vector<double> chunk_ms; // per-chunk upload, compute and readback

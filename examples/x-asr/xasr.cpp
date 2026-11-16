@@ -80,6 +80,19 @@ struct xasr_model {
     std::vector<float> dec_emb, dec_conv, dec_proj_w, dec_proj_b, join_out_w, join_out_b;
 };
 
+// Joiner projection graph on the selected backend: tanh(enc + pred) is uploaded,
+// one quantised matmul produces the logits, and argmax returns the token ids.
+struct xasr_joiner {
+    ggml_context * ctx = nullptr;
+    ggml_cgraph * gf = nullptr;
+    ggml_backend_sched_t sched = nullptr;
+    ggml_tensor * act = nullptr;
+    ggml_tensor * pred = nullptr;
+    ggml_tensor * idx = nullptr;
+    int max_frames = 0;
+    bool ready = false;
+};
+
 // Chunk geometry, fixed per context.
 struct geom {
     int decode_chunk_len = 48, T = 61, chunk = 24, left = 256, tail_pad_ms = 1200;
@@ -100,6 +113,7 @@ struct xasr_context {
     std::vector<std::pair<ggml_tensor *, std::vector<float>>> constants;
     ggml_tensor * feats = nullptr;
     ggml_tensor * output = nullptr;
+    xasr_joiner joiner;
     bool stream_active = false;
     void (*dsp_stats)(ggml_backend_t, double *, double *, uint64_t *) = nullptr;
 };
@@ -757,6 +771,81 @@ bool prepare_graph(xasr_context * c) {
     return on_target == total;
 }
 
+// Build the joiner graph once. The weight tensors stay in the model buffer on
+// the same backend, so only the activation, the predictor state and the token
+// ids cross the host boundary per call.
+bool prepare_joiner(xasr_context * c) {
+    if (c->joiner.ready) {
+        return true;
+    }
+    if (!c->params.joiner_on_device) {
+        return false;
+    }
+    ggml_tensor * weight = ggml_get_tensor(c->model.ctx, "join.output_linear.weight");
+    ggml_tensor * bias   = ggml_get_tensor(c->model.ctx, "join.output_linear.bias");
+    if (!weight || !bias) {
+        return false;
+    }
+    const int J = c->model.hp.joiner_dim;
+    const int T = 12; // encoder frames per chunk
+    ggml_init_params ip = { ggml_tensor_overhead() * 256 + ggml_graph_overhead_custom(256, false), nullptr, true };
+    c->joiner.ctx = ggml_init(ip);
+    if (!c->joiner.ctx) {
+        return false;
+    }
+    ggml_context * g = c->joiner.ctx;
+    ggml_tensor * act = ggml_new_tensor_2d(g, GGML_TYPE_F32, J, T);
+    ggml_set_name(act, "j_act");
+    ggml_set_input(act);
+    ggml_tensor * pred = ggml_new_tensor_2d(g, GGML_TYPE_F32, J, 1);
+    ggml_set_name(pred, "j_pred");
+    ggml_set_input(pred);
+    ggml_tensor * x = ggml_tanh(g, ggml_add(g, act, pred));
+    x = ggml_add(g, ggml_mul_mat(g, weight, x), bias);
+    ggml_tensor * idx = ggml_argmax(g, x);
+    ggml_set_name(idx, "j_idx");
+    ggml_set_output(idx);
+    c->joiner.gf = ggml_new_graph_custom(g, 256, false);
+    ggml_build_forward_expand(c->joiner.gf, idx);
+    ggml_backend_t backends[] = { c->backend, c->backend_cpu };
+    c->joiner.sched = ggml_backend_sched_new(backends, nullptr, c->backend == c->backend_cpu ? 1 : 2, 256, false, false);
+    if (!c->joiner.sched) {
+        return false;
+    }
+    ggml_backend_sched_set_tensor_backend(c->joiner.sched, weight, c->backend);
+    ggml_backend_sched_set_tensor_backend(c->joiner.sched, bias, c->backend);
+    if (!ggml_backend_sched_alloc_graph(c->joiner.sched, c->joiner.gf)) {
+        return false;
+    }
+    c->joiner.act = act;
+    c->joiner.pred = pred;
+    c->joiner.idx = idx;
+    c->joiner.max_frames = T;
+    c->joiner.ready = true;
+    int nodes = ggml_graph_n_nodes(c->joiner.gf);
+    int on_target = 0;
+    for (int i = 0; i < nodes; ++i) {
+        if (ggml_backend_sched_get_tensor_backend(c->joiner.sched, ggml_graph_node(c->joiner.gf, i)) == c->backend) {
+            ++on_target;
+        }
+    }
+    fprintf(stderr, "xasr: joiner %s %d/%d ops, weight %s %d x %d, %d frames per call\n",
+            ggml_backend_name(c->backend), on_target, nodes, ggml_type_name(weight->type),
+            (int) weight->ne[0], (int) weight->ne[1], T);
+    return true;
+}
+
+bool joiner_compute(xasr_context * c, const float * act, const float * pred, int32_t * idx) {
+    xasr_joiner & j = c->joiner;
+    ggml_backend_tensor_set(j.act, act, 0, ggml_nbytes(j.act));
+    ggml_backend_tensor_set(j.pred, pred, 0, ggml_nbytes(j.pred));
+    if (ggml_backend_sched_graph_compute(j.sched, j.gf) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    ggml_backend_tensor_get(j.idx, idx, 0, ggml_nbytes(j.idx));
+    return true;
+}
+
 bool run_chunks(xasr_context * c, const float * feats, int n_rows, int & pos, std::vector<float> & enc_out,
                 xasr_stats * st, bool commit_phase) {
     const auto & G = c->g;
@@ -893,6 +982,45 @@ void greedy_run(const xasr_model & m, greedy_state & gs, const float * enc, int 
     }
 }
 
+// Same greedy rule as greedy_run, but the joiner projection and the argmax run
+// on the backend in blocks of encoder frames. Tokens are taken in frame order;
+// an emitted token updates the predictor and discards the remaining frames of
+// the block, which are then recomputed with the new state.
+bool greedy_run_dev(xasr_context * c, greedy_state & gs, const float * enc, int n_enc, xasr_stats * st) {
+    const auto & hp = c->model.hp;
+    const int J = hp.joiner_dim, T = c->joiner.max_frames;
+    std::vector<float> act((size_t) T * J);
+    std::vector<int32_t> idx((size_t) T);
+    int f = 0;
+    while (f < n_enc) {
+        const int n = std::min(T, n_enc - f);
+        for (int i = 0; i < T; ++i) {
+            const int src = f + std::min(i, n - 1);
+            std::memcpy(act.data() + (size_t) i * J, enc + (size_t) src * J, (size_t) J * sizeof(float));
+        }
+        const auto t = xasr_clock::now();
+        if (!joiner_compute(c, act.data(), gs.d.data(), idx.data())) {
+            return false;
+        }
+        st->joiner_dev_ms += span_ms(t);
+        ++st->joiner_dev_calls;
+        const int start = f;
+        for (; f < n_enc; ++f) {
+            const int best = idx[(size_t) (f - start)];
+            if (best != hp.blank_id && best != hp.unk_id) {
+                gs.toks.push_back(best);
+                gs.hyp.push_back(best);
+                const auto p = xasr_clock::now();
+                gs.d = decoder_out(c->model, gs.hyp);
+                st->joiner_pred_ms += span_ms(p);
+                ++f;
+                break;
+            }
+        }
+    }
+    return true;
+}
+
 // sherpa-onnx text-utils: IsCJK / IsPunct (code-point ranges) for RemoveSpaceBetweenCjk.
 bool is_cjk(char32_t cp) {
     return (cp >= 0x1100 && cp <= 0x11FF) || (cp >= 0x2E80 && cp <= 0xA4CF) || (cp >= 0xA840 && cp <= 0xD7AF) ||
@@ -1005,6 +1133,9 @@ xasr_context * xasr_init_from_file(const char * path, xasr_context_params params
             fprintf(stderr, "xasr: selected backend must support the entire encoder graph\n");
             return nullptr;
         }
+        if (params.joiner_on_device && !prepare_joiner(c.get())) {
+            fprintf(stderr, "xasr: joiner graph unavailable, using the host decoder\n");
+        }
     } catch (const std::exception & e) {
         fprintf(stderr, "xasr: %s\n", e.what());
         return nullptr;
@@ -1015,6 +1146,12 @@ xasr_context * xasr_init_from_file(const char * path, xasr_context_params params
 void xasr_free(xasr_context * c) {
     if (!c) {
         return;
+    }
+    if (c->joiner.sched) {
+        ggml_backend_sched_free(c->joiner.sched);
+    }
+    if (c->joiner.ctx) {
+        ggml_free(c->joiner.ctx);
     }
     if (c->sched) {
         ggml_backend_sched_free(c->sched);
@@ -1108,7 +1245,14 @@ bool stream_accept(xasr_stream * s, const float * pcm, int n, bool flush) {
         return false;
     }
     t = xasr_clock::now();
-    greedy_run(s->c->model, s->gs, enc.data(), (int)(enc.size() / (size_t)s->c->model.hp.joiner_dim));
+    if (s->c->joiner.ready) {
+        if (!greedy_run_dev(s->c, s->gs, enc.data(), (int)(enc.size() / (size_t)s->c->model.hp.joiner_dim), &s->stats)) {
+            s->failed = true;
+            return false;
+        }
+    } else {
+        greedy_run(s->c->model, s->gs, enc.data(), (int)(enc.size() / (size_t)s->c->model.hp.joiner_dim));
+    }
     s->stats.greedy_ms += span_ms(t);
     s->finished = flush;
     return true;
@@ -1160,12 +1304,14 @@ bool xasr_commit(xasr_stream * s, std::string & text) {
                 R"(xasr-timing {"chunks":%d,"chunks_stream":%d,"chunks_commit":%d,"frames":%d,"pad_frames":%d,)"
                 R"("fbank_ms":%.3f,"feat_up_ms":%.3f,"mask_build_ms":%.3f,"mask_up_ms":%.3f,)"
                 R"("compute_ms":%.3f,"submit_ms":%.3f,"wait_ms":%.3f,"dsp_batches":%d,)"
-                R"("readback_ms":%.3f,"greedy_ms":%.3f,"detok_ms":%.3f,)"
+                R"("readback_ms":%.3f,"greedy_ms":%.3f,"joiner_dev_ms":%.3f,"joiner_dev_calls":%d,)"
+                R"("joiner_pred_ms":%.3f,"detok_ms":%.3f,)"
                 R"("append_wall_ms":%.3f,"commit_wall_ms":%.3f,"chunk_ms":[)",
                 st.chunks_stream + st.chunks_commit, st.chunks_stream, st.chunks_commit, st.n_frames, st.pad_frames,
                 st.fbank_ms, st.feat_up_ms, st.mask_build_ms, st.mask_up_ms,
                 st.compute_ms, st.submit_ms, st.wait_ms, st.dsp_batches,
-                st.readback_ms, st.greedy_ms, st.detok_ms,
+                st.readback_ms, st.greedy_ms, st.joiner_dev_ms, st.joiner_dev_calls,
+                st.joiner_pred_ms, st.detok_ms,
                 st.append_wall_ms, st.commit_wall_ms);
         for (size_t i = 0; i < st.chunk_ms.size(); ++i) {
             fprintf(stderr, "%s%.3f", i ? "," : "", st.chunk_ms[i]);
