@@ -1026,6 +1026,9 @@ void greedy_run(const xasr_model & m, greedy_state & gs, const float * enc, int 
             if (acc > logits[(size_t)best])
                 best = v;
         }
+        if (best < 0 || best >= V) {
+            best = hp.blank_id;
+        }
         if (best != hp.blank_id && best != hp.unk_id) {
             gs.toks.push_back(best);
             gs.hyp.push_back(best);
@@ -1058,7 +1061,12 @@ bool greedy_run_dev(xasr_context * c, greedy_state & gs, const float * enc, int 
         ++st->joiner_dev_calls;
         const int start = f;
         for (; f < n_enc; ++f) {
-            const int best = idx[(size_t) (f - start)];
+            int best = idx[(size_t) (f - start)];
+            // A degenerate input (digital silence) drives the normalisation to
+            // NaN, and the argmax of NaN logits is not a valid token id.
+            if (best < 0 || best >= hp.vocab) {
+                best = hp.blank_id;
+            }
             if (best != hp.blank_id && best != hp.unk_id) {
                 gs.toks.push_back(best);
                 gs.hyp.push_back(best);
