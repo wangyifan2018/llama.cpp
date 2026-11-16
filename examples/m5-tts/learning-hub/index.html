@@ -367,7 +367,7 @@
 <div class="partIntro" id="p1">
   <b>第一部 · 认识对象</b>
   <p>动手改任何一行代码之前，先钉死三件事：音频是怎么一帧帧生成的（第 1 章）、llama.cpp
-  这个框架<b>靠什么加速</b>又把哪些原语借给了我们（第 2 章）、这些计算真正落在哪块芯片上（第 3 章）。
+  这个框架<strong>靠什么加速</strong>又把哪些原语借给了我们（第 2 章）、这些计算真正落在哪块芯片上（第 3 章）。
   这三章是后面所有判断的地基。</p>
 </div>
 <section class="chapter" id="ch1" data-title="M5-TTS 流水线">
@@ -451,7 +451,7 @@
     本章讲的是<b>逻辑数据流</b>。llama.cpp 在这条流水线里到底复用了哪些原语、
     <code>llama_batch.embd</code> 这招"借壳"为什么成立，展开在 <b><a href="#ch2">第 2 章 · llama.cpp 加速地图</a></b>；
     哪些模块真正在 HTP0、哪些在 CPU、一帧要跨多少次边界、以及为什么 App 形态拿不到 NPU，
-    统一放在 <b><a href="#ch3">第 3 章 · HTP 后端与 NPU / CPU 边界</a></b>。
+    统一放在 <b><a href="#ch3">第 3 章 · HTP 后端：会话、批边界与硅的形状</a></b>。
   </div>
 
   <h3>1.3 depth 链：16 个 book 为什么必须一个一个来</h3>
@@ -1009,54 +1009,244 @@ Q8  →                        65 KB/行 → 4k 行 = 256 MB</pre>
 </section>
 
 <!-- ============ CHAPTER 3 ============ -->
-<section class="chapter" id="ch3" data-title="HTP 后端、计算图与设备分工">
-  <div class="chapHead"><span class="idx">03</span><h2>HTP 后端：FastRPC、HVX 与 NPU / CPU 的边界</h2></div>
-  <p class="subtitle">"模型跑在 NPU 上"这句话对 M5-TTS 只对了一小半。这一章讲清楚 DSP 的调用链、计算归属，以及每帧 15 次跨边界往返的真实结构。</p>
+<section class="chapter" id="ch3" data-title="HTP 后端：会话、批边界与硅的形状">
+  <div class="chapHead"><span class="idx">03</span><h2>HTP 后端：会话、批边界与这块硅的形状</h2></div>
+  <p class="subtitle">"模型跑在 NPU 上"这句话对 M5-TTS 只对了一小半。它没说清哪条路径每帧都在走、哪条一辈子只走一次；也没说清这块 NPU 有几个向量单元、多少片上内存、能不能做矩阵乘。这一章把 HTP 后端拆到可以自己复算的程度。</p>
   <div class="objectives"><b>本章目标</b><ul>
-    <li>能画出从用户态进程到 Hexagon DSP 的 FastRPC 调用链，解释为什么 App 形态拿不到 NPU</li>
-    <li>用张量形状、内核覆盖和边界成本解释 backbone、depth、heads 与 codec 的设备分工</li>
-    <li>理解"两个 HTP 会话分时一个 NPU"与每帧 15 次往返的结构含义</li>
+    <li>分清「建立会话」与「提交一批算子」是两条完全不同的路径：前者每进程一次，后者每帧 15 次</li>
+    <li>把一次提交拆成固定项 F 与每行项 R，并说明为什么优化目标是<strong>减少批边界</strong>，而不是减少函数调用</li>
+    <li>记住这块硅的硬形状——2 个 HVX 128B 单元、2 MB VTCM、无 HMX——以及它如何决定权重布局与设备分工</li>
+    <li>用张量形状、内核覆盖和边界成本解释 backbone、depth、heads、codec 的归属，并复述一帧 15 次往返的结构</li>
   </ul></div>
 
-  <h3>3.1 FastRPC：从用户态到 DSP</h3>
-  <p>HTP（Hexagon Tensor Processor）不是一块"插上就能用"的加速卡，它是一组通过
-  <b>FastRPC</b> 远程过程调用的 DSP 服务。调用链是：</p>
+  <h3 id="ch3-paths">3.1 会话不是提交：两条路径</h3>
+  <p>先纠一个最常见的误读：把"每帧 15 次提交"想成 15 次 FastRPC 调用。FastRPC 确实在链路上，
+  但它承担的是<b>建立会话</b>，不是每帧的提交。这两件事的代价差三个数量级，混在一起就会得出完全错误的优化方向。</p>
   <figure>
     <div class="figureBox">
-      <svg viewBox="0 0 880 264" role="img" aria-label="FastRPC 调用链：stage 进程到 Hexagon DSP 到 HVX">
-        <rect class="dg-panel" x="0" y="0" width="880" height="264" rx="12"/>
-        <rect class="dg-cpu" x="20" y="24" width="250" height="120" rx="12"/>
-        <text class="dg-tb" x="145" y="50" text-anchor="middle">常驻 stage 进程（CPU 侧）</text>
-        <text class="dg-ts" x="145" y="71" text-anchor="middle">backbone-resident / depth-resident</text>
-        <text class="dg-ts" x="145" y="91" text-anchor="middle">llama_context + ggml 图</text>
-        <text class="dg-ts" x="145" y="111" text-anchor="middle">每帧 1~15 次提交</text>
-        <rect class="dg-mix" x="310" y="44" width="180" height="80" rx="10"/>
-        <text class="dg-tb" x="400" y="74" text-anchor="middle">libadsprpc.so</text>
-        <text class="dg-ts" x="400" y="95" text-anchor="middle">FastRPC ioctl</text>
-        <rect class="dg-mix" x="530" y="44" width="150" height="80" rx="10"/>
-        <text class="dg-tb" x="605" y="74" text-anchor="middle">/dev/adsprpc-smd</text>
-        <text class="dg-ts" x="605" y="95" text-anchor="middle">内核节点 · 权限闸门</text>
-        <rect class="dg-npu" x="720" y="24" width="140" height="200" rx="12"/>
-        <text class="dg-tb" x="790" y="50" text-anchor="middle">HTP0 · DSP</text>
-        <rect class="dg-npu-in" x="732" y="64" width="116" height="46" rx="8"/>
-        <text class="dg-t" x="790" y="92" text-anchor="middle">会话（skel）</text>
-        <text class="dg-ts" x="790" y="108" text-anchor="middle">libggml-htp-v73</text>
-        <rect class="dg-npu-in" x="732" y="118" width="116" height="46" rx="8"/>
-        <text class="dg-t" x="790" y="146" text-anchor="middle">量化算子执行</text>
-        <text class="dg-ts" x="790" y="162" text-anchor="middle">HVX 向量核</text>
-        <text class="dg-ts" x="790" y="196" text-anchor="middle">会话创建昂贵 →</text>
-        <text class="dg-ts" x="790" y="212" text-anchor="middle">进程必须常驻</text>
-        <path class="dg-flow" d="M270 84 H308"/><path class="dg-flow" d="M490 84 H528"/><path class="dg-flow" d="M680 84 H718"/>
-        <text class="dg-ts" x="20" y="166">ADSP_LIBRARY_PATH 指向设备目录，DSP 侧按需加载 skel（<code>libggml-htp-v73.so</code>）；同一个二进制被两种角色复用。</text>
-        <text class="dg-bad" x="20" y="190" style="font:600 12px var(--mono)">权限：app uid 打开 /dev/adsprpc-smd 得到 EACCES —— 只有 shell 域进程能用 DSP。</text>
-        <text class="dg-ts" x="20" y="214">这就是"server 形态跑 NPU、App 形态只能 native CPU"的根源；也是 stage 被拆成常驻子进程的第二原因（隔离崩溃域）。</text>
-        <text class="dg-ts" x="20" y="238">提交成本模型（第 5 章展开）：F ≈ 1.25 ms 固定/次 + R ≈ 0.91 ms/行 —— 15 次串行提交 = 18.8 ms 纯税。</text>
+      <svg viewBox="0 0 680 420" role="img" aria-label="HTP 后端的两条调用路径：会话建立与批提交">
+        <text class="dg-tb" x="16" y="24">① 每进程一次：建立会话 —— 同步 RPC，毫秒到百毫秒级</text>
+        <rect class="dg-cpu" x="16" y="36" width="152" height="58" rx="9"/>
+        <text class="dg-t" x="92" y="58" text-anchor="middle">m5-server / stage</text>
+        <text class="dg-ts" x="92" y="76" text-anchor="middle">申请一个 remote handle</text>
+        <rect class="dg-box" x="192" y="36" width="168" height="58" rx="9"/>
+        <text class="dg-t" x="276" y="58" text-anchor="middle">libcdsprpc.so</text>
+        <text class="dg-ts" x="276" y="76" text-anchor="middle">ioctl 进内核</text>
+        <rect class="dg-box" x="384" y="36" width="140" height="58" rx="9"/>
+        <text class="dg-t" x="454" y="58" text-anchor="middle">/dev/adsprpc-smd</text>
+        <text class="dg-ts" x="454" y="76" text-anchor="middle">权限闸门</text>
+        <rect class="dg-npu" x="548" y="36" width="116" height="58" rx="9"/>
+        <text class="dg-t" x="606" y="58" text-anchor="middle">DSP 侧 skel</text>
+        <text class="dg-ts" x="606" y="76" text-anchor="middle">加载 + 预留 VTCM</text>
+        <path class="dg-flow" d="M168 65 H190"/><path class="dg-flow" d="M360 65 H382"/><path class="dg-flow" d="M524 65 H546"/>
+        <text class="dg-ts" x="16" y="112">产物：一个 handle + 一个导出的 dspqueue id + 一块 VTCM 预留。之后每帧都不再走这两步。</text>
+        <text class="dg-bad" x="16" y="132" style="font:600 12px var(--mono)">失败点：app uid 打开 /dev/adsprpc-smd 得 EACCES —— 只有 shell 域进程能用 DSP。</text>
+
+        <text class="dg-tb" x="16" y="164">② 每批一次：提交 —— 异步，只按一下门铃</text>
+        <rect class="dg-cpu" x="16" y="176" width="152" height="58" rx="9"/>
+        <text class="dg-t" x="92" y="198" text-anchor="middle">写描述符</text>
+        <text class="dg-ts" x="92" y="216" text-anchor="middle">bufs / tensors / ops</text>
+        <rect class="dg-cpu-in" x="192" y="176" width="168" height="58" rx="9"/>
+        <text class="dg-t" x="276" y="198" text-anchor="middle">共享内存槽</text>
+        <text class="dg-ts" x="276" y="216" text-anchor="middle">slot = seq % 8</text>
+        <rect class="dg-box" x="384" y="176" width="140" height="58" rx="9"/>
+        <text class="dg-t" x="454" y="198" text-anchor="middle">dspqueue_write</text>
+        <text class="dg-ts" x="454" y="216" text-anchor="middle">门铃：24 B 头</text>
+        <rect class="dg-npu" x="548" y="176" width="116" height="58" rx="9"/>
+        <text class="dg-t" x="606" y="198" text-anchor="middle">DSP 取批</text>
+        <text class="dg-ts" x="606" y="216" text-anchor="middle">read_noblock</text>
+        <path class="dg-flow" d="M168 205 H190"/><path class="dg-flow" d="M360 205 H382"/><path class="dg-flow" d="M524 205 H546"/>
+        <rect class="dg-npu-in" x="16" y="252" width="648" height="56" rx="9"/>
+        <text class="dg-t" x="30" y="274">process_opbatch：dcache 全量 flush/invalidate → 按 footprint 预取 L2 → 逐 op 派发到 HVX 工作队列</text>
+        <text class="dg-ts" x="30" y="294">→ 收尾：再 flush 一次 → 写响应槽。前后两次 flush 与 op 数无关，这就是批边界。</text>
+        <path class="dg-flow" d="M606 234 V250"/>
+        <text class="dg-ts" x="16" y="330">回程：DSP 写响应槽 → 宿主 dspqueue_read 取回（OPPOLL=1 时超时设 0，改成自旋）。完成信号走队列，不走函数返回。</text>
+        <text class="dg-ts" x="16" y="352">异步的后果：宿主塞完门铃就继续写下一批描述符，只在要结果时同步。两条流可以各自排队，但共用同一颗 HTP0。</text>
+        <text class="dg-lbl" x="16" y="382">成本量级：会话建立 = 每进程一次；批边界 = 每批一次（F ≈ 1.25 ms）；批内每行（R ≈ 0.91 ms）。</text>
+        <text class="dg-lbl" x="16" y="402">一帧 depth 15 批 → 约 15 × (F + 2R) ≈ 46 ms，实测 40.6 ms/帧；模型偏保守，但形状是对的。</text>
       </svg>
     </div>
-    <figcaption>图 3-1　FastRPC 调用链。FastRPC 的"每次提交都有固定开销"直接决定了 depth 的成本模型形状，也是"15 步压成 2 步"这一思路的成本依据。</figcaption>
+    <figcaption>图 3-1　HTP 后端的两种调用。上面那条一辈子走一次，也是 App 形态被挡住的地方；下面那条每帧走 15 次，成本落在"批边界"上而不是"函数调用"上。</figcaption>
   </figure>
-  <h3>3.2 计算归属全景</h3>
-  <p>真正跑在 HTP0 上的只有<b>两个 transformer</b>：backbone（8 层 Q8_0，32 MB）与 depth core（5 层 Q4_0，10.7 MB），合计约 43 MB 权重常驻。
+  <p>两条路径的区别不止在快慢，还在<b>谁在等谁</b>。会话建立是同步 RPC：宿主线程阻塞到 DSP 返回，
+  中途失败就是一个错误码。批提交是异步的：<code>dspqueue_write</code> 只把门铃按下去，
+  宿主立刻回来继续写下一批描述符，直到需要结果时才 <code>dspqueue_read</code>。
+  这个异步性决定了后面所有结构——两个进程能各自排自己的队、codec 能在 CPU 上与 depth 重叠、
+  以及"取消一个请求"必须自己实现（没有可中断的同步调用可打）。</p>
+
+  <h3 id="ch3-submit">3.2 一次提交的真实粒度：opbatch</h3>
+  <p>一次提交 = 一个 <b>opbatch</b>。宿主把这次要跑的 N 个算子写成一串描述符（buffer 表、tensor 表、
+  op 表）放进共享内存的固定槽里，默认 8 个槽轮转，单批最多 2048 个算子；
+  门铃里只带一个 24 B 的头（序号 + 四个计数）加一个指向槽的描述符。DSP 侧拿到槽以后，按图 3-1 第二条路径的流程处理，
+  期间不回到宿主。</p>
+  <p>所以"提交"这个字在 HTP 上指的是<b>批边界</b>，而批边界的工作量与批内算子数几乎无关：
+  两次全量 dcache flush、一次 L2 预取、一次工作队列唤醒与收尾。
+  <code>depth_batch_bench</code> 就是为拆开这两项写的：同样处理 28 行，用不同次数提交。</p>
+  <div class="tableWrap"><table>
+    <tr><th>形状</th><th class="num">总耗时（中位）</th><th class="num">摊到每次提交</th><th>它测的差异</th></tr>
+    <tr><td>28×1（28 次提交，每次 1 行）</td><td class="num">60.6 ms</td><td class="num">2.16 ms</td><td>最坏情况：28 次批边界</td></tr>
+    <tr><td>14×2（14 次提交，每次 2 行）</td><td class="num">42.6 ms</td><td class="num">3.04 ms</td><td>生产上 depth 的真实形状</td></tr>
+    <tr><td>1×28（1 次提交，28 行）</td><td class="num">26.8 ms</td><td class="num">—</td><td>完全合并：只有 1 次批边界</td></tr>
+  </table></div>
+  <p>拿首尾两行解一个线性模型：<code>28·(F+R)=60.6</code>、<code>F+28·R=26.8</code>，
+  得 <b>F ≈ 1.25 ms/批</b>、<b>R ≈ 0.91 ms/行</b>。中间那行是模型的检验点：
+  <code>14·(F+2R)=43.1 ms</code>，实测 42.6 ms，误差 1%——这个两参数模型在这块硅上是站得住的。</p>
+  <figure>
+    <div class="figureBox">
+      <svg viewBox="0 0 680 306" role="img" aria-label="三种提交形状在不同轮询设置下的总耗时">
+        <text class="dg-lbl" x="16" y="36">ms</text>
+        <path class="dg-grid" d="M64 214 H648"/><path class="dg-grid" d="M64 143 H648"/><path class="dg-grid" d="M64 72 H648"/>
+        <text class="dg-lbl" x="34" y="218">0</text><text class="dg-lbl" x="30" y="147">50</text><text class="dg-lbl" x="26" y="76">100</text>
+        <rect class="dg-bar"  x="120" y="128" width="46" height="86" rx="3"/>
+        <rect class="dg-bar2" x="174" y="56"  width="46" height="158" rx="3"/>
+        <rect class="dg-bar"  x="310" y="154" width="46" height="60" rx="3"/>
+        <rect class="dg-bar2" x="364" y="115" width="46" height="99" rx="3"/>
+        <rect class="dg-bar"  x="500" y="176" width="46" height="38" rx="3"/>
+        <rect class="dg-bar2" x="554" y="170" width="46" height="44" rx="3"/>
+        <g class="dg-num">
+          <text x="143" y="120" text-anchor="middle">60.6</text><text x="197" y="48" text-anchor="middle">111.3</text>
+          <text x="333" y="146" text-anchor="middle">42.6</text><text x="387" y="107" text-anchor="middle">69.7</text>
+          <text x="523" y="168" text-anchor="middle">26.8</text><text x="577" y="162" text-anchor="middle">31.4</text>
+        </g>
+        <g class="dg-t" text-anchor="middle">
+          <text x="170" y="234">28×1</text><text x="360" y="234">14×2</text><text x="550" y="234">1×28</text>
+        </g>
+        <g class="dg-lbl" text-anchor="middle">
+          <text x="170" y="251">28 次批边界</text><text x="360" y="251">14 次</text><text x="550" y="251">1 次</text>
+        </g>
+        <rect class="dg-bar"  x="112" y="272" width="11" height="11" rx="2"/>
+        <text class="dg-ts" x="129" y="281">OPPOLL=1（生产配置）</text>
+        <rect class="dg-bar2" x="300" y="272" width="11" height="11" rx="2"/>
+        <text class="dg-ts" x="317" y="281">OPPOLL=0</text>
+        <text class="dg-ts" x="400" y="281">同一份 depth 权重、同一轮交替</text>
+      </svg>
+    </div>
+    <figcaption>图 3-2　三种提交形状的总耗时。形状决定批边界次数；两条柱子的差就是 3.7 节要解释的轮询效应——它随批次数放大，不随行数放大。</figcaption>
+  </figure>
+  <p>这个模型立刻给出两个可以证伪的推论，而且都用已有实验验过了：</p>
+  <ul>
+    <li><b>批越大越划算。</b>把 15 步合成 1 批，应该能省掉 14 个 F（约 17.5 ms/帧）。
+    但 depth 第 b+1 步的输入依赖第 b 步的采样结果——宿主必须先看到 logits 才能构造下一行，
+    所以这条链无法合并（<a href="#ch5">第 5 章</a>把这件事算成结构天花板）。</li>
+    <li><b>R 不是权重带宽。</b>若 R 由 DDR 带宽主导，把 depth 权重从 Q4_0 10.7 MB 换成 Q8_0 21 MB
+    应该让 R 接近翻倍。实测只慢 9%。说明 R 的主体是 HVX 计算与每行的固定开销，
+    权重带宽不是主项——这也是"把 depth 量化到更低比特"被判死的依据（<a href="#ch6">第 6 章</a>）。</li>
+  </ul>
+  <p><code>OPFUSION</code> 是同一机制的另一半：把 RMSNorm+Mul、MatMul+Add、SwiGLU 这类三段式
+  在批内合成一个算子的一个 opcode，省的是批内算子数与中间张量的往返访存。
+  实测关掉它只慢 5%（14×2：44.7 vs 42.6 ms）——depth 图本来就小，能省的有限。
+  反过来说：<b>如果一个后端开了融合也拿不到 10%，说明瓶颈不在批内。</b></p>
+
+  <h3 id="ch3-silicon">3.3 这块硅的形状：2 HVX、2 MB VTCM、没有 HMX</h3>
+  <p>会话启动时会打印一行硬件信息，这行字比任何论文都重要，因为后面所有设计都由它推出来：</p>
+  <pre>ggml-hex: HTP0 hwinfo: threads 4, hvx 2, hmx 0, vtcm 2 MB</pre>
+  <div class="tableWrap"><table>
+    <tr><th style="width:13%">能力项</th><th style="width:21%">SM6650 实测</th><th>它决定了什么</th></tr>
+    <tr><td>HVX</td><td>2 个，128 B/cycle</td><td>并行度上限是<b>单元数</b>不是线程数。启动时按 <code>min(threads-1, hw_n_hvx, 8)</code> 定 2 个 worker，之后每个算子按行/列块切成 2 份</td></tr>
+    <tr><td>VTCM</td><td>2 MB（页 2 MB）</td><td>depth core 权重 10.7 MB 是它的 5 倍、backbone 32 MB 是 16 倍 → 权重只能流式，片上只放得下"一个 tile + 累加器 + 激活"</td></tr>
+    <tr><td>HMX</td><td>0（能力位全 0）</td><td>没有专用矩阵引擎，矩阵乘/卷积全部走 HVX 向量指令；"NPU 上的 GEMM 峰值"在这里不存在</td></tr>
+    <tr><td>架构版本</td><td>0x4d73（v73）</td><td>决定可用的 HVX 指令集、DMA 位宽与映射窗口；v73 不支持 64 位 DMA，权重走惰性映射</td></tr>
+  </table></div>
+  <figure>
+    <div class="figureBox">
+      <svg viewBox="0 0 680 340" role="img" aria-label="HTP 的内存层次：DDR、VTCM 与两个 HVX 单元">
+        <rect class="dg-panel" x="16" y="20" width="648" height="150" rx="12"/>
+        <rect class="dg-cpu" x="32" y="42" width="196" height="112" rx="9"/>
+        <text class="dg-tb" x="130" y="64" text-anchor="middle">DDR · 43 MB 常驻</text>
+        <text class="dg-ts" x="130" y="84" text-anchor="middle">backbone Q8_0 32 MB</text>
+        <text class="dg-ts" x="130" y="102" text-anchor="middle">depth Q4_0 10.7 MB</text>
+        <text class="dg-ts" x="130" y="120" text-anchor="middle">KV / 激活 / 描述符槽</text>
+        <text class="dg-lbl" x="130" y="142" text-anchor="middle">容量充足，延迟不可控</text>
+        <text class="dg-lbl" x="277" y="72" text-anchor="middle">DMA</text>
+        <path class="dg-flow" d="M248 88 H300"/>
+        <rect class="dg-npu" x="306" y="42" width="180" height="112" rx="9"/>
+        <text class="dg-tb" x="396" y="64" text-anchor="middle">VTCM · 2 MB</text>
+        <text class="dg-ts" x="396" y="84" text-anchor="middle">一个 32×32 tile = 576 B</text>
+        <text class="dg-ts" x="396" y="102" text-anchor="middle">2 MB ≈ 3,640 个 tile</text>
+        <text class="dg-ts" x="396" y="120" text-anchor="middle">≈ 3.7 M 个 Q4_0 权重</text>
+        <text class="dg-lbl" x="396" y="142" text-anchor="middle">唯一喂得满 HVX 的层次</text>
+        <path class="dg-flow" d="M488 82 H524"/>
+        <rect class="dg-npu-in" x="528" y="42" width="120" height="50" rx="8"/>
+        <text class="dg-t" x="588" y="63" text-anchor="middle">HVX #0</text>
+        <text class="dg-ts" x="588" y="80" text-anchor="middle">128 B / cycle</text>
+        <rect class="dg-npu-in" x="528" y="102" width="120" height="50" rx="8"/>
+        <text class="dg-t" x="588" y="123" text-anchor="middle">HVX #1</text>
+        <text class="dg-ts" x="588" y="140" text-anchor="middle">128 B / cycle</text>
+        <text class="dg-tb" x="16" y="196">权重总量与片上内存的比值，是这块硅的设计约束</text>
+        <rect class="dg-cpu-in" x="16" y="208" width="600" height="16" rx="3"/>
+        <rect class="dg-npu-in" x="16" y="208" width="28" height="16" rx="3"/>
+        <text class="dg-ts" x="626" y="221">43 MB</text>
+        <text class="dg-lbl" x="16" y="242">紫段 = VTCM 2 MB，约占 5%：整个模型不可能驻留，只能按 tile 流式</text>
+        <text class="dg-ts" x="16" y="274">① 权重按 tile 流式读，中间结果别指望驻留：图要切得能让同一块 tile 被复用多次。</text>
+        <text class="dg-ts" x="16" y="296">② 两个会话各预留一份 VTCM（2 MB × 2）；超过硬件上报值会话直接 start 失败。</text>
+        <text class="dg-ts" x="16" y="318">③ 没有 HMX → 矩阵乘靠 HVX 拼，峰值受寄存器与 VTCM 带宽约束，别套 GEMM 论文的百分比。</text>
+      </svg>
+    </div>
+    <figcaption>图 3-3　内存层次。2 MB 的片上内存对上 43 MB 权重，是这块硅最硬的约束；它解释了两件事——为什么权重必须重排成 tile、为什么"把整块搬上来算"的方案要先问容量。</figcaption>
+  </figure>
+  <p>HMX 这一行值得单独记一笔，因为它教的是<b>怎么读能力位</b>。代码里 <code>htp_iface_hwinfo</code>
+  无条件把 <code>*n_hmx</code> 写成 1，于是这个会话在日志里报告"有矩阵扩展"。
+  直接用 <code>remote.h</code> 的 12 项能力查询交叉验证，才看到 <code>HMX_SUPPORT_DEPTH=0</code>、
+  <code>HMX_SUPPORT_SPATIAL=0</code>——这块 CDSP 根本没有 FP16 HMX。修法是加一个
+  <code>htpdrv_get_hmx_support()</code>，在初始化时查能力并回填 <code>opt_nhmx</code>。</p>
+  <div class="tableWrap"><table>
+    <tr><th>检查项（默认环境，不设 <code>GGML_HEXAGON_NHMX</code>）</th><th class="num">修复前</th><th class="num">修复后</th></tr>
+    <tr><td>hwinfo 报告的 hmx</td><td class="num">1</td><td class="num">0，并打印 <code>CDSP reports no HMX support</code></td></tr>
+    <tr><td>单卷积探针的最大绝对误差</td><td class="num">1.348567（输出全零）</td><td class="num">3.74e-4</td></tr>
+    <tr><td>32 行 prefill + 7 帧 decode 的 hidden 误差</td><td class="num">19.78</td><td class="num">0.0111</td></tr>
+  </table></div>
+  <p>教训不是"这颗芯片没有 HMX"，而是：<b>能力位要自己查，别信后端替你猜的那一份</b>。
+  错误的能力位不会报错，只会给出全零的结果和一个看起来正常的耗时——这是最难查的一类 bug，
+  因为耗时是对的。</p>
+
+  <h3 id="ch3-repack">3.4 权重为什么要重排：tile 不是压缩</h3>
+  <p>权重进 DSP 之前会被重排成 <b>32×32 的 tile</b>。条件写在 <code>htp_is_tiled_weight_tensor</code> 里：
+  第一维是 32 的倍数、连续、不是 view、第四维为 1。<code>F16</code> 到 <code>Q4_0</code> 到
+  <code>Q6_K</code> 都在覆盖范围内，每种类型有自己的 tile 字节数。</p>
+  <p>关键事实：<b>重排不改变总字节数</b>。Q4_0 的一个 tile 是 576 B = 32 行 × 16 B 的 nibbles
+  + 32 个 fp16 的 scale（64 B）；而 ggml 行主序下 32 行 × 32 个权重也是 32 × 18 = 576 B。
+  Q8_0 的 1088 B 同理（1024 + 64）。所以它不是量化、不是压缩，纯粹是<b>换个顺序摆</b>。</p>
+  <figure>
+    <div class="figureBox">
+      <svg viewBox="0 0 680 340" role="img" aria-label="行主序与 tile 布局的对比">
+        <text class="dg-tb" x="16" y="26">行主序：每行自带 scale，行距 18 B</text>
+        <g class="dg-cpu-in">
+          <rect x="16" y="40" width="160" height="16" rx="3"/><rect x="16" y="62" width="160" height="16" rx="3"/>
+          <rect x="16" y="84" width="160" height="16" rx="3"/><rect x="16" y="106" width="160" height="16" rx="3"/>
+          <rect x="16" y="128" width="160" height="16" rx="3"/><rect x="16" y="150" width="160" height="16" rx="3"/>
+          <rect x="16" y="172" width="160" height="16" rx="3"/><rect x="16" y="194" width="160" height="16" rx="3"/>
+        </g>
+        <rect class="dg-accent" x="16" y="40" width="56" height="16" rx="3"/>
+        <text class="dg-t" x="44" y="52" text-anchor="middle">qs</text>
+        <text class="dg-ts" x="190" y="52">← 紫段 = 32 个 4bit，共 16 B</text>
+        <text class="dg-ts" x="190" y="74">同一列的下一行要 +18 B</text>
+        <text class="dg-ts" x="190" y="96">每行自带一个独立 scale</text>
+        <path class="dg-flow2" d="M330 118 H424"/>
+        <text class="dg-lbl" x="377" y="106" text-anchor="middle">8×8 转置</text>
+        <text class="dg-lbl" x="377" y="140" text-anchor="middle">+ 半字节拆平面</text>
+        <text class="dg-tb" x="440" y="26">tile：同一列块的多行连续</text>
+        <rect class="dg-npu-in" x="440" y="40" width="160" height="168" rx="6"/>
+        <rect class="dg-accent2" x="440" y="40" width="14" height="136" rx="3"/>
+        <path class="dg-line" d="M440 176 H600"/>
+        <text class="dg-ts" x="524" y="86" text-anchor="middle">nibbles · 512 B</text>
+        <text class="dg-ts" x="524" y="106" text-anchor="middle">低 / 高半字节各一层</text>
+        <text class="dg-ts" x="524" y="150" text-anchor="middle">32 行共用一个 32×32 块</text>
+        <text class="dg-ts" x="524" y="196" text-anchor="middle">scale 32 × fp16 = 64 B</text>
+        <text class="dg-ts" x="16" y="234">Q4_0 一个 tile = 576 B = 512 B nibbles + 64 B scale；与行主序的 32 行 × 18 B 完全相同 —— 重排不省一个字节。</text>
+        <text class="dg-ts" x="16" y="258">tile 左侧那条紫 = 8 行同列的量化值落在连续的 14 B 里，一次向量载入就能同时喂 8 行。</text>
+        <text class="dg-ts" x="16" y="282">重排的代价在宿主侧一次性付出：按图 uid 缓存，同一张图第二次执行不再重排；DSP 侧只读，不解回原始布局。</text>
+        <text class="dg-ts" x="16" y="306">检查方法：打开 GGML_HEXAGON_VERBOSE=1，tile 化失败的张量会退回通用内核，耗时立刻不同。</text>
+      </svg>
+    </div>
+    <figcaption>图 3-4　tile 重排。字节数不变，变的是"一次 128 B 向量载入能覆盖多少行"。这就是第 2 章说的 repack 布局在这块硅上的具体含义。</figcaption>
+  </figure>
+  <p>把 3.3 和 3.4 放一起，就能推出一个容易被忽略的结论：<b>在这块硅上，"量化更狠"的收益路径和别处不同。</b>
+  没有 HMX、VTCM 只有 2 MB，意味着算子是"流式读 tile + 向量乘加"，而 R 又被实测证明不是带宽主导——
+  于是降低比特数省下的是 DDR 流量，却换不来多少时间（第 6 章会看到 Q4_0 → Q8_0 区间只有 9%）。</p>
+
+  <h3 id="ch3-graphs">3.5 从计算图推导 CPU / HTP 的分工</h3>
+  <p>现在把后端机制放回模型。真正跑在 HTP0 上的只有<b>两个 transformer</b>：
+  backbone（8 层 Q8_0，32 MB）与 depth core（5 层 Q4_0，10.7 MB），合计约 43 MB 权重常驻。
   <b>heads 投影、采样、噪声生成、codec 声码器、PCM 输出全在 CPU。</b></p>
   <figure>
     <div class="figureBox">
@@ -1091,36 +1281,42 @@ Q8  →                        65 KB/行 → 4k 行 = 256 MB</pre>
         <g class="dg-ts">
           <text x="428" y="114">Q8_0 32 MB · 8 层</text><text x="428" y="131">prefill + 每帧 1 token decode</text>
           <text x="428" y="194">Q4_0 10.7 MB · 5 层</text><text x="428" y="211">每帧 15 次 decode</text>
-          <text x="428" y="274">HVX 向量 · NHMX=0</text><text x="428" y="291">OPPOLL=1 保持 DSP 时钟</text>
+          <text x="428" y="274">2×HVX 128 B · VTCM 2 MB</text><text x="428" y="291">OPPOLL=1 保持批间不掉频</text>
         </g>
-        <path class="dg-arr" d="M346 118 H394"/><path class="dg-arr" d="M394 166 H346"/>
-        <text class="dg-lbl" x="370" y="205" text-anchor="middle">pipe</text>
-        <text class="dg-lbl" x="370" y="221" text-anchor="middle">2 KB/行</text>
-        <text class="dg-ts" x="40" y="348">两个常驻子进程各持一个 HTP 会话；引擎 ↔ stage 走匿名 pipe（FP32 512 维行），stage → DSP 走 FastRPC。</text>
+        <path class="dg-arr" d="M344 118 H397"/><path class="dg-arr" d="M397 166 H344"/>
+        <text class="dg-lbl" x="370" y="138" text-anchor="middle">pipe</text>
+        <text class="dg-lbl" x="370" y="154" text-anchor="middle">2 KB/行</text>
+        <text class="dg-ts" x="40" y="348">两个常驻子进程各持一个 HTP 会话；引擎 ↔ stage 走匿名 pipe（FP32 512 维行），stage → DSP 走 opbatch 提交。</text>
         <text class="dg-ts" x="40" y="368">同一物理 HTP0 被两个会话分时复用；codec 在 CPU worker 线程上，与 depth 并行（overlap）。</text>
       </svg>
     </div>
-    <figcaption>图 3-2　CPU 与 HTP0 的计算归属。注意"模型在 NPU"只覆盖了 43 MB 权重；每帧最重的 16 路 heads 矩阵乘和整个声码器都在 CPU。</figcaption>
+    <figcaption>图 3-5　CPU 与 HTP0 的计算归属。注意"模型在 NPU"只覆盖了 43 MB 权重；每帧最重的 16 路 heads 矩阵乘和整个声码器都在 CPU。</figcaption>
   </figure>
-
-  <h3 id="ch3-graphs">3.3 从计算图推导 CPU / HTP 的分工</h3>
-  <p>图 3-2 给出了设备分工。现在沿着一帧音频看各段的输入形状、算子和状态，再用实验检查分工是否划算。下面的实测限定在本项目的 SM6650、Hexagon v73、无可用 HMX 路径及当时的 GGML/ORT 构建。</p>
+  <p>下面沿着一帧音频看各段的输入形状、算子与状态，再用实验检查分工是否划算。
+  实测限定在本项目的 SM6650、Hexagon v73、无可用 HMX 路径及当时的 GGML/ORT 构建。</p>
 
   <h4>Backbone：让一串投影和注意力共用一次设备执行</h4>
   <pre>前缀 [N, 512] 或单帧输入 [1, 512]
   → 8 层：RMSNorm → Q/K/V 投影 → RoPE + KV 注意力 → 输出投影
              + 残差 → RMSNorm → SwiGLU FFN + 残差
   → hidden[512] → CPU 上的首码本预测</pre>
-  <p>权重以 Q8_0 常驻后端，KV 随语句累积。前缀阶段的投影可处理多行；逐帧 decode 的投影更接近矩阵向量乘。HTP 的价值来自支持这些形状的 HVX 内核，以及多层在同一后端执行，减少跨后端同步。不能从 GEMM 峰值推断单行收益。同机初测中，32 行 prefill 的 CPU / HTP 中位数约 70.2 / 73.9 ms，7 次 decode 约 281.6 / 87.7 ms；CPU 样本有波动，这组对照只涵盖 backbone。<a href="../../../docs/backend/snapdragon/m5-tts-port-notes.md">移植笔记：SM6650 同机 backbone 初测</a></p>
+  <p>权重以 Q8_0 常驻后端，KV 随语句累积。前缀阶段的投影可处理多行；逐帧 decode 的投影更接近矩阵向量乘。
+  HTP 的价值来自支持这些形状的 HVX 内核，以及多层在同一后端执行、只为整张图付一次批边界。
+  不能从 GEMM 峰值推断单行收益。同机初测中，32 行 prefill 的 CPU / HTP 中位数约 70.2 / 73.9 ms，
+  7 次 decode 约 281.6 / 87.7 ms；CPU 样本有波动，这组对照只涵盖 backbone。
+  详见<a href="../../../docs/backend/snapdragon/m5-tts-port-notes.md">移植笔记：SM6650 同机 backbone 初测</a>。</p>
+  <p>这组数字正是 3.2 节模型的形状：prefill 有 32 行，摊薄了批边界，HTP 与 4 核 CPU 打平；
+  decode 每次只有 1 行，CPU 每行都要重走一遍算子调度，HTP 把整图化成一次提交，7 行共用一份开销，于是差出 3 倍。</p>
 
   <h4>Depth core 与 heads：按一个码本步骤画图</h4>
   <div class="tableWrap"><table>
-    <tr><th>阶段</th><th>本次真实工作</th><th>分工依据</th></tr>
-    <tr><td>Depth core</td><td>每步 1–2 行、宽度 512；5 层 Q4_0 Transformer，包含投影、普通注意力和 FFN；帧内保留 KV</td><td>量化权重和短 KV 留在 HTP，连续投影可在同一后端执行。每帧 15 次 decode 的固定开销仍在，下一步依赖当前采样。</td></tr>
-    <tr><td>音频 heads 与采样</td><td>每个 book 选择对应的 <code>[2051, 512]</code> 投影矩阵，计算 logits、top-k 和带噪采样；随后查变换表生成下一步输入</td><td>每步会读取所选投影的整块权重；查表只是生成下一步输入的一部分。本机 per-row INT8 NEON 路径把同轮 <code>heads_s</code> 从 0.94 s 降到 0.38 s。迁移投影还要考虑采样位置和同步。</td></tr>
-    <tr><td>主机侧准备与输出</td><td>分词、embedding 查表、控制提示、PCM 封装</td><td>这些任务涉及字节处理、查表和 I/O，留在持有文本与输出缓冲区的 CPU。</td></tr>
+    <tr><th style="width:13%">阶段</th><th style="width:45%">本次真实工作</th><th>分工依据</th></tr>
+    <tr><td>Depth core</td><td>每步 1–2 行、宽度 512；5 层 Q4_0 Transformer，包含投影、普通注意力和 FFN；帧内保留 KV</td><td>量化权重和短 KV 留在 HTP，连续投影可在同一后端执行。每帧 15 次 decode 的批边界仍在，下一步依赖当前采样。</td></tr>
+    <tr><td>heads 与采样</td><td>每个 book 选择对应的 <code>[2051, 512]</code> 投影矩阵，计算 logits、top-k 和带噪采样；随后查变换表生成下一步输入</td><td>每步会读取所选投影的整块权重；查表只是生成下一步输入的一部分。本机 per-row INT8 NEON 路径把同轮 <code>heads_s</code> 从 0.94 s 降到 0.38 s。迁移投影还要考虑采样位置和同步。</td></tr>
+    <tr><td style="white-space:nowrap">主机准备与输出</td><td>分词、embedding 查表、控制提示、PCM 封装</td><td>这些任务涉及字节处理、查表和 I/O，留在持有文本与输出缓冲区的 CPU。</td></tr>
   </table></div>
-  <p>同样是小矩阵，core 可以让多层连续运行；heads 每一步都要把预测结果交给下一步的控制流。<a href="#ch5">第 5 章</a>把这条依赖转换成每次提交和每行计算的成本模型。</p>
+  <p>同样是小矩阵，core 可以让多层连续跑、只付一次批边界；heads 每一步都要把预测结果交给下一步的控制流。
+  <a href="#ch5">第 5 章</a>把这条依赖转换成每次提交和每行计算的成本模型。</p>
 
   <h4>Codec：低速码本、缓存注意力和高采样率卷积</h4>
   <pre>codes [1, 16, T] + offset + past KV + conv_0…conv_20
@@ -1129,15 +1325,29 @@ Q8  →                        65 KB/行 → 4k 行 = 256 MB</pre>
   → 多级上采样 + 残差卷积（Conv → Snake → Conv）
   → audio [1, 1, samples] + present KV + 21 组 next_conv 状态
        下一次 codec chunk 读回这些状态</pre>
-  <p>生产通常按首块 2 帧、后续 4 帧执行。在码本时间轴上，新数据很短；上采样后，4 帧对应 <code>4 × 1920 = 7680</code> 个采样位置，尾部在高时间分辨率上连续做卷积和激活。发布版 ONNX 的静态图包含 31 个 Conv、85 个 MatMul、8 个 Softmax 和 29 个 <code>m5::Snake</code>，还有两百多个 <code>DequantizeLinear</code>。这些数字来自发布版文件的静态统计。ORT 在加载图后仍可消除或融合节点，运行时实际耗时要看 profile。</p>
+  <p>生产通常按首块 2 帧、后续 4 帧执行。在码本时间轴上，新数据很短；上采样后，4 帧对应
+  <code>4 × 1920 = 7680</code> 个采样位置，尾部在高时间分辨率上连续做卷积和激活。
+  发布版 ONNX 的静态图包含 31 个 Conv、85 个 MatMul、8 个 Softmax 和 29 个 <code>m5::Snake</code>，
+  还有两百多个 <code>DequantizeLinear</code>。这些数字来自发布版文件的静态统计。
+  ORT 在加载图后仍可消除或融合节点，运行时实际耗时要看 profile。</p>
   <ol>
-    <li><b>内核覆盖。</b>生产图已经把反卷积改写成 MatMul 加布局变换，并以 QDQ 描述部分量化算子。能执行 MatMul 只覆盖了其中一类形状。尾部的空洞卷积、逐点 Snake、切片和缓存更新也需要匹配的数据类型、布局及实现。该设备的 HTP 探针拒绝所测形状的直卷积与通用 Sin；ORT CPU 可以连续执行这些操作，并使用融合 Snake。</li>
-    <li><b>切图位置。</b>4 帧码本只有 64 个索引；把一个尾部卷积单独迁移时，边界经过的是放大后的浮点激活。以 96 通道、7680 个输出位置为例，FP32 输出约 2.81 MiB；完全物化 <code>im2col</code> 的逻辑张量为 <code>7680 × (96 × 7) × 4</code> 字节，约 19.7 MiB。这是展开空间的估算，不能当成实际传输字节或 DRAM 流量。端到端测量还要计入重排、提交、同步和读回。</li>
-    <li><b>状态与并行。</b>当前 CPU 实现也会复制缓存。从状态常驻与完整子图出发重做后端，有机会省掉部分搬运；切开单个卷积不会自动取得这些收益。CPU codec 还可与 HTP depth 重叠。若将它们放到同一 HTP，要重新测排队、首包和总墙钟。</li>
+    <li><b>内核覆盖。</b>生产图已经把反卷积改写成 MatMul 加布局变换，并以 QDQ 描述部分量化算子。
+    能执行 MatMul 只覆盖了其中一类形状。尾部的空洞卷积、逐点 Snake、切片和缓存更新也需要匹配的数据类型、
+    布局及实现。该设备的 HTP 探针拒绝所测形状的直卷积与通用 Sin；ORT CPU 可以连续执行这些操作，
+    并使用融合 Snake。</li>
+    <li><b>切图位置。</b>4 帧码本只有 64 个索引；把一个尾部卷积单独迁移时，边界经过的是放大后的浮点激活。
+    以 96 通道、7680 个输出位置为例，FP32 输出约 2.81 MiB；完全物化 <code>im2col</code> 的逻辑张量为
+    <code>7680 × (96 × 7) × 4</code> 字节，约 19.7 MiB。这是展开空间的估算，不能当成实际传输字节或 DRAM 流量。
+    端到端测量还要计入重排、提交、同步和读回。</li>
+    <li><b>状态与并行。</b>当前 CPU 实现也会复制缓存。从状态常驻与完整子图出发重做后端，有机会省掉部分搬运；
+    切开单个卷积不会自动取得这些收益。CPU codec 还可与 HTP depth 重叠。若将它们放到同一 HTP，
+    要重新测排队、首包和总墙钟。</li>
   </ol>
 
   <h4>用真实的四帧 chunk 对照一个卷积</h4>
-  <p>日志 §15 从生产流式请求的第二个四帧块抽取数据。<code>/conv_32/Conv</code> 为 FP32、96→96 通道、7 taps、dilation 9，输入含 54 个历史位置。表中 HTP 探针包含子图输入设置、执行和读回；ORT 一行是生产图中单个算子的 profile。</p>
+  <p>日志 §15 从生产流式请求的第二个四帧块抽取数据。<code>/conv_32/Conv</code> 为 FP32、96→96 通道、
+  7 taps、dilation 9，输入含 54 个历史位置。表中 HTP 探针包含子图输入设置、执行和读回；
+  ORT 一行是生产图中单个算子的 profile。</p>
   <div class="tableWrap"><table>
     <tr><th>路径</th><th>约耗时</th><th>从对照能看出什么</th></tr>
     <tr><td>生产 ORT CPU Conv32</td><td>11.03 ms</td><td>原图中该节点的参考耗时</td></tr>
@@ -1145,16 +1355,29 @@ Q8  →                        65 KB/行 → 4k 行 = 256 MB</pre>
     <tr><td>HTP 九相位重排 + MatMul</td><td>48.26 ms</td><td>把 dilation 改为分相位的普通卷积后，重排与展开仍在</td></tr>
     <tr><td>HTP HVX 直卷积 / 四输出通道分块</td><td>148.8 / 约 80 ms</td><td>按输出通道复用输入能改善原型；这版仍慢于生产节点</td></tr>
   </table></div>
-  <p>这组数字回答的是「要不要将已测子图从当前 CPU 路径移走」。完整 codec 的 HTP 对照需要可运行的整图或连续分区，并报告每个边界。同一批 codes 应同时测数值误差、PCM、首包和端到端耗时。更换 ORT EP 也要确认实际分配的节点；注册 XNNPACK 后，日志 §28 中 <code>codec_s</code> 中位数为 2.818 s，原 CPU 为 2.810 s，WAV 一致，注册日志本身无法说明算子覆盖率。<a href="../../../docs/backend/snapdragon/m5-tts-optimization-log.md#codec-尾部-fp32-子图移植探针">移植探针与原始口径</a> · <a href="../../../docs/backend/snapdragon/m5-tts-optimization-log.md#28-codec-执行后端-abxnnpack-无收益">EP 对照</a> · <a href="https://onnxruntime.ai/docs/execution-providers/">ORT 的图分区机制</a></p>
+  <p>这组数字回答的是"要不要将已测子图从当前 CPU 路径移走"。完整 codec 的 HTP 对照需要可运行的整图或连续分区，
+  并报告每个边界。同一批 codes 应同时测数值误差、PCM、首包和端到端耗时。更换 ORT EP 也要确认实际分配的节点；
+  注册 XNNPACK 后，日志 §28 中 <code>codec_s</code> 中位数为 2.818 s，原 CPU 为 2.810 s，WAV 一致，
+  注册日志本身无法说明算子覆盖率。
+  <a href="../../../docs/backend/snapdragon/m5-tts-optimization-log.md#codec-尾部-fp32-子图移植探针">移植探针与原始口径</a> ·
+  <a href="../../../docs/backend/snapdragon/m5-tts-optimization-log.md#28-codec-执行后端-abxnnpack-无收益">EP 对照</a> ·
+  <a href="https://onnxruntime.ai/docs/execution-providers/">ORT 的图分区机制</a></p>
 
   <div class="callout key"><span class="tagline">把图形状变成测量计划</span>
-    给任一候选子图标出常驻权重、跨 chunk 的状态、每次传输的激活和提交次数。先在同形状下测数值与单块耗时，再量整条流水线。接下来的 3.4 顺着一帧看提交在哪里发生；<a href="#ch4">第 4 章</a>确定计时边界，<a href="#ch6">第 6 章</a>复盘量化与融合，<a href="#ch7">第 7 章</a>计算重叠的收益。</div>
+    给任一候选子图标出常驻权重、跨 chunk 的状态、每次传输的激活和提交次数。先在同形状下测数值与单块耗时，再量整条流水线。
+    手边就有一个不写代码的判据：<code>GGML_HEXAGON_OPFILTER="CONV_2D"</code> 把算子挡回 CPU，
+    同一请求跑两遍——如果墙钟没变，这个算子留在 NPU 上就没有意义。</div>
 
-  <h3>3.4 一帧内的 15 次跨边界往返</h3>
-  <p>引擎 ↔ stage 一行 FP32 512 维 = 2 KB。默认 <code>--depth-pipe</code> 下，每个 book 都要「CPU 构造 transform 行 → 送 HTP0 跑一步 depth core → 回 CPU 投影 2051 类 → 采样」，<b>一帧 15 次</b>。<code>--depth-chain</code> 能把整条链搬进 stage、一次往返，但实测打平；<code>m5_ring</code> 共享内存反而更慢。这两种尝试都没有减少模型在 HTP 上的逐步提交。</p>
+  <h3 id="ch3-frame">3.6 一帧内的 15 次跨边界往返</h3>
+  <p>引擎 ↔ stage 一行 FP32 512 维 = 2 KB。默认 <code>--depth-pipe</code> 下，每个 book 都要
+  「CPU 构造 transform 行 → 送 HTP0 跑一步 depth core → 回 CPU 投影 2051 类 → 采样」，<b>一帧 15 次</b>。
+  <code>--depth-chain</code> 能把整条链搬进 stage、pipe 往返从 15 次降到 1 次，但实测打平
+  （depth 4.15 vs 4.08 s，逐位一致）；<code>m5_ring</code> 共享内存反而更慢。
+  用 3.2 节的模型解释就很直接：chain 省掉的是 pipe 往返，<b>并没有减少 HTP 侧的批边界</b>——
+  每一步仍然要等采样结果才能构造下一步输入，15 个 opbatch 一个都免不了。</p>
   <figure>
     <div class="figureBox">
-      <svg viewBox="0 0 680 306" role="img" aria-label="一帧内 CPU 与 HTP0 的十五次往返及 codec 并行">
+      <svg viewBox="0 0 680 320" role="img" aria-label="一帧内 CPU 与 HTP0 的十五次往返及 codec 并行">
         <g class="dg-lbl">
           <rect class="dg-npu-in" x="40" y="22" width="12" height="10" rx="2"/><text x="58" y="31">HTP0 / NPU 执行</text>
           <rect class="dg-cpu-in" x="170" y="22" width="12" height="10" rx="2"/><text x="188" y="31">CPU 执行</text>
@@ -1162,47 +1385,75 @@ Q8  →                        65 KB/行 → 4k 行 = 256 MB</pre>
         </g>
         <rect class="dg-npu-in" x="40" y="52" width="132" height="60" rx="8"/>
         <text class="dg-tb" x="106" y="74" text-anchor="middle">backbone decode</text>
-        <text class="dg-lbl" x="106" y="92" text-anchor="middle">1 token → hidden[512]</text>
+        <text class="dg-lbl" x="106" y="92" text-anchor="middle">token → hidden[512]</text>
         <rect class="dg-cpu-in" x="196" y="52" width="132" height="60" rx="8"/>
         <text class="dg-tb" x="262" y="74" text-anchor="middle">book0 投影采样</text>
-        <text class="dg-lbl" x="262" y="92" text-anchor="middle">2051×512 int8 · NEON</text>
+        <text class="dg-lbl" x="262" y="92" text-anchor="middle">2051×512 int8</text>
         <rect class="dg-mix" x="352" y="52" width="152" height="60" rx="8"/>
-        <text class="dg-tb" x="428" y="74" text-anchor="middle">15× 深度链往返</text>
-        <text class="dg-lbl" x="428" y="92" text-anchor="middle">transform 行 → core → 投影 → 采样</text>
+        <text class="dg-tb" x="428" y="70" text-anchor="middle">15× 深度链往返</text>
+        <text class="dg-lbl" x="428" y="88" text-anchor="middle">transform 行 → core</text>
+        <text class="dg-lbl" x="428" y="103" text-anchor="middle">→ 2051 类投影 → 采样</text>
         <rect class="dg-cpu-in" x="528" y="52" width="112" height="60" rx="8"/>
         <text class="dg-tb" x="584" y="74" text-anchor="middle">next_hidden</text>
         <text class="dg-lbl" x="584" y="92" text-anchor="middle">16 行查表累加</text>
-        <g class="dg-arr"><path d="M174 82 H194"/><path d="M330 82 H350"/><path d="M506 82 H526"/><path d="M428 114 V182"/></g>
-        <path class="dg-arr" d="M584 114 V146 H106 V114"/>
-        <text class="dg-lbl" x="345" y="141" text-anchor="middle">每帧重复，直到 16 个 code 全为 0（EOS）</text>
-        <rect class="dg-cpu" x="196" y="186" width="444" height="56" rx="8"/>
-        <text class="dg-tb" x="418" y="208" text-anchor="middle">codec worker（CPU · ORT 3 线程 · 独立线程）</text>
-        <text class="dg-lbl" x="418" y="226" text-anchor="middle">把 codes 解码成 24 kHz PCM，与下一帧 depth 重叠执行</text>
-        <text class="dg-ts" x="40" y="266">默认 --depth-pipe：每个 book 一次 pipe 往返（1~2 行 × 2 KB），一帧 15 次；--depth-chain 合并成 1 次但实测打平。</text>
-        <text class="dg-ts" x="40" y="286">权重位置：depth-weights.f32（202 MB）在 CPU 侧 mmap，int8 镜像 17 MB/帧流式读；两个 GGUF 共约 43 MB 常驻 HTP。</text>
+        <g class="dg-arr"><path d="M174 82 H194"/><path d="M330 82 H350"/><path d="M506 82 H526"/><path d="M478 112 V194"/></g>
+        <path class="dg-arr" d="M584 112 V146 H106 V114"/>
+        <text class="dg-lbl" x="330" y="170" text-anchor="middle">每帧重复，直到 16 个 code 全为 0</text>
+        <rect class="dg-cpu" x="196" y="196" width="444" height="56" rx="8"/>
+        <text class="dg-tb" x="418" y="218" text-anchor="middle">codec worker（CPU · ORT 3 线程 · 独立线程）</text>
+        <text class="dg-lbl" x="418" y="236" text-anchor="middle">把 codes 解码成 24 kHz PCM，与下一帧 depth 重叠执行</text>
+        <text class="dg-ts" x="40" y="278">默认 --depth-pipe：每个 book 一次 pipe 往返（1~2 行 × 2 KB），一帧 15 次，也就是 15 个 opbatch。</text>
+        <text class="dg-ts" x="40" y="298">--depth-chain 把 pipe 往返压成 1 次，但批边界仍是 15 个 —— 这就是它打平的原因。</text>
       </svg>
     </div>
-    <figcaption>图 3-3　一帧的数据流。虚线框是 CPU↔NPU 交替区，也是日志 §14 里草稿无法跨越的那段依赖。</figcaption>
+    <figcaption>图 3-6　一帧的数据流。虚线框是 CPU↔NPU 交替区，也是日志 §14 里草稿无法跨越的那段依赖，同时是 15 个批边界的来源。</figcaption>
   </figure>
-<h3>3.5 三个值 2.2 倍的后端旋钮</h3>
-  <p>ggml-hexagon 后端有三个环境旋钮，全部写进了部署脚本（见 <code>deploy.sh</code> 头部注释）：</p>
-  <div class="grid2">
-    <div class="tile"><b><code>GGML_HEXAGON_NHMX=0</code></b><p>HMX 是 Hexagon 的矩阵扩展，按理更适合 GEMM——但本部署的形状是 512 宽、每次 1–2 行的 GEMV，实测走 HMX 反而慢，关掉后走 HVX 向量路径。旋钮的价值随硅与形状变，抄配置之前先量。</p></div>
-    <div class="tile"><b><code>GGML_HEXAGON_OPPOLL=1</code></b><p>保持 DSP 时钟轮询。不设时 DSP 在两次提交之间掉频，实测差 <b>2.2×</b>——这是本项目捡到的最大一笔"免费"收益。后续测量还发现它只改墙钟、不改 CPU 总量（省的是等待，不是算力）。</p></div>
-    <div class="tile"><b><code>POWER_MODE=sustained_high_performance</code></b><p>告诉电源管理"这是持续负载"。与 OPPOLL 一起构成 DSP 侧的稳态环境；漏掉任何一个，NPU 结论都不可复现。</p></div>
-    <div class="tile"><b>为什么是环境变量</b><p>三个旋钮都属于"不改代码、只改部署"的层。它们的教训是通用的：<b>先把执行环境的税交齐，再谈 kernel 优化</b>——顺序反了会把环境噪声当成算子瓶颈。</p></div>
-  </div>
 
-  <h3>3.6 两个容易误解的点</h3>
+  <h3>3.7 旋钮：为什么 OPPOLL 的收益随形状变</h3>
+  <p>把 3.2 节的表按开关分组看（图 3-2），OPPOLL 的效果很反常：28 次提交的场景差 84%，
+  14 次差 63%，只有 1 次时只差 17%。<b>额外成本随批次数增长，却不随行数增长</b>——
+  这与"计算变慢"无关，是"两次批之间跨了一个睡眠/唤醒"。</p>
+  <p>机制在代码里只有一行：等结果时 <code>dspqueue_read</code> 的超时。默认给一个长超时，
+  宿主线程睡下去等 DSP 通知；<code>OPPOLL=1</code> 把超时设成 0，变成自旋。
+  在单请求 CLI 里这条差得惊人（同句 RTF 1.62 → 0.75）；在常驻 server 里它只值 18%
+  （同一请求墙钟 7.47 → 6.34 s），而且 <b>CPU 秒数几乎不变（30.2–31.5）</b>、四份 WAV 逐字节相同。
+  这正是它的性质：省的是调度延迟，不是算力。也解释了为什么它能被写进部署脚本而当成"免费收益"。</p>
+  <div class="tableWrap"><table>
+    <tr><th>配置</th><th class="num">28×1</th><th class="num">14×2</th><th class="num">1×28</th><th>结论</th></tr>
+    <tr><td>baseline（OPPOLL=1, NHMX=0）</td><td class="num">60.6</td><td class="num">42.6</td><td class="num">26.8</td><td>基准</td></tr>
+    <tr><td>OPPOLL=0</td><td class="num">111.3</td><td class="num">69.7</td><td class="num">31.4</td><td>必须保留；收益随批次数放大</td></tr>
+    <tr><td>NHMX=1</td><td class="num">61.4</td><td class="num">42.8</td><td class="num">26.8</td><td>无差（这块硅没有 HMX）</td></tr>
+    <tr><td>OPFUSION=0</td><td class="num">64.6</td><td class="num">44.7</td><td class="num">27.1</td><td>略慢 5%，默认开是对的</td></tr>
+    <tr><td>OPBATCH=16 / 64</td><td class="num">76.3 / 64.6</td><td class="num">52.6 / 44.7</td><td class="num">27.1 / 26.7</td><td>更慢：批变小等于批边界变多</td></tr>
+    <tr><td>OPQUEUE=1 / 2</td><td class="num">60.6 / 61.0</td><td class="num">42.7 / 42.9</td><td class="num">26.7 / 26.7</td><td>无差：默认 8 个槽够用</td></tr>
+  </table></div>
+  <p>另外两个旋钮不值得抄，值得记：<code>GGML_HEXAGON_POWER_MODE</code> 默认就是 <code>burst</code>
+  （关掉 DCVS），实测各种模式都在 ±1% 噪声内；<code>GGML_HEXAGON_HOSTBUF</code> 关系到映射窗口，
+  映射失败时的报错是 <code>possibly out of IOVA space, try --no-host</code>。
+  <b>抄配置要抄对那一条，别把整串都当咒语。</b></p>
+
+  <h3>3.8 三个容易被读错的现象</h3>
   <div class="grid2">
-    <div class="tile"><b>两个 HTP 会话 ≠ 两个 NPU</b><p>都是 HTP0，只是两个独立的 llama 上下文（各自 KV、各自量化）。它们分时复用同一物理 DSP。</p></div>
+    <div class="tile"><b>两个 HTP 会话 ≠ 两个 NPU</b><p>都是 HTP0，只是两个独立的 llama 上下文（各自 KV、各自量化、各自一份 VTCM 预留）。它们分时复用同一物理 DSP，所以"两路并发"不是翻倍，而是排队。</p></div>
     <div class="tile"><b>App 形态拿不到 HTP</b><p>OS 对 app uid 封了 <code>/dev/adsprpc-smd</code>（EACCES），JNI 版只能全 CPU 跑（RTF ~0.79–0.90）。只有 shell 域启动的 m5-server 才能用 NPU——所以全书的 NPU 结论都只适用于 server 形态。</p></div>
+    <div class="tile"><b>耗时正常但结果全零</b><p>3.3 节那个 HMX bug 的形态：能力位报错 → 内核选了不存在的路径 → 输出全零，而耗时看着完全合理。所以 NPU 的验收必须有数值门禁，"能跑完"不等于"跑对了"。</p></div>
   </div>
   <div class="callout warn"><span class="tagline">由此决定的一个工程结构</span>
     backbone 与 depth 被拆成两个常驻子进程，不是为了"并行"，而是两个边界条件逼出来的：
-    HTP 上下文初始化以秒计（一次进程启动就吃掉整段预算），且一旦 DSP 侧崩溃，
-    进程级隔离才不会把整个 server 带走。<b>先量清楚启动成本与崩溃域，再决定进程拓扑</b>——
-    这是端侧推理里最容易被忽略的一层设计。
+    会话建立（打开 skel、预留 VTCM、建队导出）是每进程一次的成本，不能进任何一帧的预算——
+    冷启动首包 0.398 s 里就含这一段；并且一旦 DSP 侧崩溃，进程级隔离才不会把整个 server 带走。
+    <b>先量清楚启动成本与崩溃域，再决定进程拓扑</b>——这是端侧推理里最容易被忽略的一层设计。
+  </div>
+  <div class="callout key"><span class="tagline">本章要点</span>
+    这一章只讲了三件事，但它们决定了后面所有的账。<br>
+    <b>第一，提交的粒度是批不是调用。</b>会话建立每进程一次，批边界每批一次，成本 F ≈ 1.25 ms 与批内算子数无关；
+    每行 R ≈ 0.91 ms 且不是权重带宽。所以"减少往返次数"和"减少批边界"是两笔完全不同的账——
+    <code>--depth-chain</code> 打平正是因为它只动了前者。<br>
+    <b>第二，硅的形状先于代码。</b>2 个 HVX 单元定了并行度上限，2 MB VTCM 定了"权重只能流式"，
+    没有 HMX 定了"别用 GEMM 峰值做推理"。这三条一起把量化收益压成了个位数百分比，
+    也把 codec 留在了 CPU。<br>
+    <b>第三，能力位要自己查。</b>后端替你做的那份猜测可能给出全零结果和一个正常的耗时。
+    数值门禁不是质量流程的装饰，它是 NPU 上唯一能发现这类错误的探针。
   </div>
   <div class="chapterDone"><button class="doneBtn" data-ch="ch3">标记本章已学完</button></div>
 </section>
@@ -1281,7 +1532,7 @@ Q8  →                        65 KB/行 → 4k 行 = 256 MB</pre>
   </div>
 
   <h3>4.2 三层可观测性</h3>
-  <p><a href="#ch3-graphs">第 3.3 节</a>里，ORT 卷积节点与 HTP 迁移探针的时间来自不同边界。这里把节点、完整子图和用户请求分开计时，再判断单项收益能否兑现。</p>
+  <p><a href="#ch3-graphs">第 3.5 节</a>里，ORT 卷积节点与 HTP 迁移探针的时间来自不同边界。这里把节点、完整子图和用户请求分开计时，再判断单项收益能否兑现。</p>
   <div class="tableWrap"><table>
     <tr><th>层</th><th>工具 / 接口</th><th>回答什么问题</th><th>本项目实例</th></tr>
     <tr><td>端到端</td><td><code>X-M5-RTF / Elapsed-S / First-Pcm-S / Frames</code>、<code>GET /metrics</code></td><td>用户实际感受到多快？分布如何？</td><td>wav 响应带头；pcm 流式头提前定稿，只能靠 <code>/metrics</code> 与客户端实测</td></tr>
@@ -2970,6 +3221,13 @@ for i in 1 2; do M5_HEADS_INT8=1 …; M5_HEADS_INT8=0 …; done
     <tr><td>zero-shot voice clone</td><td>不更新权重，靠参考音频的 speaker embedding 或 text–speech pair 上下文迁移音色</td></tr>
     <tr><td>MTP</td><td>Multi-Token Prediction：Qwen3-TTS 由专用预测器逐步生成每帧剩余码本</td></tr>
     <tr><td>dual-track</td><td>Qwen3-TTS 文本轨与声学轨并行自回归，收到文本即刻出声学帧</td></tr>
+    <tr><td>HTP / CDSP</td><td>Hexagon 张量处理器 / 计算 DSP；本机 HTP0 有 2 个 HVX 128B 单元、2 MB VTCM、无 HMX</td></tr>
+    <tr><td>FastRPC</td><td>宿主进程调用 DSP 服务的机制；建立会话走它（一次），每帧提交不走它</td></tr>
+    <tr><td>opbatch</td><td>一次提交的单位：一串 buf/tensor/op 描述符放进 8 个共享槽之一，门铃只发 32 B 头</td></tr>
+    <tr><td>F / R（批边界 / 每行）</td><td>提交成本模型：F ≈ 1.25 ms 与批内算子数无关，R ≈ 0.91 ms/行；一帧 depth = 15F + 30R</td></tr>
+    <tr><td>VTCM</td><td>DSP 的向量紧耦合内存，本机 2 MB；权重放不下，只能按 tile 流式读</td></tr>
+    <tr><td>tile / repack</td><td>权重的 32×32 分块布局；总字节数不变，只把"同列多行"摆成连续，供一次向量载入</td></tr>
+    <tr><td>OPPOLL</td><td><code>GGML_HEXAGON_OPPOLL=1</code>：等结果时超时设 0 改自旋，省调度延迟不省算力</td></tr>
   </table></div>
 
   <h3>14.4 延伸阅读</h3>
