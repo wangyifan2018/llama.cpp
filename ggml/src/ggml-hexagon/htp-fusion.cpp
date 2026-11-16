@@ -233,8 +233,11 @@ static bool fuse_mul_mat_add(const ggml_hexagon_session * sess, htp_opnode & pre
         return false;
     }
 
+    // The HVX matmul kernels apply the bias over a row grid, so a batched
+    // activation is not a reason to refuse the fused op. Keep the guard for
+    // HMX, where the fused solver has not been measured with several rows.
     const int src1_nrows = src1->ne[1] * src1->ne[2] * src1->ne[3];
-    if (kparams.n_hmx == 0 && src1_nrows != 1) return false;
+    if (kparams.n_hmx == 0 && src1_nrows != 1 && src2->ne[1] * src2->ne[2] * src2->ne[3] != 1) return false;
 
     if (kparams.n_hmx > 0 && orig_kparams->n_hmx > 0) {
         if (kparams.m_chunk < orig_kparams->m_chunk ||

@@ -20,6 +20,122 @@ The [historical probe files](BENCHMARK.md#historical-artifacts) record the initi
 
 For a fresh ablation, use one baseline build and vary one mechanism at a time. Restore the original `MEAN → SQRT` subgraph to test BiasNorm, or restore the composite `ggml_conv_2d_dw` call to test the convolution. For state residency, keep the graph cached and compare device-local copies with explicit cache read and upload. Measure graph rebuild and allocation in a separate run. To measure the constant-folding change, move only the relative-position projection and edge-scale expressions back into the per-chunk graph. Compare log placements before interpreting latency. The historical timing table spans several changes and cannot attribute the latency delta to any single graph rewrite.
 
+## HTP experiments
+
+Each entry follows the same shape: bottleneck and evidence, change, how to
+reproduce, A/B result, and what it does not cover.
+
+### H1. Bounded wait instead of spin for DSP completion (rejected, no code kept)
+
+**Bottleneck.** With `GGML_HEXAGON_OPPOLL=1` the host spins in
+`dspqueue_read` with a zero timeout. The tail is good (191 ms on the 2.65 s
+clip) but the host burns 760 ms of CPU for a 3.85 s session. With
+`GGML_HEXAGON_OPPOLL=0` the host blocks and uses 357 ms, but the tail is 273 ms.
+A bounded timeout should give the polling latency at close to the blocking CPU
+cost, so the hypothesis was that a few tens of microseconds of wait per attempt
+would recover both.
+
+**Change tried.** `GGML_HEXAGON_OPPOLL_US`: pass that value as the
+`dspqueue_read` timeout instead of 0. Four lines in
+`ggml/src/ggml-hexagon/ggml-hexagon.cpp` (the `flush_pending` read and the
+environment parsing).
+
+**Result.** Rejected. Any finite timeout behaves like the blocking path, even
+20 us:
+
+| Completion wait | zh 2.65 s flush | zh 2.65 s CPU | zh 10 s flush | zh 10 s CPU |
+|---|---:|---:|---:|---:|
+| block (OPPOLL 0) | 272.5 | 357 | 415.1 | 1204 |
+| spin (OPPOLL 1, timeout 0) | 191.0 | 760 | 296.6 | 2541 |
+| timeout 20 us | 271.9 | 384 | 419.8 | 1307 |
+| timeout 50 us | 273.2 | 393 | 415.4 | 1353 |
+| timeout 100 us | 269.9 | 387 | 414.1 | 1357 |
+| timeout 250 us | 276.8 | 403 | 414.8 | 1313 |
+| timeout 500 us | 271.8 | 386 | 411.7 | 1301 |
+
+At 20 us the host already pays the blocking CPU cost and the blocking latency,
+so there is no trade-off curve to pick from. The completion path costs about
+7 ms per DSP batch when the host sleeps, which is larger than the whole
+per-batch submit cost (0.2 ms). Reproduce with
+`bin/llama-x-asr x-asr-zh-en-q8_0.gguf HTP0:0 zh.wav zh-10.wav --realtime`
+and `GGML_HEXAGON_OPPOLL=1 GGML_HEXAGON_OPPOLL_US=<0|20|50|100|250|500>`;
+the knob no longer exists because the result was negative.
+
+**Consequence.** Polling is the only low-latency completion mode on this
+device. Host CPU must be paid for, or hidden behind other useful work. That
+moves the next HTP work to (a) fewer DSP ops per chunk and (b) overlapping a
+second stream's host work with the first stream's DSP batch (Phase 3).
+
+Raw log: `/tmp/poll-sweep-1.txt` on the development host; values above are
+medians of two paced repetitions per cell.
+
+### H2. Fuse the bias add into the HVX matmul (kept)
+
+**Bottleneck.** The DSP profile of one chunk
+(`GGML_HEXAGON_PROFILE=1`, 14 chunks over two replays) counts 9,730 ADD ops
+for 14 chunks, 695 per chunk, and 120.6 ms of DSP time in 14 chunks, 8.6 ms per
+chunk. Most of them are single-row biases added to a matmul result, for
+example `640:24 x 640:1 -> 640:24`. On the DSP a 3,072-float add costs about
+12 us, almost all of it dispatch: the same op moves 24 kB, which at the
+measured 50 GB/s would take 0.5 us. The graph has 2,820 DSP ops per chunk at
+about 86.6 ms, so op overhead is a large share of the chunk.
+
+**Why HTP.** The backend already has a fused `MUL_MAT_ADD` op with a bias
+parameter and the HVX kernel applies the bias over a row grid
+(`hvx_tensor_add_f32_grid` in `htp/matmul-ops.c`). The fusion was refused on
+HVX-only devices by one condition in
+`ggml/src/ggml-hexagon/htp-fusion.cpp`:
+`if (kparams.n_hmx == 0 && src1_nrows != 1) return false;`
+so every matmul on a 24-frame activation lost its bias add. SM6650 has no HMX,
+so this excluded the whole encoder from the fusion on exactly the device under
+test.
+
+**Change.** Allow the fusion on HVX when the added tensor is a broadcast bias,
+that is when `src2` has a single row. The residual adds, which add a full
+`C x T` tensor, keep the old path. Op shape, layout and dtype do not change:
+`MUL_MAT q8_0 x f32 -> f32` plus `ADD f32 x f32 -> f32` becomes
+`MUL_MAT+ADD q8_0 x f32 x f32 -> f32` at the same output shape, with the bias
+read through `src2->nb[1]` inside the kernel.
+
+**Reproduce.**
+
+```sh
+# Baseline commit: the parent of the H2 commit. Both arms use the same command.
+adb shell -T "cd /data/local/tmp/llama.cpp && \
+  export LD_LIBRARY_PATH=\$PWD/lib ADSP_LIBRARY_PATH=\$PWD/lib \
+  GGML_HEXAGON_DEVICES=HTP0:0 GGML_HEXAGON_OPBATCH=2048 GGML_HEXAGON_OPPOLL=1 \
+  GGML_HEXAGON_POWER_MODE=burst && \
+  bin/llama-x-asr x-asr-zh-en-q8_0.gguf HTP0:0 zh.wav zh-10.wav --realtime"
+
+# DSP op census and per-batch time.
+adb shell -T "cd /data/local/tmp/llama.cpp && ... GGML_HEXAGON_PROFILE=1 \
+  bin/llama-x-asr x-asr-zh-en-q8_0.gguf HTP0:0 zh.wav zh.wav" 2> profile.log
+python3 /tmp/agg_profile.py profile.log   # pipe-separated profile-op lines
+```
+
+**Result.** Fused bias adds: 289 fewer DSP ops per chunk. The second command
+batch shrinks from 772 to 483 ops.
+
+| Arm | DSP ops/chunk | batch 1 | batch 2 | DSP ms/chunk | zh tail (2 reps) | zh 10 s tail (2 reps) | text |
+|---|---|---:|---:|---:|---:|---:|---|
+| baseline | 2,820 (2048+772) | 67.6 ms | 21.0 ms | 88.6 | 190.9, 191.1 | 295.9, 297.2 | reference |
+| fused | 2,531 (2048+483) | 71.7 ms | 13.8 ms | 85.7 | 188.4, 188.7 | 293.8, 294.5 | identical |
+
+DSP time per chunk falls 3.3% (88.6 to 85.7 ms) and the end-to-end tail falls
+1.3% (about 2.5 ms on a two-chunk tail). The first batch becomes slower because
+the fused ops now sit in it while the cheap ADDs are gone from the second; the
+batch split is by op count, not by work, so the boundary moved. The measured
+tail saving is about half what the profile predicts for two chunks because the
+profile adds instrumentation and because the last chunk's completion overlaps
+host work. Text is unchanged on both fixtures and on every paced run.
+
+**What it does not cover.** Only the broadcast-bias case is enabled. HMX
+devices keep the old guard; the fused solver has not been measured there.
+Two-thirds of the remaining DSP time is still in small ops: 585 CONT, 115 CPY,
+240 SCALE and 99 SOFTPLUS per chunk, 7.8 + 5.7 + 3.0 + 3.0 ms. Those are the
+next HTP target, together with the two f32 ConvNeXt projections, which run at
+6 to 10 GMAC/s against 40 GMAC/s for the q8_0 matmuls.
+
 ## Next experiments
 
 1. **Measure where the remaining tail goes.** In [`run_chunks`](xasr.cpp#L746) time feature and mask uploads, scheduled compute and completion, and encoder projection readback. In [`stream_accept`](xasr.cpp#L1018) time fbank, predictor/joiner, and text finalization. Tag each chunk with its phase (audio arrival or commit), sequence position, and number of DSP submissions. Collect a separate per-op profile using the [benchmark command](BENCHMARK.md#optional-htp-operator-profile). This distinguishes DSP kernel time from host submission and waiting. Compare CPU, HTP waiting, and HTP polling under both idle and representative CPU load.

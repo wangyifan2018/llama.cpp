@@ -52,4 +52,4 @@ For C++ integration, load the GGML backends, open a context, create a stream, an
 
 The example covers the inference path. A server can put a request queue and IPC around this API. True in-flight batching will require independent persistent stream state and a batched encoder graph.
 
-See [BENCHMARK.md](BENCHMARK.md) for the reproducible device benchmark, fixture hashes, and results. [OPTIMIZATION.md](OPTIMIZATION.md) explains the graph changes, how to isolate each one, and the next experiments.
+See [BENCHMARK.md](BENCHMARK.md) for the reproducible device benchmark, fixture hashes, and results. [OPTIMIZATION.md](OPTIMIZATION.md) explains the graph changes, how to isolate each one, and the next experiments. [BUILD.md](BUILD.md) has the host, Android and incremental build steps. [ALIGNMENT.md](ALIGNMENT.md) compares the streaming configuration with sherpa-onnx, and [ONNX-ANALYSIS.md](ONNX-ANALYSIS.md) compares the ONNX graph with this implementation. `tools/` holds the sherpa-onnx control harness, the four-configuration driver and the tail fixture generator.

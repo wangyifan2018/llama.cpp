@@ -144,6 +144,26 @@ The remaining tail is commit bookkeeping: feature and mask upload are 0.3 ms per
 chunk, the encoder projection read-back is 0.06 ms, detokenisation is 0.05 ms.
 They are not worth optimising at this granularity.
 
+### HTP op fusion A/B
+
+One factor changed between the two arms: the HVX matmul-plus-bias fusion. Same
+build flags, same device, same fixtures, same backend parameters.
+
+| Arm | DSP ops per chunk | batch 1 | batch 2 | DSP ms/chunk | zh tail | zh 10 s tail | text |
+|---|---|---:|---:|---:|---:|---:|---|
+| before | 2,820 (2048+772) | 67.6 ms | 21.0 ms | 88.6 | 190.9, 191.1 | 295.9, 297.2 | reference |
+| after | 2,531 (2048+483) | 71.7 ms | 13.8 ms | 85.7 | 188.4, 188.7 | 293.8, 294.5 | identical |
+
+Each tail cell is one paced run; the two values are two repetitions. DSP batch
+times are the median of 14 batches from `GGML_HEXAGON_PROFILE=1` replays of two
+clips, and the profile run itself is not used for the latency columns. See
+[OPTIMIZATION.md](OPTIMIZATION.md#h2-fuse-the-bias-add-into-the-hvx-matmul-kept)
+for the change and its limits.
+
+A separate experiment replaced the completion wait with a bounded timeout to cut
+host CPU. It was rejected: every finite timeout behaved like blocking. The data
+is in [OPTIMIZATION.md](OPTIMIZATION.md#h1-bounded-wait-instead-of-spin-for-dsp-completion-rejected-no-code-kept).
+
 ### Backend placement and DSP batches
 
 All four GGUF runs report `encoder HTP0:0 2877/2877 ops, 1 scheduler splits,
@@ -151,7 +171,7 @@ All four GGUF runs report `encoder HTP0:0 2877/2877 ops, 1 scheduler splits,
 batches per chunk (2,048 + 772 ops) at OPBATCH 2048. The completion wait is the
 largest single host cost: 43 ms per batch while polling and 50 ms per batch while
 blocked, against roughly 44 ms of DSP work per batch. That gap is the subject of
-the [poll wait experiment](OPTIMIZATION.md#h1-poll-wait-strategy).
+the [poll wait experiment](OPTIMIZATION.md#h1-bounded-wait-instead-of-spin-for-dsp-completion-rejected-no-code-kept).
 
 ### Quality and known differences
 
