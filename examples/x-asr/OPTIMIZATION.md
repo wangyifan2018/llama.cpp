@@ -341,6 +341,50 @@ Accuracy is checked on the four fixtures only; these weights are part of the
 encoder front end, so a CER/WER sweep on real VAD cuts is still required before
 this is called safe for deployment.
 
+## Multi-stream
+
+### M1. One encoder slot per stream, shared weights (kept)
+
+**Bottleneck.** The context held one graph, one scheduler and one state set, so
+it accepted one stream at a time. The weights are 168 MB and identical for every
+stream, so running four contexts was not an option.
+
+**Change.** `xasr_slot` now owns the encoder graph, its scheduler, its metadata
+buffer and its 4,148,736 bytes of state. `xasr_context` holds a vector of slots
+plus the shared model and the shared joiner graph. `xasr_stream_init` takes the
+first free slot and `xasr_stream_free` releases it, so a stream that finished
+can be replaced without rebuilding anything. `--streams N` sizes the pool and
+`--streams N --concurrent` drives N aligned streams from the CLI.
+
+**Reproduce.**
+
+```sh
+adb shell -T "cd /data/local/tmp/llama.cpp && \
+  export LD_LIBRARY_PATH=\$PWD/lib ADSP_LIBRARY_PATH=\$PWD/lib \
+  GGML_HEXAGON_DEVICES=HTP0:0 GGML_HEXAGON_OPBATCH=2048 GGML_HEXAGON_OPPOLL=1 && \
+  for n in 1 2 4; do bin/llama-x-asr x-asr-zh-en-q8_0.gguf HTP0:0 zh.wav \
+    --streams \$n --concurrent --realtime; done"
+```
+
+**Result.** HTP polling, 2.65 s clip, one paced run per row.
+
+| Streams | endpoint to final, in commit order (ms) | init | peak RSS |
+|---:|---|---:|---:|
+| 1 | 169.6 | 819 ms | 61.0 MB |
+| 2 | 169.4, 340.5 | 831 ms | 78.0 MB |
+| 4 | 170.0, 341.0, 512.2, 683.0 | 881 ms | 112.2 MB |
+
+Text is identical on every stream, and a second and third wave in the same
+process, including a Chinese to English switch, reproduce the same numbers, so
+the slots are cleared on reuse. About 17 MB and 20 ms of init per extra slot.
+
+**What it does not cover.** The worker is single threaded and the streams are
+serialized, so the four-way simultaneous endpoint costs one commit per stream,
+683 ms for the last one. Interleaving chunks between streams does not change the
+total work. The next step is encoder batching across streams, which needs a
+stream dimension through the attention and its per-stream left context; the
+feed-forward and convolution blocks can be widened without that.
+
 ## Next experiments
 
 1. **Measure where the remaining tail goes.** In [`run_chunks`](xasr.cpp#L746) time feature and mask uploads, scheduled compute and completion, and encoder projection readback. In [`stream_accept`](xasr.cpp#L1018) time fbank, predictor/joiner, and text finalization. Tag each chunk with its phase (audio arrival or commit), sequence position, and number of DSP submissions. Collect a separate per-op profile using the [benchmark command](BENCHMARK.md#optional-htp-operator-profile). This distinguishes DSP kernel time from host submission and waiting. Compare CPU, HTP waiting, and HTP polling under both idle and representative CPU load.

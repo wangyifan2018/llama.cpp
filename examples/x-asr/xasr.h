@@ -9,6 +9,7 @@ struct xasr_stream;
 struct xasr_context_params {
     const char * device = "CPU";
     int n_threads = 2;
+    int n_streams = 1;      // independent encoder state slots in one context
     int tail_pad_ms = 1200; // negative selects the minimal phase-aware tail padding
     int verbosity = 1;
     bool joiner_on_device = true; // run the joiner projection on the selected backend

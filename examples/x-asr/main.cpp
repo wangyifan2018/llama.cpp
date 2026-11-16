@@ -32,12 +32,13 @@ static double process_cpu_ms() {
 
 int main(int argc, char ** argv) {
     if (argc < 4) {
-        fprintf(stderr, "usage: %s MODEL.gguf DEVICE WAV... [--realtime] [--pad-ms N] [--threads N] [--joiner-host]\n", argv[0]);
+        fprintf(stderr, "usage: %s MODEL.gguf DEVICE WAV... [--realtime] [--pad-ms N] [--threads N] [--streams N] [--joiner-host]\n", argv[0]);
         return 1;
     }
     xasr_context_params params;
     params.device = argv[2];
     bool realtime = false;
+    bool concurrent = false;
     std::vector<const char *> waves;
     for (int i = 3; i < argc; ++i) {
         if (std::strcmp(argv[i], "--realtime") == 0) {
@@ -46,6 +47,10 @@ int main(int argc, char ** argv) {
             params.tail_pad_ms = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
             params.n_threads = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--streams") == 0 && i + 1 < argc) {
+            params.n_streams = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--concurrent") == 0) {
+            concurrent = true;
         } else if (std::strcmp(argv[i], "--joiner-device") == 0) {
             params.joiner_on_device = true;
         } else if (std::strcmp(argv[i], "--joiner-host") == 0) {
@@ -64,6 +69,70 @@ int main(int argc, char ** argv) {
         return 2;
     }
     fprintf(stderr, "xasr: init %.1f ms\n", std::chrono::duration<double, std::milli>(xasr_clock::now() - init_begin).count());
+    if (concurrent) {
+        // Feed every stream the same packets, then commit them all at the same
+        // endpoint. Streams are served in order, so stream i pays the commits of
+        // the streams before it; that is the head-of-line cost of one worker.
+        const int n = params.n_streams;
+        for (const char * wave : waves) {
+            ma_decoder wav;
+            auto config = ma_decoder_config_init(ma_format_f32, 1, 16000);
+            if (ma_decoder_init_file(wave, &config, &wav) != MA_SUCCESS) {
+                fprintf(stderr, "xasr: cannot decode %s\n", wave);
+                return 3;
+            }
+            const std::unique_ptr<ma_decoder, decltype(&ma_decoder_uninit)> audio(&wav, ma_decoder_uninit);
+            std::vector<std::unique_ptr<xasr_stream, decltype(&xasr_stream_free)>> streams;
+            for (int i = 0; i < n; ++i) {
+                streams.emplace_back(xasr_stream_init(model.get()), xasr_stream_free);
+                if (!streams.back()) {
+                    fprintf(stderr, "xasr: cannot open stream %d of %d\n", i, n);
+                    return 4;
+                }
+            }
+            const auto start = xasr_clock::now();
+            ma_uint64 frames = 0;
+            for (;;) {
+                float samples[320];
+                ma_uint64 n_read = 0;
+                const ma_result result = ma_decoder_read_pcm_frames(audio.get(), samples, 320, &n_read);
+                if (result != MA_SUCCESS && result != MA_AT_END) {
+                    fprintf(stderr, "xasr: cannot read %s\n", wave);
+                    return 5;
+                }
+                if (n_read > 0) {
+                    frames += n_read;
+                    if (realtime) {
+                        std::this_thread::sleep_until(start + std::chrono::microseconds(frames * 1000000 / 16000));
+                    }
+                    for (auto & stream : streams) {
+                        if (!xasr_append(stream.get(), samples, static_cast<int>(n_read))) {
+                            return 6;
+                        }
+                    }
+                }
+                if (result == MA_AT_END || n_read == 0) {
+                    break;
+                }
+            }
+            const auto endpoint = xasr_clock::now();
+            for (int i = 0; i < n; ++i) {
+                std::string text;
+                if (!xasr_commit(streams[(size_t) i].get(), text)) {
+                    return 7;
+                }
+                const auto done = xasr_clock::now();
+                printf("%s\tstream=%d\tendpoint_to_final_ms=%.3f\tcommit_ms=%.3f\t%s\n", wave, i,
+                       std::chrono::duration<double, std::milli>(done - endpoint).count(),
+                       std::chrono::duration<double, std::milli>(done - endpoint).count(), text.c_str());
+            }
+            rusage usage{};
+            getrusage(RUSAGE_SELF, &usage);
+            printf("%s\tstreams=%d\taudio_ms=%.3f\tsession_ms=%.3f\trss_kib=%ld\n", wave, n, frames / 16.0,
+                   std::chrono::duration<double, std::milli>(xasr_clock::now() - start).count(), (long) usage.ru_maxrss);
+        }
+        return 0;
+    }
     for (const char * wave : waves) {
         ma_decoder wav;
         auto config = ma_decoder_config_init(ma_format_f32, 1, 16000);

@@ -103,21 +103,28 @@ struct geom {
 
 } // namespace
 
-struct xasr_context {
-    xasr_context_params params;
-    xasr_model model;
-    geom g;
-    ggml_backend_t backend = nullptr, backend_cpu = nullptr;
-    ggml_backend_sched_t sched = nullptr;
-    std::vector<uint8_t> compute_meta;
+// One stream slot: its own encoder graph, scheduler and state. The model
+// weights are shared by every slot through xasr_context::model.
+struct xasr_slot {
     ggml_cgraph * graph = nullptr;
+    ggml_backend_sched_t sched = nullptr;
+    std::vector<uint8_t> meta;
     std::vector<ggml_tensor *> caches;
     std::vector<ggml_tensor *> masks;
     std::vector<std::pair<ggml_tensor *, std::vector<float>>> constants;
     ggml_tensor * feats = nullptr;
     ggml_tensor * output = nullptr;
+    bool busy = false;
+};
+
+struct xasr_context {
+    xasr_context_params params;
+    xasr_model model;
+    geom g;
+    ggml_backend_t backend = nullptr, backend_cpu = nullptr;
+    std::vector<std::unique_ptr<xasr_slot>> slots;
+    xasr_slot * building = nullptr; // slot being built, used by fixed_input
     xasr_joiner joiner;
-    bool stream_active = false;
     void (*dsp_stats)(ggml_backend_t, double *, double *, uint64_t *) = nullptr;
 };
 
@@ -523,7 +530,7 @@ void out_tensor(ggml_cgraph * gf, ggml_tensor * t, const std::string & name) {
 ggml_tensor * fixed_input(xasr_context * c, ggml_tensor * tensor, std::vector<float> values) {
     ggml_set_input(tensor);
     ggml_set_output(tensor);
-    c->constants.emplace_back(tensor, std::move(values));
+    c->building->constants.emplace_back(tensor, std::move(values));
     return tensor;
 }
 
@@ -662,13 +669,14 @@ ggml_tensor * simple_downsample(ggml_context * g, ggml_tensor * x, const std::ve
     return acc;
 }
 
-ggml_cgraph * build_chunk_graph(xasr_context * c, std::vector<uint8_t> & meta) {
+ggml_cgraph * build_chunk_graph(xasr_context * c, xasr_slot & slot) {
     auto & m = c->model;
     const auto & hp = m.hp;
     const geom & G = c->g;
-    ggml_init_params ip = {meta.size(), meta.data(), true};
+    ggml_init_params ip = {slot.meta.size(), slot.meta.data(), true};
     ggml_context * g = ggml_init(ip);
     ggml_cgraph * gf = ggml_new_graph_custom(g, graph_nodes, false);
+    c->building = &slot;
 
     ggml_tensor * feats = ggml_new_tensor_4d(g, GGML_TYPE_F32, hp.feature_dim, G.T, 1, 1);
     in_tensor(feats, "feats");
@@ -746,7 +754,7 @@ ggml_cgraph * build_chunk_graph(xasr_context * c, std::vector<uint8_t> & meta) {
         auto * input = ggml_graph_get_tensor(gf, name.c_str());
         auto * output = ggml_graph_get_tensor(gf, ("o_" + name).c_str());
         ggml_set_output(input);
-        c->caches.push_back(input);
+        c->building->caches.push_back(input);
         // All reads of the old cache are in the graph before this write.
         ggml_build_forward_expand(gf, ggml_cpy(g, output, input));
     };
@@ -756,43 +764,44 @@ ggml_cgraph * build_chunk_graph(xasr_context * c, std::vector<uint8_t> & meta) {
             add_cache(lname(name, l));
         }
     }
+    c->building = nullptr;
     ggml_free(g);
     return gf;
 }
 
-bool prepare_graph(xasr_context * c) {
-    c->graph = build_chunk_graph(c, c->compute_meta);
+bool prepare_slot(xasr_context * c, xasr_slot & slot) {
+    slot.graph = build_chunk_graph(c, slot);
     ggml_backend_t backends[] = {c->backend, c->backend_cpu};
-    c->sched = ggml_backend_sched_new(backends, nullptr, c->backend == c->backend_cpu ? 1 : 2, graph_nodes, false, false);
-    if (!c->sched) {
+    slot.sched = ggml_backend_sched_new(backends, nullptr, c->backend == c->backend_cpu ? 1 : 2, graph_nodes, false, false);
+    if (!slot.sched) {
         return false;
     }
-    for (auto * cache : c->caches) {
-        ggml_backend_sched_set_tensor_backend(c->sched, cache, c->backend);
+    for (auto * cache : slot.caches) {
+        ggml_backend_sched_set_tensor_backend(slot.sched, cache, c->backend);
     }
-    for (const auto & constant : c->constants) {
-        ggml_backend_sched_set_tensor_backend(c->sched, constant.first, c->backend);
+    for (const auto & constant : slot.constants) {
+        ggml_backend_sched_set_tensor_backend(slot.sched, constant.first, c->backend);
     }
-    if (!ggml_backend_sched_alloc_graph(c->sched, c->graph)) {
+    if (!ggml_backend_sched_alloc_graph(slot.sched, slot.graph)) {
         return false;
     }
-    c->feats = ggml_graph_get_tensor(c->graph, "feats");
-    c->output = ggml_graph_get_tensor(c->graph, "enc_out");
+    slot.feats = ggml_graph_get_tensor(slot.graph, "feats");
+    slot.output = ggml_graph_get_tensor(slot.graph, "enc_out");
     size_t cache_bytes = 0;
-    for (auto * tensor : c->caches) {
+    for (auto * tensor : slot.caches) {
         cache_bytes += ggml_nbytes(tensor);
     }
-    for (const auto & [tensor, values] : c->constants) {
+    for (const auto & [tensor, values] : slot.constants) {
         ggml_backend_tensor_set(tensor, values.data(), 0, ggml_nbytes(tensor));
     }
-    c->constants.clear();
+    slot.constants.clear();
     for (size_t s = 0; s < c->model.stacks.size(); ++s) {
-        c->masks.push_back(ggml_graph_get_tensor(c->graph, ("mask_" + std::to_string(s)).c_str()));
+        slot.masks.push_back(ggml_graph_get_tensor(slot.graph, ("mask_" + std::to_string(s)).c_str()));
     }
     int total = 0;
     int on_target = 0;
-    for (int i = 0; i < ggml_graph_n_nodes(c->graph); ++i) {
-        auto * node = ggml_graph_node(c->graph, i);
+    for (int i = 0; i < ggml_graph_n_nodes(slot.graph); ++i) {
+        auto * node = ggml_graph_node(slot.graph, i);
         switch (node->op) {
             case GGML_OP_NONE:
             case GGML_OP_VIEW:
@@ -803,14 +812,14 @@ bool prepare_graph(xasr_context * c) {
             default:
                 ++total;
         }
-        if (ggml_backend_sched_get_tensor_backend(c->sched, node) == c->backend) {
+        if (ggml_backend_sched_get_tensor_backend(slot.sched, node) == c->backend) {
             ++on_target;
         } else {
             fprintf(stderr, "xasr: encoder fallback %s (%s)\n", ggml_op_name(node->op), node->name);
         }
     }
     fprintf(stderr, "xasr: encoder %s %d/%d ops, %d scheduler splits, %zu bytes of cache\n",
-            ggml_backend_name(c->backend), on_target, total, ggml_backend_sched_get_n_splits(c->sched), cache_bytes);
+            ggml_backend_name(c->backend), on_target, total, ggml_backend_sched_get_n_splits(slot.sched), cache_bytes);
     return on_target == total;
 }
 
@@ -889,17 +898,17 @@ bool joiner_compute(xasr_context * c, const float * act, const float * pred, int
     return true;
 }
 
-bool run_chunks(xasr_context * c, const float * feats, int n_rows, int & pos, std::vector<float> & enc_out,
-                xasr_stats * st, bool commit_phase) {
+bool run_chunks(xasr_context * c, xasr_slot & slot, const float * feats, int n_rows, int & pos,
+                std::vector<float> & enc_out, xasr_stats * st, bool commit_phase) {
     const auto & G = c->g;
     const int first = pos;
     for (; pos + G.T < n_rows; pos += G.decode_chunk_len) {
         const auto chunk_begin = xasr_clock::now();
         auto up = xasr_clock::now();
-        ggml_backend_tensor_set(c->feats, feats + size_t(pos) * c->model.hp.feature_dim, 0, ggml_nbytes(c->feats));
+        ggml_backend_tensor_set(slot.feats, feats + size_t(pos) * c->model.hp.feature_dim, 0, ggml_nbytes(slot.feats));
         st->feat_up_ms += span_ms(up);
-        for (size_t s = 0; s < c->masks.size(); ++s) {
-            auto * tensor = c->masks[s];
+        for (size_t s = 0; s < slot.masks.size(); ++s) {
+            auto * tensor = slot.masks[s];
             const int ds = c->model.hp.downsample[s];
             const int unseen = G.left - pos / 2;
             up = xasr_clock::now();
@@ -918,15 +927,15 @@ bool run_chunks(xasr_context * c, const float * feats, int n_rows, int & pos, st
             c->dsp_stats(c->backend, &dsp_submit, &dsp_wait, &dsp_batches);
         }
         up = xasr_clock::now();
-        const ggml_status status = ggml_backend_sched_graph_compute(c->sched, c->graph);
+        const ggml_status status = ggml_backend_sched_graph_compute(slot.sched, slot.graph);
         st->compute_ms += span_ms(up);
         if (status != GGML_STATUS_SUCCESS) {
             return false;
         }
         const size_t start = enc_out.size();
-        enc_out.resize(start + ggml_nelements(c->output));
+        enc_out.resize(start + ggml_nelements(slot.output));
         up = xasr_clock::now();
-        ggml_backend_tensor_get(c->output, enc_out.data() + start, 0, ggml_nbytes(c->output));
+        ggml_backend_tensor_get(slot.output, enc_out.data() + start, 0, ggml_nbytes(slot.output));
         st->readback_ms += span_ms(up);
         if (c->dsp_stats) {
             double submit_after = 0, wait_after = 0;
@@ -1171,10 +1180,15 @@ xasr_context * xasr_init_from_file(const char * path, xasr_context_params params
             return nullptr;
         }
         c->g.tail_pad_ms = params.tail_pad_ms;
-        c->compute_meta.resize(ggml_tensor_overhead() * graph_nodes + ggml_graph_overhead_custom(graph_nodes, false));
-        if (!prepare_graph(c.get())) {
-            fprintf(stderr, "xasr: selected backend must support the entire encoder graph\n");
-            return nullptr;
+        const int n_streams = params.n_streams > 0 ? params.n_streams : 1;
+        for (int s = 0; s < n_streams; ++s) {
+            auto slot = std::make_unique<xasr_slot>();
+            slot->meta.resize(ggml_tensor_overhead() * graph_nodes + ggml_graph_overhead_custom(graph_nodes, false));
+            if (!prepare_slot(c.get(), *slot)) {
+                fprintf(stderr, "xasr: selected backend must support the entire encoder graph\n");
+                return nullptr;
+            }
+            c->slots.push_back(std::move(slot));
         }
         if (params.joiner_on_device && !prepare_joiner(c.get())) {
             fprintf(stderr, "xasr: joiner graph unavailable, using the host decoder\n");
@@ -1196,9 +1210,12 @@ void xasr_free(xasr_context * c) {
     if (c->joiner.ctx) {
         ggml_free(c->joiner.ctx);
     }
-    if (c->sched) {
-        ggml_backend_sched_free(c->sched);
+    for (auto & slot : c->slots) {
+        if (slot->sched) {
+            ggml_backend_sched_free(slot->sched);
+        }
     }
+    c->slots.clear();
     if (c->model.aux_buf) {
         ggml_backend_buffer_free(c->model.aux_buf);
     }
@@ -1229,6 +1246,7 @@ void xasr_free(xasr_context * c) {
 
 struct xasr_stream {
     xasr_context * c = nullptr;
+    xasr_slot * slot = nullptr;
     std::vector<float> pcm, feats;
     int pos = 0;
     greedy_state gs;
@@ -1244,7 +1262,7 @@ void stream_reset(xasr_stream * s) {
     s->feats.clear();
     s->pos = 0;
     s->stats = xasr_stats{};
-    for (auto * cache : s->c->caches) {
+    for (auto * cache : s->slot->caches) {
         const std::vector<float> zero(ggml_nelements(cache));
         ggml_backend_tensor_set(cache, zero.data(), 0, ggml_nbytes(cache));
     }
@@ -1289,7 +1307,7 @@ bool stream_accept(xasr_stream * s, const float * pcm, int n, bool flush) {
     const int n_frames = static_cast<int>(s->feats.size() / s->c->model.hp.feature_dim);
     s->stats.n_frames = n_frames;
     std::vector<float> enc;
-    if (!run_chunks(s->c, s->feats.data(), n_frames, s->pos, enc, &s->stats, flush)) {
+    if (!run_chunks(s->c, *s->slot, s->feats.data(), n_frames, s->pos, enc, &s->stats, flush)) {
         s->failed = true;
         return false;
     }
@@ -1314,13 +1332,24 @@ std::string stream_text(const xasr_stream * s) {
 } // namespace
 
 xasr_stream * xasr_stream_init(xasr_context * c) {
-    if (!c || c->stream_active) {
+    if (!c) {
+        return nullptr;
+    }
+    xasr_slot * slot = nullptr;
+    for (auto & candidate : c->slots) {
+        if (!candidate->busy) {
+            slot = candidate.get();
+            break;
+        }
+    }
+    if (!slot) {
         return nullptr;
     }
     auto s = std::make_unique<xasr_stream>();
     s->c = c;
+    s->slot = slot;
+    slot->busy = true;
     stream_reset(s.get());
-    c->stream_active = true;
     return s.release();
 }
 
@@ -1376,7 +1405,9 @@ const xasr_stats * xasr_stream_stats(const xasr_stream * s) {
 
 void xasr_stream_free(xasr_stream * s) {
     if (s) {
-        s->c->stream_active = false;
+        if (s->slot) {
+            s->slot->busy = false;
+        }
         delete s;
     }
 }

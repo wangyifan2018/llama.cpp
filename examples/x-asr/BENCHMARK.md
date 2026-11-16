@@ -272,6 +272,35 @@ graph allocation all land on the DSP.
 - The DSP operator profile perturbs timing. All latency numbers here come from
   runs without `GGML_HEXAGON_PROFILE`.
 
+## Concurrent streams
+
+The context can hold one encoder graph and state set per stream, all sharing one
+copy of the weights. `--streams N --concurrent` feeds the same packets to N
+streams, aligns their endpoints, and commits them in slot order, so stream i
+pays the commits of the streams before it. That is the head-of-line cost of a
+single worker and the baseline for scheduling work.
+
+HTP polling, OPBATCH 2048, the 2.65 s Mandarin clip, one paced run per row:
+
+| Streams | endpoint to final, in commit order (ms) | max | model init | peak RSS |
+|---:|---|---:|---:|---:|
+| 1 | 169.6 | 169.6 | 819 ms | 61.0 MB |
+| 2 | 169.4, 340.5 | 340.5 | 831 ms | 78.0 MB |
+| 4 | 170.0, 341.0, 512.2, 683.0 | 683.0 | 881 ms | 112.2 MB |
+
+Each extra stream adds about 171 ms, which is one full commit: two encoder
+chunks plus the decoder. Every stream returns the same text as the single-stream
+run, and the same numbers reproduce when the four slots are reused by a second
+and third wave in one process, including a language change, so the per-stream
+state is cleared on reuse. Cost per extra slot is about 17 MB of memory and 20 ms
+of model init.
+
+What this does not do: the streams are serialized. Total work for four aligned
+endpoints is four commits, so the last stream waits for the other three. Cutting
+that needs the encoder batched across streams, which needs a graph with a stream
+dimension through the attention and its per-stream left context. Until then the
+four-way simultaneous endpoint number is 683 ms, not 170 ms.
+
 ## Reproduce on Android
 
 Run these blocks from the repository root in the same Bash session. The [Snapdragon toolchain guide](../../docs/backend/snapdragon/README.md) covers Docker and ADB setup. Set `ANDROID_SERIAL` if several devices are attached.
