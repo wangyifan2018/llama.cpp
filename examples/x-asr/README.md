@@ -35,6 +35,79 @@ adb shell 'cd /data/local/tmp/llama.cpp &&
 
 Set the positional device to `CPU` for a same-device comparison. For the measured low-latency SM6650 configuration, export `GGML_HEXAGON_OPPOLL=1` and `GGML_HEXAGON_OPBATCH=2048` before launching the binary. This example checks the selected device's actual scheduler placement and fails initialization if any encoder compute node falls back. The placement line includes the device, assigned nodes, scheduler splits, and bytes of encoder cache. One scheduler split can still produce multiple HTP command batches.
 
+## ASR server
+
+`llama-x-asr-server` wraps the engine in a small daemon. It is not part of
+`tools/server`: the [server scope](tools/server/README-dev.md) covers
+model-agnostic LLM features and excludes model-specific ones, and this is a
+model-specific streaming ASR engine with its own frame protocol.
+
+```sh
+cmake --build build-x-asr --target llama-x-asr-server -j
+build-x-asr/bin/llama-x-asr-server x-asr-zh-en-q8_0.gguf CPU --port 8765 --streams 4
+python3 examples/x-asr/tools/asr_client.py --port 8765 --wav zh.wav --sessions 4 --paced
+```
+
+On Android, run the daemon on the device and forward the port:
+
+```sh
+adb shell -T 'cd /data/local/tmp/llama.cpp &&
+    export LD_LIBRARY_PATH=$PWD/lib ADSP_LIBRARY_PATH=$PWD/lib &&
+    export GGML_HEXAGON_DEVICES=HTP0:0 GGML_HEXAGON_OPBATCH=2048 GGML_HEXAGON_OPPOLL=1 &&
+    bin/llama-x-asr-server x-asr-zh-en-q8_0.gguf HTP0:0 --port 8765 --streams 4'
+adb forward tcp:8765 tcp:8765
+```
+
+### Protocol
+
+Length-prefixed frames, little-endian. Request: `u32 op, u32 session, u32 bytes,
+payload`. Response: `u32 status, u32 bytes, payload`.
+
+| op | name | payload | reply |
+|---:|---|---|---|
+| 0 | OPEN | none | status 0, 4-byte session id |
+| 1 | APPEND | float32 mono 16 kHz | none, one way |
+| 2 | COMMIT | none | status 1, UTF-8 final text |
+| 3 | CANCEL | none | status 0, the stream is freed |
+| 4 | CLOSE | none | status 0, the stream is freed |
+
+Status 2 carries an error string. APPEND is one way: audio never waits for a
+reply, and backpressure is the request queue filling and the reader blocking on
+the socket. Every other op answers exactly once. An APPEND the engine rejects
+closes the connection, so a client can never resynchronise on a stale reply.
+
+The VAD stays on the caller's side: the client sends PCM while it records and
+one COMMIT at its endpoint. The server returns only final text.
+
+### Lifecycle, limits, scheduling
+
+- One worker thread owns the engine and every session; connection threads only
+  move bytes. The engine is not thread safe, so this is also what makes the
+  context usable.
+- `--streams N` bounds concurrent sessions, because a session holds one encoder
+  slot. OPEN past the limit returns status 2 and the caller must wait or retry.
+  Slots are returned on COMMIT, CANCEL, CLOSE or disconnect.
+- `--queue N` bounds the pending request queue (64 by default). When it is full
+  the reader thread blocks, which turns into TCP backpressure on the client.
+- One request is held to 60 s of audio and one stream to ten minutes.
+- COMMIT has priority: when one is queued, that session's earlier APPENDs are
+  drained and run first, then the commit. Other sessions' audio cannot delay a
+  finished utterance, and per-session order is preserved.
+- There is no idle eviction yet. A client that disconnects without CLOSE still
+  releases its slot.
+
+### Verification
+
+`tools/server_smoke.sh` starts the daemon, replays the fixtures through the
+socket and compares the text with an in-process CLI run:
+
+```sh
+MODEL=x-asr-zh-en-q8_0.gguf tools/server_smoke.sh "zh.wav en.wav zh-10.wav" CPU
+```
+
+Measured end to end, including the socket and the queue, see
+[BENCHMARK.md](BENCHMARK.md#server-end-to-end).
+
 ## Inference flow
 
 | Stage | Execution |

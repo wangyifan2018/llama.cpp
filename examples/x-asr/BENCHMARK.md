@@ -317,6 +317,35 @@ What batching needs: a stream dimension through the attention and its per-stream
 left context. The feed-forward, convolution and pointwise blocks can be widened
 across streams without that, so a partial batch is possible first.
 
+## Server: end to end
+
+`llama-x-asr-server` on the device (HTP polling, 4 slots), client on the host
+through `adb forward`, so these numbers include the socket, the queue and the
+USB path. The in-process column is the same engine driven directly, from the
+tables above.
+
+| Case | in-process endpoint to final (ms) | through the server (ms) |
+|---|---|---|
+| 1 stream, zh 2.65 s | 169.6 | 167.8, 166.5 |
+| 4 aligned, zh 2.65 s | 170.0, 341.0, 512.2, 683.0 | 240, 249, 499, 509, 756, 765, 927, 937 |
+| 3 end at 8.5 s, 1 records to 10 s | 171.4, 343.2, 514.9, 269.6 | 249, 423, 595, **258** |
+
+Reading:
+
+- One stream is within noise of the in-process figure, so the socket and the
+  queue cost almost nothing when there is nothing to queue behind.
+- Aligned endpoints are the worst case. Four commits queue behind each other,
+  and the spread is wider than in-process because the first commit also waits
+  behind the four sessions' pending audio. The maximum doubles, from 683 to 937.
+- With staggered endpoints the continuing stream still gets 258 ms, the same as
+  in-process. The service overhead is in the queue, not in the commit path.
+
+These are single runs per cell, not percentiles; the queue and IPC variance is
+larger than the inference variance, so Phase 3 scheduling work has to report
+P50/P95/P99 over many arrivals before it is trusted. What is established here is
+the shape: a single stream is unaffected by the service, aligned endpoints pay
+queueing, staggered endpoints do not.
+
 ## Reproduce on Android
 
 Run these blocks from the repository root in the same Bash session. The [Snapdragon toolchain guide](../../docs/backend/snapdragon/README.md) covers Docker and ADB setup. Set `ANDROID_SERIAL` if several devices are attached.
