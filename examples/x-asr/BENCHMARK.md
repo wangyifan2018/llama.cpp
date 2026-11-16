@@ -86,6 +86,10 @@ Raw logs for the run quoted here:
 
 ### Endpoint to final
 
+Snapshot at commit `e1ef64e79`. Later optimization batches report their own A/B
+tables and are not folded into this one, so that every row comes from a single
+session on the same build.
+
 Tail is measured from the scheduled arrival of the last 20 ms packet to the final
 text. Three rounds per fixture, so N=3 per cell.
 
@@ -182,6 +186,23 @@ for the change and its limits.
 A separate experiment replaced the completion wait with a bounded timeout to cut
 host CPU. It was rejected: every finite timeout behaved like blocking. The data
 is in [OPTIMIZATION.md](OPTIMIZATION.md#h1-bounded-wait-instead-of-spin-for-dsp-completion-rejected-no-code-kept).
+
+### HTP ConvNeXt quantisation A/B
+
+One factor changed: the two ConvNeXt pointwise projections, F32 in the GGUF,
+replaced by Q8_0 copies of the same weights.
+
+| Arm | weights | DSP ms/chunk | projections ms/chunk | zh | en | zh 10 s | en 20 s |
+|---|---|---:|---:|---:|---:|---:|---:|
+| F32 | 196 KB | 86.9 | 6.09 | 179.9 | 193.4 | 282.6 | 195.1 |
+| Q8_0 | 104 KB | 81.3 | 1.11 | 170.7 | 184.2 | 265.5 | 183.6 |
+
+One paced run per cell, identical text in both arms and on both backends. The
+DSP operator profile confirms the placement: `MUL_MAT+ADD f32 x f32 x f32`
+disappears and `MUL_MAT+ADD q8_0` gains 28 ops per 14 chunks. See
+[OPTIMIZATION.md](OPTIMIZATION.md#h6-quantise-the-two-convext-pointwise-projections-kept-now-the-default).
+The joiner A/B is in
+[H5](OPTIMIZATION.md#h5-joiner-projection-and-argmax-on-the-selected-backend-kept-now-the-default).
 
 ### Backend placement and DSP batches
 

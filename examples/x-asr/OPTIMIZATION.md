@@ -282,6 +282,65 @@ noisier corpus issues more calls; the worst case is one call per frame, which is
 still cheaper per frame than the host loop. Text parity was checked on the four
 fixtures only, plus repeat and language-alternation runs on one context.
 
+### H6. Quantise the two ConvNeXt pointwise projections (kept, now the default)
+
+**Bottleneck.** After H2 the DSP profile still had one operator pair far off the
+fast path: `emb.cnx.pw1.weight` 128 x 384 and `emb.cnx.pw2.weight` 384 x 128,
+both F32 in the GGUF, running as `MUL_MAT+ADD f32 x f32 x f32`. They cost
+85.2 ms of DSP time over 14 chunks, 6.09 ms per chunk, for 44.8 M MAC, which is
+7.4 GMAC/s. The quantised matmuls on the same device reach about 40 GMAC/s.
+
+**Why HTP.** The weight is read once per call and the activation is 128 x 456,
+so at this shape the matmul is weight-bandwidth bound. Q8_0 halves the weight
+bytes and uses the tiled quantised kernel that already carries the rest of the
+encoder. It also removes 92 KB of resident weight per stream, which matters when
+several streams share the model.
+
+**Change.** `quantize_into_q8` converts the two F32 tensors once at load with
+`ggml_quantize_chunk` and uploads them as Q8_0 into a separate small context and
+backend buffer, because the GGUF context is sized exactly for the file. The graph
+selects the Q8_0 tensor when present. Shapes and layouts are unchanged
+(`(128, 384)` and `(384, 128)`), the activation stays F32, and the bias add is
+still fused by H2. `XASR_CNX_Q8=0` restores the F32 path for the A/B.
+
+**Reproduce.**
+
+```sh
+adb shell -T "cd /data/local/tmp/llama.cpp && \
+  export LD_LIBRARY_PATH=\$PWD/lib ADSP_LIBRARY_PATH=\$PWD/lib \
+  GGML_HEXAGON_DEVICES=HTP0:0 GGML_HEXAGON_OPBATCH=2048 GGML_HEXAGON_OPPOLL=1 && \
+  XASR_CNX_Q8=0 bin/llama-x-asr x-asr-zh-en-q8_0.gguf HTP0:0 zh.wav --realtime && \
+  XASR_CNX_Q8=1 bin/llama-x-asr x-asr-zh-en-q8_0.gguf HTP0:0 zh.wav --realtime"
+
+# Operator census for either arm.
+adb shell -T "... GGML_HEXAGON_PROFILE=1 bin/llama-x-asr ... zh.wav zh.wav" 2> profile.log
+python3 /tmp/agg_profile.py profile.log
+```
+
+**Result.** DSP time per chunk 86.9 to 81.3 ms, minus 6.5 percent. The two
+projections fall from 6.09 to 1.11 ms per chunk. The group
+`MUL_MAT+ADD f32 x f32 x f32` disappears from the profile (28 ops, 85.2 ms over
+14 chunks) and `MUL_MAT+ADD q8_0` grows by 28 ops and 15.6 ms.
+
+| Arm | weights | DSP ms/chunk | projections ms/chunk | zh | en | zh 10 s | en 20 s |
+|---|---|---:|---:|---:|---:|---:|---:|
+| F32 | 196 KB | 86.9 | 6.09 | 179.9 | 193.4 | 282.6 | 195.1 |
+| Q8_0 | 104 KB | 81.3 | 1.11 | 170.7 | 184.2 | 265.5 | 183.6 |
+
+Endpoint to final drops 9.2, 9.2, 17.1 and 11.6 ms on the four fixtures, 5 to 6
+percent, with identical text on all four and on both backends. CPU backend on
+the device, three paced repetitions of the 2.65 s clip: 150.2 ms median before,
+138.4 ms after, so the quantised weights do not hurt the CPU path.
+
+**What it does not cover.** The subsampling convolutions still run as
+`IM2COL f32 -> f16` plus `MUL_MAT f16 x f32` at 5.3 GMAC/s (3.8 ms per chunk for
+the three of them). They cannot simply be quantised: their matmul input is the
+F16 im2col buffer, and a Q8_0 weight against an F16 activation is not a path the
+backend supports. That needs either an im2col that emits F32 or a mixed kernel.
+Accuracy is checked on the four fixtures only; these weights are part of the
+encoder front end, so a CER/WER sweep on real VAD cuts is still required before
+this is called safe for deployment.
+
 ## Next experiments
 
 1. **Measure where the remaining tail goes.** In [`run_chunks`](xasr.cpp#L746) time feature and mask uploads, scheduled compute and completion, and encoder projection readback. In [`stream_accept`](xasr.cpp#L1018) time fbank, predictor/joiner, and text finalization. Tag each chunk with its phase (audio arrival or commit), sequence position, and number of DSP submissions. Collect a separate per-op profile using the [benchmark command](BENCHMARK.md#optional-htp-operator-profile). This distinguishes DSP kernel time from host submission and waiting. Compare CPU, HTP waiting, and HTP polling under both idle and representative CPU load.

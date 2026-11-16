@@ -71,6 +71,9 @@ struct xasr_model {
     std::vector<std::string> vocab;
     // encoder_embed
     ggml_tensor *conv_w[3], *conv_b[3], *cnx_dw_w, *cnx_dw_b, *cnx_pw1_w, *cnx_pw1_b, *cnx_pw2_w, *cnx_pw2_b;
+    ggml_tensor *cnx_pw1_q8 = nullptr, *cnx_pw2_q8 = nullptr; // optional Q8_0 copies of the pointwise projections
+    ggml_context * aux_ctx = nullptr;
+    ggml_backend_buffer_t aux_buf = nullptr;
     ggml_tensor *emb_out_w, *emb_out_b, *emb_norm_bias;
     float emb_norm_scale = 1.0f;
     std::vector<zstack> stacks;
@@ -166,6 +169,22 @@ std::vector<float> to_f32(ggml_tensor * t) {
         traits->to_float(raw.data(), out.data(), (int64_t)out.size());
     }
     return out;
+}
+
+// Quantise a loaded F32 weight into a Q8_0 tensor that lives in the model buffer.
+void quantize_into_q8(ggml_tensor * src, ggml_tensor * dst) {
+    if (!src || !dst) {
+        throw std::runtime_error("missing tensor for the Q8_0 conversion");
+    }
+    const std::vector<float> data = to_f32(src);
+    std::vector<char> quant(ggml_nbytes(dst));
+    const int64_t n_per_row = dst->ne[0];
+    const int64_t nrows = ggml_nrows(dst);
+    const size_t written = ggml_quantize_chunk(GGML_TYPE_Q8_0, data.data(), quant.data(), 0, nrows, n_per_row, nullptr);
+    if (written != quant.size()) {
+        throw std::runtime_error("Q8_0 conversion size mismatch for " + std::string(src->name));
+    }
+    ggml_backend_tensor_set(dst, quant.data(), 0, quant.size());
 }
 
 std::vector<int> kv_int_array(gguf_context* g, const char * key) {
@@ -298,7 +317,6 @@ bool load(xasr_model & m, const char * path, ggml_backend_t backend) {
         }
         ggml_backend_tensor_set(tensor, bytes.data(), 0, size);
     }
-
     const int conv_channels[] = {1, 8, 32, 128};
     for (int i = 0; i < 3; i++) {
         m.conv_w[i] = req_shape(m, "emb.conv" + std::to_string(i) + ".weight", {3, 3, conv_channels[i], conv_channels[i + 1]}, true);
@@ -310,6 +328,31 @@ bool load(xasr_model & m, const char * path, ggml_backend_t backend) {
     m.cnx_pw1_b = req_shape(m, "emb.cnx.pw1.bias", {384}, true);
     m.cnx_pw2_w = req_shape(m, "emb.cnx.pw2.weight", {1, 1, 384, 128}, true);
     m.cnx_pw2_b = req_shape(m, "emb.cnx.pw2.bias", {128}, true);
+    // Optional Q8_0 copies of the two ConvNeXt pointwise projections. They are
+    // F32 in the GGUF and run at 6 to 10 GMAC/s on the DSP, against 40 GMAC/s
+    // for the quantised matmuls. They live in their own context and buffer
+    // because the GGUF context is sized exactly for the file.
+    const char * cnx_q8_env = getenv("XASR_CNX_Q8");
+    if (!cnx_q8_env || atoi(cnx_q8_env) != 0) {
+        ggml_init_params aux = { ggml_tensor_overhead() * 8, nullptr, true };
+        m.aux_ctx = ggml_init(aux);
+        if (!m.aux_ctx) {
+            throw std::runtime_error("cannot allocate the quantised ConvNeXt context");
+        }
+        m.cnx_pw1_q8 = ggml_new_tensor_2d(m.aux_ctx, GGML_TYPE_Q8_0, 128, 384);
+        ggml_set_name(m.cnx_pw1_q8, "emb.cnx.pw1.q8");
+        m.cnx_pw2_q8 = ggml_new_tensor_2d(m.aux_ctx, GGML_TYPE_Q8_0, 384, 128);
+        ggml_set_name(m.cnx_pw2_q8, "emb.cnx.pw2.q8");
+        m.aux_buf = ggml_backend_alloc_ctx_tensors(m.aux_ctx, backend);
+        if (!m.aux_buf) {
+            throw std::runtime_error("cannot allocate the quantised ConvNeXt weights");
+        }
+        quantize_into_q8(m.cnx_pw1_w, m.cnx_pw1_q8);
+        quantize_into_q8(m.cnx_pw2_w, m.cnx_pw2_q8);
+        fprintf(stderr, "xasr: ConvNeXt pointwise projections converted to Q8_0, %zu bytes\n",
+                (size_t) ggml_nbytes(m.cnx_pw1_q8) + (size_t) ggml_nbytes(m.cnx_pw2_q8));
+    }
+
     m.emb_out_w = req_shape(m, "emb.out.weight", {2432, 192}, false);
     m.emb_out_b = req_shape(m, "emb.out.bias", {192}, true);
     m.emb_norm_bias = req_shape(m, "emb.norm.bias", {192}, true);
@@ -650,9 +693,9 @@ ggml_cgraph * build_chunk_graph(xasr_context * c, std::vector<uint8_t> & meta) {
     y = ggml_add(g, y, cbias(m.cnx_dw_b));
     y = ggml_cont(g, ggml_permute(g, y, 1, 2, 0, 3)); // (128, F', chunk)
     y = ggml_reshape_2d(g, y, Ch, Fp * G.chunk);
-    y = lin(g, y, ggml_reshape_2d(g, m.cnx_pw1_w, Ch, m.cnx_pw1_w->ne[3]), m.cnx_pw1_b);
+    y = lin(g, y, m.cnx_pw1_q8 ? m.cnx_pw1_q8 : ggml_reshape_2d(g, m.cnx_pw1_w, Ch, m.cnx_pw1_w->ne[3]), m.cnx_pw1_b);
     y = swoosh_l(g, y);
-    y = lin(g, y, ggml_reshape_2d(g, m.cnx_pw2_w, m.cnx_pw2_w->ne[2], Ch), m.cnx_pw2_b); // (128, F'*chunk)
+    y = lin(g, y, m.cnx_pw2_q8 ? m.cnx_pw2_q8 : ggml_reshape_2d(g, m.cnx_pw2_w, m.cnx_pw2_w->ne[2], Ch), m.cnx_pw2_b); // (128, F'*chunk)
     ggml_tensor * byp = ggml_view_3d(g, x, Fp, G.chunk, Ch, x->nb[1], x->nb[2], 0);
     byp = ggml_cont(g, ggml_permute(g, byp, 1, 2, 0, 3)); // (128, F', chunk)
     y = ggml_add(g, ggml_reshape_3d(g, y, Ch, Fp, G.chunk), byp);
@@ -1155,6 +1198,12 @@ void xasr_free(xasr_context * c) {
     }
     if (c->sched) {
         ggml_backend_sched_free(c->sched);
+    }
+    if (c->model.aux_buf) {
+        ggml_backend_buffer_free(c->model.aux_buf);
+    }
+    if (c->model.aux_ctx) {
+        ggml_free(c->model.aux_ctx);
     }
     if (c->model.buf) {
         ggml_backend_buffer_free(c->model.buf);
