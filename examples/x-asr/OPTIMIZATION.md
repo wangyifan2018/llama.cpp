@@ -136,6 +136,41 @@ Two-thirds of the remaining DSP time is still in small ops: 585 CONT, 115 CPY,
 next HTP target, together with the two f32 ConvNeXt projections, which run at
 6 to 10 GMAC/s against 40 GMAC/s for the q8_0 matmuls.
 
+### H3. Shorter tail padding (rejected on these fixtures)
+
+**Bottleneck.** `xasr_commit` appends 1,200 ms of zeros, which triggers two or
+three extra encoder chunks. At 74.5 ms per chunk on CPU and 95 ms on HTP that is
+most of the tail, so the obvious change is to append only what is needed.
+
+**Hypothesis.** The last chunk of a 1,200 ms pad covers only silence, so it can
+be dropped without changing the final text.
+
+**Test.** `--pad-ms` accepts an explicit padding, and a phase-aware mode pads
+only until the chunk that covers the last real frame can run:
+`target = 48 * floor((frames - 1) / 48) + 62`.
+
+| Padding | zh 2.65 s | zh 10 s |
+|---|---|---|
+| 1,200 ms (default) | 请导航到上海虹桥机场, 7 chunks | ...车内温度调到二十二, 23 chunks |
+| phase-aware, 370 ms | 请导航到上海虹桥机 (场 lost), 6 chunks | ...车内温度调到 (二十二 lost), 21 chunks |
+| none | 请导航到上海虹桥 (机场 lost), 5 chunks | ...车内温度 (二十二 lost), 20 chunks |
+
+**Result.** Rejected. The extra silence chunk is load-bearing: it gives the
+transducer the right context to emit the last token or two. The minimum safe
+padding is phase dependent, because the chunk that covers the last real frame
+is followed by a chunk that carries the trailing tokens. For the 2.65 s fixture
+the real audio ends at frame 265, the covering chunk starts at 240, and the
+emitting chunk starts at 288, so at least 850 ms is needed; 1,200 ms then costs
+nothing extra on that fixture. On the 10 s fixture the same rule would save two
+chunks, but only if 1,200 ms is not required to flush the last phrase, which the
+table above contradicts.
+
+**Next attempt.** Shorten the padding only after measuring the minimum per
+endpoint phase over real VAD cuts, or emit the final text from a partial window
+instead of padding. Both need a text-parity harness that runs many endpoint
+phases; `tools/make_tail_fixtures.py` already generates the phase-shifted and
+truncated clips for it.
+
 ## Next experiments
 
 1. **Measure where the remaining tail goes.** In [`run_chunks`](xasr.cpp#L746) time feature and mask uploads, scheduled compute and completion, and encoder projection readback. In [`stream_accept`](xasr.cpp#L1018) time fbank, predictor/joiner, and text finalization. Tag each chunk with its phase (audio arrival or commit), sequence position, and number of DSP submissions. Collect a separate per-op profile using the [benchmark command](BENCHMARK.md#optional-htp-operator-profile). This distinguishes DSP kernel time from host submission and waiting. Compare CPU, HTP waiting, and HTP polling under both idle and representative CPU load.
