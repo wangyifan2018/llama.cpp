@@ -27,6 +27,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -63,6 +64,9 @@ struct request {
 struct session_entry {
     engine * eng = nullptr;
     xasr_stream * stream = nullptr;
+    int fd = -1;
+    double last_ms = 0;
+    bool expiring = false;
 };
 
 struct engine {
@@ -86,12 +90,44 @@ struct engine {
     }
 };
 
+static double now_ms() {
+    return std::chrono::duration<double, std::milli>(xasr_clock::now().time_since_epoch()).count();
+}
+
 static std::mutex sessions_mutex;
 static std::map<uint32_t, session_entry> sessions;
 static uint32_t next_session = 1;
+static double idle_limit_ms = 30000;
 
-static double now_ms() {
-    return std::chrono::duration<double, std::milli>(xasr_clock::now().time_since_epoch()).count();
+// Reaps sessions that stopped sending. Expiry is queued to the owning engine so
+// the stream is freed on the worker thread, never concurrently with a commit.
+static void janitor_loop(std::vector<engine *> engines) {
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+        const double now = now_ms();
+        std::vector<std::pair<engine *, uint32_t>> expired;
+        {
+            std::lock_guard<std::mutex> lock(sessions_mutex);
+            for (auto & [id, entry] : sessions) {
+                if (!entry.expiring && now - entry.last_ms > idle_limit_ms) {
+                    entry.expiring = true;
+                    expired.emplace_back(entry.eng, id);
+                }
+            }
+        }
+        for (auto & [eng, id] : expired) {
+            request req;
+            req.fd = -1;
+            req.op = OP_CLOSE;
+            req.session = id;
+            req.eng = eng;
+            req.enqueued_ms = now_ms();
+            fprintf(stderr, "xasr-server: session %u idle, releasing\n", id);
+            std::lock_guard<std::mutex> lock(eng->mutex);
+            eng->queue.push_back(std::move(req));
+            eng->ready.notify_one();
+        }
+    }
 }
 
 static bool read_exact(int fd, void * data, size_t bytes) {
@@ -121,6 +157,9 @@ static bool write_exact(int fd, const void * data, size_t bytes) {
 }
 
 static bool respond(int fd, uint32_t status, const std::string & payload) {
+    if (fd < 0) {
+        return true; // internal request, nobody to answer
+    }
     uint32_t head[2] = {status, (uint32_t) payload.size()};
     return write_exact(fd, head, sizeof(head)) &&
            (payload.empty() || write_exact(fd, payload.data(), payload.size()));
@@ -197,6 +236,25 @@ static void worker_loop(engine * eng) {
             }
             const bool known = req.op == OP_OPEN || s != nullptr;
             switch (req.op) {
+                case OP_OPEN: {
+                    // Stream creation touches the engine, so it runs here and
+                    // never on a connection thread.
+                    xasr_stream * created = xasr_stream_init(eng->ctx);
+                    if (!created) {
+                        std::lock_guard<std::mutex> lock(eng->mutex);
+                        eng->live -= 1;
+                        respond(req.fd, ST_ERROR, "open: stream init failed");
+                        break;
+                    }
+                    uint32_t id = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(sessions_mutex);
+                        id = next_session++;
+                        sessions[id] = session_entry{eng, created, req.fd, now_ms(), false};
+                    }
+                    respond(req.fd, ST_OK, std::string(reinterpret_cast<const char *>(&id), sizeof(id)));
+                    break;
+                }
                 case OP_APPEND:
                     if (!known || !xasr_append(s, req.audio.data(), (int) req.audio.size())) {
                         fprintf(stderr, "xasr-server: append rejected, closing connection\n");
@@ -283,22 +341,10 @@ static void reader_thread(int fd, std::vector<engine *> engines) {
             }
             {
                 std::lock_guard<std::mutex> lock(best->mutex);
-                best->live += 1;
+                best->live += 1; // reserve the slot; the worker creates the stream
             }
-            xasr_stream * s = xasr_stream_init(best->ctx);
-            if (!s) {
-                std::lock_guard<std::mutex> lock(best->mutex);
-                best->live -= 1;
-                respond(fd, ST_ERROR, "open: stream init failed");
-                continue;
-            }
-            uint32_t id = 0;
-            {
-                std::lock_guard<std::mutex> lock(sessions_mutex);
-                id = next_session++;
-                sessions[id] = session_entry{best, s};
-            }
-            respond(fd, ST_OK, std::string(reinterpret_cast<const char *>(&id), sizeof(id)));
+            req.eng = best;
+            push(best, std::move(req));
             continue;
         }
         {
@@ -314,6 +360,7 @@ static void reader_thread(int fd, std::vector<engine *> engines) {
                 continue;
             }
             req.eng = it->second.eng;
+            it->second.last_ms = now_ms();
         }
         push(req.eng, std::move(req));
     }
@@ -337,6 +384,8 @@ int main(int argc, char ** argv) {
             params.n_streams = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--cpu-streams") == 0 && i + 1 < argc) {
             cpu_streams = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--idle-ms") == 0 && i + 1 < argc) {
+            idle_limit_ms = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--queue") == 0 && i + 1 < argc) {
             (void) std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
@@ -404,13 +453,17 @@ int main(int argc, char ** argv) {
     for (auto * eng : raw) {
         fprintf(stderr, "xasr-server: engine %s with %d streams\n", eng->device, eng->max_sessions);
     }
-    fprintf(stderr, "xasr-server: listening on %s:%d\n", bind_addr, port);
+    fprintf(stderr, "xasr-server: idle timeout %.0f ms, listening on %s:%d\n", idle_limit_ms, bind_addr, port);
+    std::thread(janitor_loop, raw).detach();
     for (;;) {
         const int fd = accept(listener, nullptr, nullptr);
         if (fd < 0) {
             continue;
         }
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        timeval tv{};
+        tv.tv_sec = 60;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         std::thread(reader_thread, fd, raw).detach();
     }
     return 0;

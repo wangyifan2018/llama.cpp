@@ -99,7 +99,12 @@ one COMMIT at its endpoint. The server returns only final text.
   Slots are returned on COMMIT, CANCEL, CLOSE or disconnect.
 - `--queue N` bounds the pending request queue (64 by default). When it is full
   the reader thread blocks, which turns into TCP backpressure on the client.
-- One request is held to 60 s of audio and one stream to ten minutes.
+- One request is held to 60 s of audio and one stream to ten minutes, and a
+  session with no request for `--idle-ms` (30 s by default) is released and its
+  slot returned. Expiry is queued to the owning engine, so a stream is never
+  freed from the janitor thread while its worker is inside a commit.
+- A connection that stops sending is dropped after 60 s without a complete
+  frame, so a stalled client cannot pin a reader thread.
 - COMMIT has priority: when one is queued, that session's earlier APPENDs are
   drained and run first, then the commit. Other sessions' audio cannot delay a
   finished utterance, and per-session order is preserved.
