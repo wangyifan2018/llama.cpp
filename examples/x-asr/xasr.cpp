@@ -903,10 +903,13 @@ bool joiner_compute(xasr_context * c, const float * act, const float * pred, int
 }
 
 bool run_chunks(xasr_context * c, xasr_slot & slot, const float * feats, int n_rows, int & pos,
-                std::vector<float> & enc_out, xasr_stats * st, bool commit_phase) {
+                std::vector<float> & enc_out, xasr_stats * st, bool commit_phase, bool single_chunk) {
     const auto & G = c->g;
     const int first = pos;
     for (; pos + G.T < n_rows; pos += G.decode_chunk_len) {
+        if (single_chunk && pos != first) {
+            break;
+        }
         const auto chunk_begin = xasr_clock::now();
         auto up = xasr_clock::now();
         ggml_backend_tensor_set(slot.feats, feats + size_t(pos) * c->model.hp.feature_dim, 0, ggml_nbytes(slot.feats));
@@ -1264,6 +1267,9 @@ struct xasr_stream {
     greedy_state gs;
     bool finished = false;
     bool failed = false;
+    bool stepping = false;
+    bool step_flush = false;
+    double step_ms = 0;
     xasr_stats stats;
 };
 
@@ -1282,13 +1288,7 @@ void stream_reset(xasr_stream * s) {
     s->finished = false;
 }
 
-bool stream_accept(xasr_stream * s, const float * pcm, int n, bool flush) {
-    if (s->failed) {
-        return false;
-    }
-    if (s->finished) {
-        return true;
-    }
+void stream_feed(xasr_stream * s, const float * pcm, int n, bool flush) {
     if (n > 0) {
         s->pcm.insert(s->pcm.end(), pcm, pcm + n);
     }
@@ -1318,12 +1318,16 @@ bool stream_accept(xasr_stream * s, const float * pcm, int n, bool flush) {
     s->stats.fbank_ms += span_ms(t);
     const int n_frames = static_cast<int>(s->feats.size() / s->c->model.hp.feature_dim);
     s->stats.n_frames = n_frames;
+}
+
+bool stream_decode(xasr_stream * s, bool flush, bool single_chunk) {
+    const int n_frames = s->stats.n_frames;
     std::vector<float> enc;
-    if (!run_chunks(s->c, *s->slot, s->feats.data(), n_frames, s->pos, enc, &s->stats, flush)) {
+    if (!run_chunks(s->c, *s->slot, s->feats.data(), n_frames, s->pos, enc, &s->stats, flush, single_chunk)) {
         s->failed = true;
         return false;
     }
-    t = xasr_clock::now();
+    const auto t = xasr_clock::now();
     if (s->c->joiner.ready) {
         if (!greedy_run_dev(s->c, s->gs, enc.data(), (int)(enc.size() / (size_t)s->c->model.hp.joiner_dim), &s->stats)) {
             s->failed = true;
@@ -1333,6 +1337,20 @@ bool stream_accept(xasr_stream * s, const float * pcm, int n, bool flush) {
         greedy_run(s->c->model, s->gs, enc.data(), (int)(enc.size() / (size_t)s->c->model.hp.joiner_dim));
     }
     s->stats.greedy_ms += span_ms(t);
+    return true;
+}
+
+bool stream_accept(xasr_stream * s, const float * pcm, int n, bool flush) {
+    if (s->failed || s->stepping) {
+        return false;
+    }
+    if (s->finished) {
+        return true;
+    }
+    stream_feed(s, pcm, n, flush);
+    if (!stream_decode(s, flush, false)) {
+        return false;
+    }
     s->finished = flush;
     return true;
 }
@@ -1365,9 +1383,14 @@ xasr_stream * xasr_stream_init(xasr_context * c) {
     return s.release();
 }
 
-bool xasr_append(xasr_stream * s, const float * samples, int count) {
+static bool valid_audio(const xasr_stream * s, const float * samples, int count) {
     constexpr size_t max_samples = 16000 * 600;
-    if (!s || s->finished || count < 0 || (!samples && count != 0) || size_t(count) > max_samples - s->pcm.size()) {
+    return s && !s->finished && !s->failed && !s->stepping && count >= 0 &&
+           (samples || count == 0) && s->pcm.size() <= max_samples && size_t(count) <= max_samples - s->pcm.size();
+}
+
+bool xasr_append(xasr_stream * s, const float * samples, int count) {
+    if (!valid_audio(s, samples, count)) {
         return false;
     }
     const auto begin = xasr_clock::now();
@@ -1376,18 +1399,11 @@ bool xasr_append(xasr_stream * s, const float * samples, int count) {
     return ok;
 }
 
-bool xasr_commit(xasr_stream * s, std::string & text) {
-    if (!s) {
-        return false;
-    }
-    const auto begin = xasr_clock::now();
-    if (!stream_accept(s, nullptr, 0, true)) {
-        return false;
-    }
-    auto t = xasr_clock::now();
+static void stream_final(xasr_stream * s, std::string & text, double work_ms) {
+    const auto t = xasr_clock::now();
     text = stream_text(s);
     s->stats.detok_ms = span_ms(t);
-    s->stats.commit_wall_ms = span_ms(begin);
+    s->stats.commit_wall_ms = work_ms + s->stats.detok_ms;
     if (timing_requested()) {
         const xasr_stats & st = s->stats;
         fprintf(stderr,
@@ -1408,8 +1424,57 @@ bool xasr_commit(xasr_stream * s, std::string & text) {
         }
         fprintf(stderr, "]}\n");
     }
+}
+
+bool xasr_commit(xasr_stream * s, std::string & text) {
+    const auto begin = xasr_clock::now();
+    if (!s || !stream_accept(s, nullptr, 0, true)) {
+        return false;
+    }
+    stream_final(s, text, span_ms(begin));
     return true;
 }
+
+bool xasr_begin_step(xasr_stream * s, const float * samples, int count, bool commit) {
+    if (!s || s->failed || s->stepping || (!commit && !valid_audio(s, samples, count))) {
+        return false;
+    }
+    if (commit && (samples || count != 0)) {
+        return false;
+    }
+    const auto begin = xasr_clock::now();
+    if (!s->finished) {
+        stream_feed(s, samples, count, commit);
+    }
+    s->step_ms = span_ms(begin);
+    s->step_flush = commit;
+    s->stepping = true;
+    return true;
+}
+
+xasr_step_result xasr_step(xasr_stream * s, std::string & text) {
+    if (!s || !s->stepping) {
+        return xasr_step_result::error;
+    }
+    const auto begin = xasr_clock::now();
+    if (!s->finished && !stream_decode(s, s->step_flush, true)) {
+        s->stepping = false;
+        return xasr_step_result::error;
+    }
+    s->step_ms += span_ms(begin);
+    if (!s->finished && s->pos + s->c->g.T < s->stats.n_frames) {
+        return xasr_step_result::pending;
+    }
+    s->stepping = false;
+    if (s->step_flush) {
+        s->finished = true;
+        stream_final(s, text, s->step_ms);
+    } else {
+        s->stats.append_wall_ms += s->step_ms;
+    }
+    return xasr_step_result::done;
+}
+
 
 const xasr_stats * xasr_stream_stats(const xasr_stream * s) {
     return s ? &s->stats : nullptr;

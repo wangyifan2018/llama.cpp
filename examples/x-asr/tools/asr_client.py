@@ -64,6 +64,10 @@ class Client:
 
 
 def run_session(args, samples, start, results, index, n_sessions):
+    if args.paced:
+        wait = start - time.monotonic() - 0.05
+        if wait > 0:
+            time.sleep(wait)
     client = Client(args.host, args.port)
     status, body = client.call(OP_OPEN)
     if status != ST_OK or len(body) != 4:
@@ -96,6 +100,7 @@ def run_session(args, samples, start, results, index, n_sessions):
         results[index] = {
             "session": index,
             "server_session": session,
+            "planned_start_offset_ms": args.start_offsets_ms[index],
             "audio_ms": len(samples) / 16.0,
             "endpoint_to_final_ms": (done - endpoint_schedule) * 1000.0,
             "commit_rtt_ms": (done - commit_sent) * 1000.0,
@@ -116,10 +121,22 @@ def main():
     parser.add_argument("--sessions", type=int, default=1)
     parser.add_argument("--stagger-ms", type=int, default=0,
                         help="the last session keeps this much more audio")
+    parser.add_argument("--start-offsets-ms", help="comma-separated PCM start offsets, one per session")
     parser.add_argument("--paced", action="store_true")
     parser.add_argument("--reps", type=int, default=1)
     parser.add_argument("--json", action="store_true", help="one JSON object per session and rep")
     args = parser.parse_args()
+
+    if args.start_offsets_ms is None:
+        args.start_offsets_ms = [0] * args.sessions
+    else:
+        try:
+            offsets = [int(value) for value in args.start_offsets_ms.split(",")]
+        except ValueError:
+            parser.error("--start-offsets-ms expects integers")
+        if not args.paced or len(offsets) != args.sessions or any(offset < 0 for offset in offsets):
+            parser.error("--start-offsets-ms requires --paced and one nonnegative offset per session")
+        args.start_offsets_ms = offsets
 
     if not args.wav and not args.wavs:
         parser.error("give --wav or --wavs")
@@ -138,7 +155,7 @@ def main():
                 samples = full[: max(0, len(full) - args.stagger_ms * 16)]
             else:
                 samples = full
-            t = threading.Thread(target=run_session, args=(args, samples, start, results, i, args.sessions))
+            t = threading.Thread(target=run_session, args=(args, samples, start + args.start_offsets_ms[i] / 1000, results, i, args.sessions))
             t.start()
             threads.append(t)
         for t in threads:

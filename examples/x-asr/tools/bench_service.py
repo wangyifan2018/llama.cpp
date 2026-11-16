@@ -21,6 +21,8 @@ SCENARIOS = {
     "single":   (1, ["--wav", "{short}"]),
     "aligned4": (4, ["--wav", "{short}"]),
     "stagger4": (4, ["--wav", "{long}", "--stagger-ms", "1500"]),
+    "stagger-start4": (4, ["--wavs", "{long2},{long},{short},{short}",
+                          "--start-offsets-ms", "0,10000,17100,17400"]),
     "mixed4":   (4, ["--wavs", "{short},{short},{long},{long2}"]),
 }
 

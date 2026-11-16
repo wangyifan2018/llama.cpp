@@ -483,6 +483,94 @@ python3 examples/x-asr/tools/eval_cer.py --manifest /tmp/eval-pack/manifest-clea
     --model x-asr-zh-en-q8_0.gguf --device CPU --label "CPU default"
 ```
 
+## B=1 chunk scheduler
+
+Both arms use the same server binary, model, HTP device, four slots, and queue
+limit of 64. Only `--chunk-scheduler` differs. Its worker alternates queue
+admission with resumable requests and can yield after one encoder chunk plus
+greedy work. It does not combine model inputs. For multichunk requests, stepping
+can change how joiner calls are grouped across chunk boundaries.
+
+The same binary includes the joiner bounds fix. Once a block of indices has
+been consumed, a blank-only block advances to a fresh joiner call. An earlier
+pilot predates this fix and is excluded from the results below. The run uses
+the same GGUF and audio fixtures as the service baseline.
+
+SM6650, three paced repetitions per arm and scenario, with one single-stream
+warmup per arm. Latency is endpoint to final in milliseconds, in p50 / p95
+order. A second ASR process was present and observed active on the device.
+
+| Scenario | N per arm | Request scheduler | Chunk scheduler |
+|---|---:|---:|---:|
+| single | 3 | 168 / 170 | 173 / 327 |
+| aligned4 | 12 | 733 / 1593 | 697 / 960 |
+| mixed4 | 12 | 405 / 534 | 348 / 606 |
+
+All 27 transcripts match. The maximum between-step wait was 90 ms for
+aligned4 and 89 ms for mixed4, compared with a near-zero residual in the
+request arm. This confirms interleaving. Median commit work stayed within
+2 ms across arms in each scenario. The mixed tail regressed, the sample was
+small and shared-device load varied, so the chunk scheduler remains opt-in.
+Raw JSONL, timing logs, and hashes are in
+`$HOME/Library/Caches/qwen3-asr-htp/xasr-multistream/chunk-yield.bSh3PG`.
+
+Run after building and deploying the Android package with
+[BUILD.md](BUILD.md). Point `XASR_REMOTE` at the package on the phone and
+select the same host fixtures. The script starts and stops its own server on
+an ADB-forwarded loopback port, records input and device binary hashes,
+runs the three scenarios, and checks transcript parity.
+
+```bash
+export ANDROID_SERIAL=ADNQ6R5823007930
+export XASR_REMOTE=/data/local/tmp/llama-x-asr
+export XASR_ARMS='chunk request'
+CACHE="$HOME/Library/Caches/qwen3-asr-htp"
+bash examples/x-asr/tools/bench_chunk_scheduler.sh \
+    build-android-xasr/bin/llama-x-asr-server "$CACHE/zh.wav" \
+    "$CACHE/cabin-asr-probe/long-perf/zh-10.wav" \
+    "$CACHE/cabin-asr-probe/long-perf/en-20.wav"
+```
+
+For staggered starts, prefix the same command with
+`XASR_SCENARIOS=stagger-start4 XASR_REPS=1`. This uses four start offsets
+of 0, 10,000, 17,100, and 17,400 ms and lengths of 20 s, 10 s, and two
+short clips. The recorded single-round smoke test returned four matching
+transcripts. Endpoint-to-final max was 1,001 ms in request mode and
+1,098 ms in chunk mode. This is one round across four concurrent sessions.
+Logs and the recorded planned offsets are in
+`$HOME/Library/Caches/qwen3-asr-htp/xasr-multistream/stagger-start.HkmwgQ`.
+
+The server log reports delay before first service as `queue_ms`, work spent on
+the commit as `commit_ms`, and time from ingress to completion as
+`elapsed_ms`. In the stepping arm, elapsed time also includes waits between
+steps. These fields exclude the response socket write. The client records
+endpoint-to-final over the ADB transport in both modes.
+
+## Soak
+
+Four sessions of mixed length (2.65 s, 2.65 s, 10 s, 20 s), unpaced, driven back
+to back through the socket on the hybrid server (HTP x2 + CPU x2). Each round
+creates four sessions, commits them and closes them, so this exercises session
+creation, slot release and the encoding of 35 s of audio per round.
+
+| Pass | Rounds | Sessions | endpoint p50 | p95 | p99 | max | peak RSS after | idle reaps |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 40 | 160 | 234.5 | 425.9 | 778.6 | 810.3 | 316.8 MB | 0 |
+| 2 | 20 | 80 | see raw | | | | | 0 |
+
+Pass 1 starts at 294.7 MB and ends at 316.8 MB. The per-stream p50 is balanced
+across the four slots (251, 253, 246, 168 ms), no session was reaped by the idle
+timeout, which means every client closed cleanly, and the server was still alive
+afterwards. The growth is kept under watch in pass 2: if it plateaus the extra
+resident memory is allocator retention for the 20 s session buffers rather than a
+leak, because each stream allocates its own PCM and feature vectors.
+
+Mixed lengths are much kinder than aligned endpoints: p95 here is 426 ms against
+941 ms for four aligned 2.65 s clips, because the endpoints naturally stagger and
+the second engine drains them.
+
+Raw: `/tmp/soak-mixed.jsonl`, `/tmp/soak-mixed2.jsonl`.
+
 ## Reproduce on Android
 
 Run these blocks from the repository root in the same Bash session. The [Snapdragon toolchain guide](../../docs/backend/snapdragon/README.md) covers Docker and ADB setup. Set `ANDROID_SERIAL` if several devices are attached.

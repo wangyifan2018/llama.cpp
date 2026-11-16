@@ -39,6 +39,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -53,6 +54,8 @@ enum { ST_OK = 0, ST_FINAL = 1, ST_ERROR = 2 };
 
 struct engine;
 
+using socket_ref = std::shared_ptr<const int>;
+
 struct request {
     int fd = -1;
     uint32_t op = 0;
@@ -60,12 +63,15 @@ struct request {
     double enqueued_ms = 0;
     engine * eng = nullptr;
     std::vector<float> audio;
+    socket_ref connection;
+    bool started = false;
+    double queue_ms = 0;
 };
 
 struct session_entry {
     engine * eng = nullptr;
     xasr_stream * stream = nullptr;
-    int fd = -1;
+    std::weak_ptr<const int> connection;
     double last_ms = 0;
     bool expiring = false;
 };
@@ -78,6 +84,7 @@ struct engine {
     std::deque<request> queue;
     std::mutex mutex;
     std::condition_variable ready;
+    std::condition_variable space;
     std::thread worker;
     bool stopping = false;
 
@@ -183,11 +190,12 @@ static void close_session(uint32_t id) {
 // Bounded queue: a reader that outruns its engine blocks here, which is the
 // backpressure the client sees as a stalled socket.
 static size_t queue_limit = 256;
+static bool chunk_scheduler = false;
 
 static void push(engine * eng, request && req) {
     {
         std::unique_lock<std::mutex> lock(eng->mutex);
-        eng->ready.wait(lock, [eng] { return eng->queue.size() < queue_limit || eng->stopping; });
+        eng->space.wait(lock, [eng] { return eng->queue.size() < queue_limit || eng->stopping; });
         eng->queue.push_back(std::move(req));
     }
     eng->ready.notify_one();
@@ -198,45 +206,82 @@ static void push(engine * eng, request && req) {
 // cannot delay a finished utterance.
 static void worker_loop(engine * eng) {
     std::vector<request> batch;
+    std::deque<request> pending;
+    bool resume_next = false;
     for (;;) {
         batch.clear();
         {
             std::unique_lock<std::mutex> lock(eng->mutex);
-            eng->ready.wait(lock, [eng] { return !eng->queue.empty() || eng->stopping; });
-            if (eng->queue.empty() && eng->stopping) {
-                return;
-            }
-            size_t commit_at = eng->queue.size();
-            for (size_t i = 0; i < eng->queue.size(); ++i) {
-                if (eng->queue[i].op == OP_COMMIT) {
-                    commit_at = i;
-                    break;
+            if (pending.empty()) {
+                eng->ready.wait(lock, [eng] { return !eng->queue.empty() || eng->stopping; });
+                if (eng->queue.empty() && eng->stopping) {
+                    return;
                 }
             }
-            if (commit_at == eng->queue.size()) {
-                batch.push_back(std::move(eng->queue.front()));
-                eng->queue.pop_front();
-            } else {
-                const uint32_t sid = eng->queue[commit_at].session;
-                for (size_t i = 0; i < commit_at;) {
-                    if (eng->queue[i].op == OP_APPEND && eng->queue[i].session == sid) {
-                        batch.push_back(std::move(eng->queue[i]));
-                        eng->queue.erase(eng->queue.begin() + (long) i);
-                        --commit_at;
+            if (chunk_scheduler) {
+                auto eligible = [&](const request & item) {
+                    return std::none_of(pending.begin(), pending.end(), [&](const request & active) {
+                        return (item.session && item.session == active.session) ||
+                               (item.connection && item.connection == active.connection);
+                    });
+                };
+                auto next = eng->queue.end();
+                if (!resume_next || pending.empty()) {
+                    // A commit may pass unrelated clients, but not its own earlier frames.
+                    const auto commit = std::find_if(eng->queue.begin(), eng->queue.end(), [&](const request & item) {
+                        return item.op == OP_COMMIT && eligible(item);
+                    });
+                    if (commit != eng->queue.end()) {
+                        next = std::find_if(eng->queue.begin(), std::next(commit), [&](const request & item) {
+                            return item.connection == commit->connection && eligible(item);
+                        });
                     } else {
-                        ++i;
+                        next = std::find_if(eng->queue.begin(), eng->queue.end(), eligible);
                     }
                 }
-                batch.push_back(std::move(eng->queue[commit_at]));
-                eng->queue.erase(eng->queue.begin() + (long) commit_at);
+                if (next != eng->queue.end()) {
+                    batch.push_back(std::move(*next));
+                    eng->queue.erase(next);
+                    resume_next = !pending.empty();
+                } else {
+                    batch.push_back(std::move(pending.front()));
+                    pending.pop_front();
+                    resume_next = false;
+                }
+            } else {
+                size_t commit_at = eng->queue.size();
+                for (size_t i = 0; i < eng->queue.size(); ++i) {
+                    if (eng->queue[i].op == OP_COMMIT) {
+                        commit_at = i;
+                        break;
+                    }
+                }
+                if (commit_at == eng->queue.size()) {
+                    batch.push_back(std::move(eng->queue.front()));
+                    eng->queue.pop_front();
+                } else {
+                    const uint32_t sid = eng->queue[commit_at].session;
+                    for (size_t i = 0; i < commit_at;) {
+                        if (eng->queue[i].op == OP_APPEND && eng->queue[i].session == sid) {
+                            batch.push_back(std::move(eng->queue[i]));
+                            eng->queue.erase(eng->queue.begin() + (long) i);
+                            --commit_at;
+                        } else {
+                            ++i;
+                        }
+                    }
+                    batch.push_back(std::move(eng->queue[commit_at]));
+                    eng->queue.erase(eng->queue.begin() + (long) commit_at);
+                }
             }
         }
+        eng->space.notify_all();
         for (auto & req : batch) {
             xasr_stream * s = nullptr;
             {
                 std::lock_guard<std::mutex> lock(sessions_mutex);
                 auto it = sessions.find(req.session);
-                if (it != sessions.end()) {
+                if (it != sessions.end() && (!req.connection || it->second.connection.lock() == req.connection)) {
                     s = it->second.stream;
                 }
             }
@@ -256,32 +301,48 @@ static void worker_loop(engine * eng) {
                     {
                         std::lock_guard<std::mutex> lock(sessions_mutex);
                         id = next_session++;
-                        sessions[id] = session_entry{eng, created, req.fd, now_ms(), false};
+                        sessions[id] = session_entry{eng, created, req.connection, now_ms(), false};
                     }
                     respond(req.fd, ST_OK, std::string(reinterpret_cast<const char *>(&id), sizeof(id)));
                     break;
                 }
                 case OP_APPEND:
-                    if (!known || !xasr_append(s, req.audio.data(), (int) req.audio.size())) {
-                        fprintf(stderr, "xasr-server: append rejected, closing connection\n");
-                        close(req.fd);
-                    }
-                    break;
                 case OP_COMMIT: {
-                    if (!known) {
-                        respond(req.fd, ST_ERROR, "commit: unknown session");
-                        break;
-                    }
-                    const double queue_ms = now_ms() - req.enqueued_ms;
+                    const bool commit = req.op == OP_COMMIT;
                     const auto begin = xasr_clock::now();
-                    std::string text;
-                    const bool ok = xasr_commit(s, text);
-                    const double commit_ms = std::chrono::duration<double, std::milli>(xasr_clock::now() - begin).count();
-                    if (getenv("XASR_TIMING")) {
-                        fprintf(stderr, "xasr-server: commit session %u on %s queue_ms=%.3f commit_ms=%.3f\n",
-                                req.session, eng->device, queue_ms, commit_ms);
+                    if (!req.started) {
+                        req.queue_ms = now_ms() - req.enqueued_ms;
                     }
-                    respond(req.fd, ok ? ST_FINAL : ST_ERROR, ok ? text : std::string("commit: failed"));
+                    std::string text;
+                    bool ok = known;
+                    if (ok && chunk_scheduler) {
+                        if (!req.started) {
+                            ok = xasr_begin_step(s, commit ? nullptr : req.audio.data(), (int) req.audio.size(), commit);
+                            req.started = true;
+                            std::vector<float>().swap(req.audio);
+                        }
+                        const auto result = ok ? xasr_step(s, text) : xasr_step_result::error;
+                        if (result == xasr_step_result::pending) {
+                            pending.push_back(std::move(req));
+                            break;
+                        }
+                        ok = result == xasr_step_result::done;
+                    } else if (ok) {
+                        ok = commit ? xasr_commit(s, text) : xasr_append(s, req.audio.data(), (int) req.audio.size());
+                    }
+                    if (!commit && !ok) {
+                        fprintf(stderr, "xasr-server: append rejected, closing connection\n");
+                        shutdown(req.fd, SHUT_RDWR);
+                    } else if (commit) {
+                        if (ok && getenv("XASR_TIMING")) {
+                            const double commit_ms = chunk_scheduler ? xasr_stream_stats(s)->commit_wall_ms :
+                                std::chrono::duration<double, std::milli>(xasr_clock::now() - begin).count();
+                            const double elapsed_ms = now_ms() - req.enqueued_ms;
+                            fprintf(stderr, "xasr-server: commit session %u on %s queue_ms=%.3f commit_ms=%.3f elapsed_ms=%.3f\n",
+                                    req.session, eng->device, req.queue_ms, commit_ms, elapsed_ms);
+                        }
+                        respond(req.fd, ok ? ST_FINAL : ST_ERROR, ok ? text : std::string("commit: failed or unknown session"));
+                    }
                     break;
                 }
                 case OP_CANCEL:
@@ -301,6 +362,10 @@ static void worker_loop(engine * eng) {
 
 // Reads one request frame, resolves the engine and queues it.
 static void reader_thread(int fd, std::vector<engine *> engines) {
+    const socket_ref connection(new int(fd), [](const int * socket) {
+        close(*socket);
+        delete socket;
+    });
     for (;;) {
         uint32_t head[3];
         if (!read_exact(fd, head, sizeof(head))) {
@@ -308,6 +373,7 @@ static void reader_thread(int fd, std::vector<engine *> engines) {
         }
         request req;
         req.fd = fd;
+        req.connection = connection;
         req.op = head[0];
         req.session = head[1];
         req.enqueued_ms = now_ms();
@@ -322,10 +388,8 @@ static void reader_thread(int fd, std::vector<engine *> engines) {
                 break;
             }
         } else if (bytes > 0) {
-            std::vector<uint8_t> discard(bytes);
-            if (!read_exact(fd, discard.data(), bytes)) {
-                break;
-            }
+            respond(fd, ST_ERROR, "control frame: unexpected payload");
+            break;
         }
         if (req.op == OP_OPEN) {
             // Pin the session to the least loaded engine that still has a slot.
@@ -347,19 +411,25 @@ static void reader_thread(int fd, std::vector<engine *> engines) {
             }
             {
                 std::lock_guard<std::mutex> lock(best->mutex);
-                best->live += 1; // reserve the slot; the worker creates the stream
+                if (best->live < best->max_sessions) {
+                    ++best->live;
+                    req.eng = best;
+                }
             }
-            req.eng = best;
+            if (!req.eng) {
+                respond(fd, ST_ERROR, "open: all streams busy");
+                continue;
+            }
             push(best, std::move(req));
             continue;
         }
         {
             std::lock_guard<std::mutex> lock(sessions_mutex);
             auto it = sessions.find(req.session);
-            if (it == sessions.end()) {
+            if (it == sessions.end() || it->second.connection.lock() != connection || it->second.expiring) {
                 if (req.op == OP_APPEND) {
                     fprintf(stderr, "xasr-server: append for unknown session, closing connection\n");
-                    close(fd);
+                    shutdown(fd, SHUT_RDWR);
                     return;
                 }
                 respond(fd, ST_ERROR, "unknown session");
@@ -370,12 +440,12 @@ static void reader_thread(int fd, std::vector<engine *> engines) {
         }
         push(req.eng, std::move(req));
     }
-    close(fd);
+    shutdown(fd, SHUT_RDWR);
 }
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s MODEL.gguf DEVICE [--port N] [--streams N] [--cpu-streams N] [--queue N] [--bind ADDR]\n", argv[0]);
+        fprintf(stderr, "usage: %s MODEL.gguf DEVICE [--port N] [--streams N] [--cpu-streams N] [--queue N] [--bind ADDR] [--chunk-scheduler]\n", argv[0]);
         return 1;
     }
     xasr_context_params params;
@@ -398,6 +468,8 @@ int main(int argc, char ** argv) {
             bind_addr = argv[++i];
         } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
             params.n_threads = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--chunk-scheduler") == 0) {
+            chunk_scheduler = true;
         } else if (std::strcmp(argv[i], "--joiner-host") == 0) {
             params.joiner_on_device = false;
         }
@@ -470,6 +542,8 @@ int main(int argc, char ** argv) {
         timeval tv{};
         tv.tv_sec = 60;
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        tv.tv_sec = 1;
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         std::thread(reader_thread, fd, raw).detach();
     }
     return 0;

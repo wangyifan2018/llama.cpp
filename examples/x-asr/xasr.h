@@ -47,9 +47,14 @@ const xasr_stats * xasr_stream_stats(const xasr_stream * stream);
 xasr_context * xasr_init_from_file(const char * path, xasr_context_params params);
 void xasr_free(xasr_context * context);
 
-// One active stream per context. Serialize calls on that context.
+// Up to n_streams active streams. Serialize calls on a context.
 // Audio is normalized mono PCM at 16 kHz.
 xasr_stream * xasr_stream_init(xasr_context * context);
 bool xasr_append(xasr_stream * stream, const float * samples, int count);
 bool xasr_commit(xasr_stream * stream, std::string & text);
+// Start an append or commit. While pending, only step or destroy this stream.
+// Other streams in the context can run between steps.
+enum class xasr_step_result { pending, done, error };
+bool xasr_begin_step(xasr_stream * stream, const float * samples, int count, bool commit);
+xasr_step_result xasr_step(xasr_stream * stream, std::string & text);
 void xasr_stream_free(xasr_stream * stream);
