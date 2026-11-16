@@ -52,8 +52,13 @@ struct request {
     int fd = -1;
     uint32_t op = 0;
     uint32_t session = 0;
+    double enqueued_ms = 0; // steady clock, for queue-wait accounting
     std::vector<float> audio;
 };
+
+static double now_ms() {
+    return std::chrono::duration<double, std::milli>(xasr_clock::now().time_since_epoch()).count();
+}
 
 static std::mutex queue_mutex;
 static std::condition_variable queue_ready;
@@ -105,6 +110,7 @@ static void reader_thread(int fd) {
         req.fd = fd;
         req.op = head[0];
         req.session = head[1];
+        req.enqueued_ms = now_ms();
         const uint32_t bytes = head[2];
         if (req.op == OP_APPEND) {
             if (bytes % sizeof(float) != 0 || bytes > 16000u * 4u * 60u) {
@@ -229,11 +235,12 @@ struct worker {
                     return;
                 }
                 const auto begin = xasr_clock::now();
+                const double queue_ms = now_ms() - req.enqueued_ms;
                 std::string text;
                 const bool ok = xasr_commit(s, text);
                 const double ms = std::chrono::duration<double, std::milli>(xasr_clock::now() - begin).count();
                 if (getenv("XASR_TIMING")) {
-                    fprintf(stderr, "xasr-server: commit session %u %.3f ms\n", req.session, ms);
+                    fprintf(stderr, "xasr-server: commit session %u queue_ms=%.3f commit_ms=%.3f\n", req.session, queue_ms, ms);
                 }
                 if (!ok) {
                     respond(req.fd, ST_ERROR, "commit: failed");

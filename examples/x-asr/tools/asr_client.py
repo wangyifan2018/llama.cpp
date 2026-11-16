@@ -7,6 +7,7 @@ long one keeps sending audio.
 """
 
 import argparse
+import json
 import socket
 import struct
 import sys
@@ -86,6 +87,7 @@ def run_session(args, samples, start, results, index, n_sessions):
         # Endpoint is the scheduled arrival of the last packet in paced mode, so a
         # backlog shows up in the number instead of hiding in the sender.
         endpoint_schedule = start + len(samples) / 16000.0 if args.paced else time.monotonic()
+        commit_sent = time.monotonic()
         status, body = client.call(OP_COMMIT, session)
         done = time.monotonic()
         if status != ST_FINAL:
@@ -96,6 +98,8 @@ def run_session(args, samples, start, results, index, n_sessions):
             "server_session": session,
             "audio_ms": len(samples) / 16.0,
             "endpoint_to_final_ms": (done - endpoint_schedule) * 1000.0,
+            "commit_rtt_ms": (done - commit_sent) * 1000.0,
+            "queue_ms": (commit_sent - endpoint_schedule) * 1000.0,
             "text": body.decode("utf-8", "replace"),
         }
         client.call(OP_CLOSE, session)
@@ -107,21 +111,30 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--wav", required=True)
+    parser.add_argument("--wav", help="one file for every session")
+    parser.add_argument("--wavs", help="comma separated, one per session (mixed lengths)")
     parser.add_argument("--sessions", type=int, default=1)
     parser.add_argument("--stagger-ms", type=int, default=0,
                         help="the last session keeps this much more audio")
     parser.add_argument("--paced", action="store_true")
     parser.add_argument("--reps", type=int, default=1)
+    parser.add_argument("--json", action="store_true", help="one JSON object per session and rep")
     args = parser.parse_args()
 
-    full = read_wav(args.wav)
+    if not args.wav and not args.wavs:
+        parser.error("give --wav or --wavs")
+    per_session = [read_wav(p) for p in args.wavs.split(",")] if args.wavs else None
+    full = read_wav(args.wav) if args.wav else None
+    if per_session and len(per_session) != args.sessions:
+        parser.error("--wavs needs one file per session")
     for rep in range(args.reps):
         results = [None] * args.sessions
         threads = []
         start = time.monotonic() + 0.05
         for i in range(args.sessions):
-            if args.stagger_ms and i < args.sessions - 1:
+            if per_session:
+                samples = per_session[i]
+            elif args.stagger_ms and i < args.sessions - 1:
                 samples = full[: max(0, len(full) - args.stagger_ms * 16)]
             else:
                 samples = full
@@ -132,10 +145,18 @@ def main():
             t.join()
         for row in results:
             if row is None or "error" in row:
-                print("rep=%d error=%s" % (rep, row))
+                if args.json:
+                    print(json.dumps({"rep": rep, "error": row}))
+                else:
+                    print("rep=%d error=%s" % (rep, row))
                 continue
-            print("rep=%d session=%d audio_ms=%.1f endpoint_to_final_ms=%.1f text=%s"
-                  % (rep, row["session"], row["audio_ms"], row["endpoint_to_final_ms"], row["text"]))
+            if args.json:
+                row["rep"] = rep
+                print(json.dumps(row, ensure_ascii=False))
+            else:
+                print("rep=%d session=%d audio_ms=%.1f endpoint_to_final_ms=%.1f commit_rtt_ms=%.1f text=%s"
+                      % (rep, row["session"], row["audio_ms"], row["endpoint_to_final_ms"],
+                         row["commit_rtt_ms"], row["text"]))
 
 
 if __name__ == "__main__":

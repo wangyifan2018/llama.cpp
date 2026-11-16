@@ -391,6 +391,38 @@ total work. The next step is encoder batching across streams, which needs a
 stream dimension through the attention and its per-stream left context; the
 feed-forward and convolution blocks can be widened without that.
 
+### M2. One-way audio and commit priority in the server (kept)
+
+**Bottleneck.** The first server version replied to every APPEND. At the endpoint
+four clients send COMMIT within a few milliseconds of each other, and the worker
+was a single FIFO: a commit queued behind another session's audio, and clients
+waited on an APPEND reply that the worker could not produce while it was inside
+someone else's commit. Measured single stream 185.9 ms and four aligned endpoints
+440 to 961 ms, against 169.6 and 683 in-process.
+
+**Change.** APPEND carries no reply. Audio is one way, backpressure is the
+bounded queue plus the socket, and an APPEND the engine rejects closes the
+connection instead of desynchronising the stream. The worker prefers a queued
+COMMIT: it drains that session's earlier APPENDs in order, then runs the commit,
+so per-session order holds and another session's audio cannot delay a finished
+utterance.
+
+**Result.** Single stream 167.3 ms p50 end to end against 169.6 in-process, and
+aligned four-way p50 638.3, p95 941.4 over 48 samples. The engine time inside
+those commits is p50 170.8 and p95 171.4, so the service adds no inference cost;
+what remains is queueing.
+
+**Not isolated.** Both changes landed together, so the numbers above are the pair.
+The reason to keep the priority rule is the split that the instrumentation now
+reports: queue wait p50 470.8 against commit p50 170.8 in the aligned case, and
+the rule is what keeps a commit from being pushed back by other sessions' audio.
+
+**What it does not cover.** FIFO among commits is still arrival order, there is
+no batching and no admission control, and throughput under free-running load is
+not measured. The queue is bounded at 64 requests, which is about 1.3 s of audio
+per session at 20 ms packets, so a long stall can still push a client into
+backpressure.
+
 ## Next experiments
 
 1. **Measure where the remaining tail goes.** In [`run_chunks`](xasr.cpp#L746) time feature and mask uploads, scheduled compute and completion, and encoder projection readback. In [`stream_accept`](xasr.cpp#L1018) time fbank, predictor/joiner, and text finalization. Tag each chunk with its phase (audio arrival or commit), sequence position, and number of DSP submissions. Collect a separate per-op profile using the [benchmark command](BENCHMARK.md#optional-htp-operator-profile). This distinguishes DSP kernel time from host submission and waiting. Compare CPU, HTP waiting, and HTP polling under both idle and representative CPU load.
