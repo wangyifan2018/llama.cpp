@@ -556,14 +556,14 @@ creation, slot release and the encoding of 35 s of audio per round.
 | Pass | Rounds | Sessions | endpoint p50 | p95 | p99 | max | peak RSS after | idle reaps |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | 1 | 40 | 160 | 234.5 | 425.9 | 778.6 | 810.3 | 316.8 MB | 0 |
-| 2 | 20 | 80 | see raw | | | | | 0 |
+| 2 | 20 | 80 | 232.6 | 452.4 | 727.1 | 878.5 | 316.8 MB | 0 |
 
-Pass 1 starts at 294.7 MB and ends at 316.8 MB. The per-stream p50 is balanced
-across the four slots (251, 253, 246, 168 ms), no session was reaped by the idle
-timeout, which means every client closed cleanly, and the server was still alive
-afterwards. The growth is kept under watch in pass 2: if it plateaus the extra
-resident memory is allocator retention for the 20 s session buffers rather than a
-leak, because each stream allocates its own PCM and feature vectors.
+Pass 1 starts at 294.7 MB and ends at 316.8 MB; pass 2 starts and ends at
+316.8 MB, so the extra 22 MB is allocator retention for the per-stream buffers
+(a 20 s session holds 1.3 MB of PCM and 0.7 MB of features), not a leak. The
+per-stream p50 is balanced across the four slots (251, 253, 246, 168 ms), no
+session was reaped by the idle timeout, which means every client closed cleanly,
+and the server was still alive after 240 sessions.
 
 Mixed lengths are much kinder than aligned endpoints: p95 here is 426 ms against
 941 ms for four aligned 2.65 s clips, because the endpoints naturally stagger and

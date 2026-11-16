@@ -68,7 +68,56 @@ adb -s "$ANDROID_SERIAL" shell -T 'cd /data/local/tmp/llama-x-asr &&
 
 `LD_LIBRARY_PATH` 用于 Android 进程加载共享库，`ADSP_LIBRARY_PATH` 用于 DSP 加载 v73 库。当前图的 HTP 验收日志应包含 `encoder HTP0:0 2877/2877 ops, 1 scheduler splits`。优化图后总节点数可能变化，检查已分配数等于总数，并和 CPU 对照转写。若找不到 `HTP0:0`，检查设备架构、库目录和 Hexagon 会话初始化日志。若出现 `CANNOT LINK EXECUTABLE`，先核对 Android ABI、报错中的共享库和构建包。若缺少 `libc++_shared.so`，使用同一构建 NDK 的 arm64 版本。
 
-## 4. 日常增量迭代
+## 4. 部署 ASR 服务端
+
+服务端是独立目标 `llama-x-asr-server`，与 CLI 共用同一份引擎。宿主机验证：
+
+```sh
+cmake --build build-x-asr --target llama-x-asr-server -j
+build-x-asr/bin/llama-x-asr-server x-asr-zh-en-q8_0.gguf CPU --port 8765 --streams 2
+```
+
+Android 上运行（HTP 引擎 2 路 + CPU 引擎 2 路，HTP 参数与 CLI 相同）：
+
+```sh
+adb -s "$ANDROID_SERIAL" shell -T 'cd /data/local/tmp/llama-x-asr &&
+    export LD_LIBRARY_PATH="$PWD/lib" ADSP_LIBRARY_PATH="$PWD/lib" &&
+    export GGML_HEXAGON_DEVICES=HTP0:0 GGML_HEXAGON_OPBATCH=2048 GGML_HEXAGON_OPPOLL=1 &&
+    nohup bin/llama-x-asr-server x-asr-zh-en-q8_0.gguf HTP0:0 \
+        --port 8765 --streams 2 --cpu-streams 2 --idle-ms 30000 \
+        > server.log 2>&1'
+
+adb -s "$ANDROID_SERIAL" forward tcp:8765 tcp:8765
+python3 examples/x-asr/tools/asr_client.py --port 8765 --wav zh.wav --sessions 4 --paced
+```
+
+启动日志应包含每个引擎一行 `engine HTP0:0 with 2 streams` / `engine CPU with 2 streams`，以及 `idle timeout 30000 ms, listening on 0.0.0.0:8765`。客户端日志逐路给出 `endpoint_to_final_ms` 与转写。
+
+协议、队列与背压、超时语义见 [README.md](README.md#asr-server)；端到端与分位数见 [BENCHMARK.md](BENCHMARK.md#server-end-to-end)。端到端通路自检：
+
+```sh
+MODEL=x-asr-zh-en-q8_0.gguf examples/x-asr/tools/server_smoke.sh "zh.wav en.wav" CPU
+```
+
+识别质量自检（宿主机 TTS 合成 24 条带标注命令，输出 CER/WER）：
+
+```sh
+examples/x-asr/tools/make_eval_pack.sh /tmp/eval-pack
+sed 's/-snr10\.wav/.wav/' /tmp/eval-pack/manifest.tsv > /tmp/eval-pack/manifest-clean.tsv
+python3 examples/x-asr/tools/eval_cer.py --manifest /tmp/eval-pack/manifest-clean.tsv \
+    --model x-asr-zh-en-q8_0.gguf --device CPU --label "CPU default"
+```
+
+服务指标采样（固定到达序列、分位数）：
+
+```sh
+python3 examples/x-asr/tools/bench_service.py --port 8765 --reps 12 \
+    --short zh.wav --long zh-10.wav --long2 en-20.wav --out /tmp/svc.jsonl
+python3 examples/x-asr/tools/bench_service.py --port 8765 --throughput --concurrency 1,2,4 \
+    --short zh.wav --long zh-10.wav --long2 en-20.wav
+```
+
+## 5. 日常增量迭代
 
 首次完整部署后，只修改 `examples/x-asr` 时，可在同一镜像、同一容器路径下重用 CMake 构建目录，并只更新可执行文件。
 
