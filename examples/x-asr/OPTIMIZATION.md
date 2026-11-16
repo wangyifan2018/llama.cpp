@@ -423,6 +423,51 @@ not measured. The queue is bounded at 64 requests, which is about 1.3 s of audio
 per session at 20 ms packets, so a long stall can still push a client into
 backpressure.
 
+### M3. Hybrid engines, device plus CPU (kept)
+
+**Bottleneck.** M2's instrumentation showed where the four-way tail lives: with
+aligned endpoints the engine time inside a commit is p50 170.8 ms and the queue
+wait is p50 470.8, p95 775.2. That queue is not protocol overhead, it is the
+single worker spending time inside another stream's commit while the eight CPU
+cores are idle.
+
+**Hypothesis.** The device DSP and the CPU are separate processors. If two
+streams commit on the DSP while two commit on the CPU, the four-way tail should
+drop toward half even though each commit is no faster.
+
+**Change.** The server now holds one engine per backend, each with its own worker
+thread, request queue and stream slots. OPEN is pinned to the least loaded engine
+that has a free slot; everything after that is dispatched to that engine's queue.
+The engine itself is unchanged, so the CPU engine loads its own copy of the
+weights.
+
+**Reproduce.**
+
+```sh
+# device, both configurations back to back
+adb shell -T "cd /data/local/tmp/llama.cpp && export LD_LIBRARY_PATH=\$PWD/lib \
+  ADSP_LIBRARY_PATH=\$PWD/lib GGML_HEXAGON_DEVICES=HTP0:0 GGML_HEXAGON_OPBATCH=2048 \
+  GGML_HEXAGON_OPPOLL=1 && bin/llama-x-asr-server x-asr-zh-en-q8_0.gguf HTP0:0 \
+  --port 18765 --streams 4 --cpu-streams 2"
+python3 examples/x-asr/tools/bench_service.py --port 18765 --reps 8 \
+  --short zh.wav --long zh-10.wav --long2 en-20.wav --scenarios aligned4,single
+```
+
+**Result.** Aligned four-way, 8 repetitions (N=32): p50 636.5 to 302.2 ms, p95
+944.0 to 433.0 ms. Single stream 166.5 to 165.0 ms. Peak RSS 112 to 313 MB
+because the CPU engine holds a second weight copy. The server log shows 24
+commits on the device engine and 16 on the CPU engine in the hybrid run, and the
+transcripts are identical across engines.
+
+**What it does not cover.** The 2+2 split is fixed. It is the natural split for
+four equal streams because both engines then carry two commits, but a burst of
+short utterances, a long recording plus three commands, or a run where the CPU is
+already busy with feature extraction will not balance. Admission control that
+picks the engine per arrival, and a split derived from the observed arrival
+pattern, are the next step. The CPU engine also steals cycles from the predictor
+and the feature extractor that run inside the device engine's commits, which the
+numbers above already include.
+
 ## Next experiments
 
 1. **Measure where the remaining tail goes.** In [`run_chunks`](xasr.cpp#L746) time feature and mask uploads, scheduled compute and completion, and encoder projection readback. In [`stream_accept`](xasr.cpp#L1018) time fbank, predictor/joiner, and text finalization. Tag each chunk with its phase (audio arrival or commit), sequence position, and number of DSP submissions. Collect a separate per-op profile using the [benchmark command](BENCHMARK.md#optional-htp-operator-profile). This distinguishes DSP kernel time from host submission and waiting. Compare CPU, HTP waiting, and HTP polling under both idle and representative CPU load.

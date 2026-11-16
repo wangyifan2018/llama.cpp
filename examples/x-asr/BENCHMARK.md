@@ -349,6 +349,31 @@ against 169.6 ms in-process. The tail in the concurrent scenarios is capacity,
 not latency, and the next lever is throughput of the shared encoder, not a
 faster commit.
 
+### Hybrid engines
+
+The queue wait above is time the single worker spends inside another stream's
+commit, while the device CPU sits idle. `--cpu-streams N` adds a second engine
+on the CPU backend with its own worker and queue, and sessions are pinned at
+OPEN to the least loaded engine that still has a slot.
+
+Eight paced repetitions per row, aligned four-way (N=32) and single (N=8):
+
+| Engines | aligned4 p50 | p95 | single p50 | peak RSS | commits HTP / CPU |
+|---|---:|---:|---:|---:|---:|
+| HTP x4 | 636.5 | 944.0 | 166.5 | 112 MB | 40 / 0 |
+| HTP x2 + CPU x2 | 302.2 | 433.0 | 165.0 | 313 MB | 24 / 16 |
+
+Halving the worst case comes from using a second processor, not from faster
+inference: the engine time per commit is unchanged. The cost is a second copy of
+the weights for the CPU engine, about 200 MB of host memory, and the CPU engine
+competes with feature extraction and the predictor in the same process.
+
+The 2+2 split is the one measured. With four aligned streams the HTP engine does
+two commits (about 324 ms) and the CPU engine two (about 300 ms), which is why
+they finish together. A 3+1 or 1+3 split would leave one engine holding twice the
+work. Choosing the split from the arrival pattern is admission control, and it is
+not implemented.
+
 Peak RSS is 61 MB with one slot and 112 MB with four. Throughput was not
 measured under free-running load: every scenario above is paced at real time,
 so the numbers show latency under a given arrival pattern, not capacity. Both

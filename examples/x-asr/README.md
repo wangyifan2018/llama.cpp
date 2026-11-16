@@ -46,7 +46,17 @@ model-specific streaming ASR engine with its own frame protocol.
 cmake --build build-x-asr --target llama-x-asr-server -j
 build-x-asr/bin/llama-x-asr-server x-asr-zh-en-q8_0.gguf CPU --port 8765 --streams 4
 python3 examples/x-asr/tools/asr_client.py --port 8765 --wav zh.wav --sessions 4 --paced
+
+# Device engine with two slots plus a CPU engine with two slots.
+build-x-asr/bin/llama-x-asr-server x-asr-zh-en-q8_0.gguf HTP0:0 \
+    --port 8765 --streams 2 --cpu-streams 2
 ```
+
+`--cpu-streams N` starts a second engine on the CPU backend with its own worker
+thread and slots. Sessions are pinned at OPEN to the least loaded engine that has
+a free slot, so a burst of simultaneous endpoints is split across both
+processors. It costs a second copy of the weights, about 200 MB, and halves the
+four-way tail (see [BENCHMARK.md](BENCHMARK.md#hybrid-engines)).
 
 On Android, run the daemon on the device and forward the port:
 
