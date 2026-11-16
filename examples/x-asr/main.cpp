@@ -14,6 +14,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <thread>
@@ -67,9 +68,13 @@ int main(int argc, char ** argv) {
             return 3;
         }
         const std::unique_ptr<ma_decoder, decltype(&ma_decoder_uninit)> audio(&wav, ma_decoder_uninit);
+        const auto stream_begin = xasr_clock::now();
         const std::unique_ptr<xasr_stream, decltype(&xasr_stream_free)> stream(xasr_stream_init(model.get()), xasr_stream_free);
         if (!stream) {
             return 4;
+        }
+        if (std::getenv("XASR_TIMING")) {
+            fprintf(stderr, "xasr: stream init %.2f ms\n", std::chrono::duration<double, std::milli>(xasr_clock::now() - stream_begin).count());
         }
         const double cpu_begin = process_cpu_ms();
         const auto start = xasr_clock::now();

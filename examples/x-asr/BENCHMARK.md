@@ -191,6 +191,24 @@ reason the ONNX row is a latency reference and not a candidate deployment.
 side: character error 1.9%, 0%, 6.7%, 7.9% on the four release fixtures when only
 the weight precision differs.
 
+### Startup and per-stream cost
+
+`xasr: init` is model load plus graph allocation, `xasr: stream init` is one
+stream creation. Measured on the current build with `XASR_TIMING=1`, one process
+per row, two streams created back to back in that process.
+
+| Stage | HTP polling | CPU |
+|---|---:|---:|
+| model init (cold) | 777.6 ms | 228.3 ms |
+| first stream | 1.00 ms | 1.92 ms |
+| second stream | 0.61 ms | 0.52 ms |
+
+Stream creation clears 4,148,736 bytes of encoder state, so the per-request
+reset is under 2 ms and per-stream state is 4 MB. For a server the constraint is
+therefore memory and DSP residency, not the reset cost. HTP pays about 550 ms
+more on the first request because the model, the tiled weight repack and the
+graph allocation all land on the DSP.
+
 ### Limitations
 
 - N=3 per cell. The P95 column is a maximum, not a percentile. Phase 3 owns the

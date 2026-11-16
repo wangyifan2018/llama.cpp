@@ -171,6 +171,32 @@ instead of padding. Both need a text-parity harness that runs many endpoint
 phases; `tools/make_tail_fixtures.py` already generates the phase-shifted and
 truncated clips for it.
 
+### H4. Backend parameter sweep (no change kept)
+
+**Question.** After H2 the chunk is 2,531 DSP ops. OPBATCH 2048 splits it into
+2,048 + 483, so the host can hand the second batch over while the DSP is already
+running the first. A larger limit removes the split; a smaller one adds more
+overlap points but more submissions.
+
+**Sweep.** Same build, `GGML_HEXAGON_OPPOLL=1`, two fixtures, two or three
+paced repetitions per cell. Medians of the flush time in milliseconds.
+
+| OPBATCH | burst | sustained_high_performance | high_performance | batches per chunk |
+|---:|---:|---:|---:|---:|
+| 512 | 187.9 (277.1 outlier) | | | 6 |
+| 1,024 | 189.6 | | | 3 |
+| 1,536 | 186.7 | | | 2 |
+| 2,048 | 187.4 | 188.6 | 187.7 | 2 |
+| 3,072 | 195.6 | | | 1 |
+| 4,096 | 193.9 | 194.4 | | 1 |
+
+**Result.** No change. 1,536 is within the 1-2 ms run-to-run spread of 2,048,
+and 512 showed one 277 ms outlier, so it is less stable. 3,072 and 4,096 are
+consistently 4-8 ms slower, which supports the overlap reading: with a single
+batch the DSP cannot start until the host has finished enqueuing, while with
+2,048 the first batch is already running. The power profile makes no measurable
+difference on this SoC. The documented default stays OPBATCH 2048 and burst.
+
 ## Next experiments
 
 1. **Measure where the remaining tail goes.** In [`run_chunks`](xasr.cpp#L746) time feature and mask uploads, scheduled compute and completion, and encoder projection readback. In [`stream_accept`](xasr.cpp#L1018) time fbank, predictor/joiner, and text finalization. Tag each chunk with its phase (audio arrival or commit), sequence position, and number of DSP submissions. Collect a separate per-op profile using the [benchmark command](BENCHMARK.md#optional-htp-operator-profile). This distinguishes DSP kernel time from host submission and waiting. Compare CPU, HTP waiting, and HTP polling under both idle and representative CPU load.
