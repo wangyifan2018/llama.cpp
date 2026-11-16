@@ -432,6 +432,57 @@ the per-request rows are the ones to read.
 
 Peak RSS for the hybrid server is 313 MB, measured on the device.
 
+## Recognition quality
+
+Twenty-four cabin commands, twelve Mandarin and twelve English, rendered with the
+host speech synthesiser and labelled by their input text
+(`tools/eval_texts.tsv`, `tools/make_eval_pack.sh`, `tools/eval_cer.py`). CER is
+character level for Mandarin, WER is word level for English, both after removing
+punctuation and spaces. One run per configuration over the same 24 files.
+
+| Configuration | zh CER | en WER | clips with errors | clips with a special token |
+|---|---:|---:|---:|---:|
+| CPU, defaults | 36.79% | 6.58% | 12/24 | 9 |
+| CPU, ConvNeXt in F32 | 38.68% | 6.58% | 12/24 | 0 |
+| CPU, joiner on the host | 36.79% | 6.58% | 12/24 | 0 |
+| HTP, polling | 36.79% | 6.58% | 12/24 | 0 |
+
+What the table says:
+
+- Quantising the ConvNeXt projections (H6) costs nothing measurable: 36.79%
+  against 38.68% is one clip, in the direction of the quantised build.
+- Moving the joiner to the device (H5) costs nothing measurable: identical
+  character error on both backends.
+- English is good on this set, 6.6% WER, five word errors in 76.
+- Mandarin is dominated by the synthesiser voice, not by the engine: the errors
+  are systematic confusions on one voice (请导航 heard as 请老黄, 把车内温度 heard
+  as 老车里温度) that repeat across every configuration. This set cannot rank
+  model variants for Mandarin; it can only show that a change does not make
+  things worse.
+
+Two artefacts worth knowing:
+
+- The CPU device-joiner combination emitted a literal `<sos/eos>` token on 9 of
+  24 clips; the host joiner and the HTP joiner emitted none. The evaluator strips
+  the token and counts it separately. It appears only on clips that end in
+  silence.
+- Clips that end in silence used to gain a trailing character (轮) from the
+  padding chunks. Flooring the BiasNorm sum removed the NaN that caused it and
+  the trailing token mostly disappeared, but the decode of a silence tail is
+  still the least stable part of the pipeline.
+
+The noisy variant of this set is not usable yet: mixing a cabin recording at
+equal weight made the speech unintelligible and every clip collapsed to the same
+hypothesis. A level-calibrated mix is a separate piece of work.
+
+Reproduce:
+
+```sh
+NOISE= examples/x-asr/tools/make_eval_pack.sh /tmp/eval-pack
+python3 examples/x-asr/tools/eval_cer.py --manifest /tmp/eval-pack/manifest-clean.tsv \
+    --model x-asr-zh-en-q8_0.gguf --device CPU --label "CPU default"
+```
+
 ## Reproduce on Android
 
 Run these blocks from the repository root in the same Bash session. The [Snapdragon toolchain guide](../../docs/backend/snapdragon/README.md) covers Docker and ADB setup. Set `ANDROID_SERIAL` if several devices are attached.

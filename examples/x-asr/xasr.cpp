@@ -460,6 +460,10 @@ ggml_tensor * swoosh_r(ggml_context * g, ggml_tensor * x) {
 ggml_tensor * bias_norm(ggml_context * g, ggml_tensor * x, ggml_tensor * bias, float scale) {
     ggml_tensor * centered = ggml_sub(g, x, bias);
     ggml_tensor * sum = ggml_sum_rows(g, ggml_sqr(g, centered));
+    // Silence drives the mean square to zero and the division to NaN, which
+    // turns the logits into noise and makes the argmax depend on rounding. Floor
+    // the sum; for speech the term is below float resolution of the sum.
+    sum = ggml_clamp(g, sum, 1e-6f, INFINITY);
     ggml_tensor * denom = ggml_reshape_1d(g, sum, ggml_nelements(sum));
     denom = ggml_reshape_2d(g, ggml_sqrt(g, denom), 1, x->ne[1]);
     return ggml_scale(g, ggml_div(g, x, denom), scale * std::sqrt(float(x->ne[0])));
