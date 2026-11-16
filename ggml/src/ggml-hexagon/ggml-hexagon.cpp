@@ -336,6 +336,12 @@ struct ggml_hexagon_session {
     uint64_t                cached_uid = 0;
     std::vector<htp_opnode> cached_nodes;
 
+    // Host-side cost of handing a batch to the DSP and of collecting its
+    // completion. Read by ggml_backend_hexagon_get_stats.
+    double   stat_submit_ms = 0;
+    double   stat_wait_ms   = 0;
+    uint64_t stat_batches   = 0;
+
     ggml_hexagon_mdev_group                mdev;
     ggml_backend_dev_t                     dev       = nullptr;
     ggml_backend_hexagon_device_context *  dev_ctx   = nullptr;
@@ -1761,6 +1767,7 @@ void ggml_hexagon_session::flush_async() {
 }
 
 void ggml_hexagon_session::flush_pending(bool all) {
+    const auto wait_begin = std::chrono::steady_clock::now();
     for (auto & sub : this->mdev.sessions) {
         sub->flush_pending(all);
         if (sub->last_error > HTP_STATUS_OK) {
@@ -1808,6 +1815,9 @@ void ggml_hexagon_session::flush_pending(bool all) {
 
         if (!all) break;
     }
+
+    this->stat_wait_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - wait_begin).count();
 }
 
 void ggml_hexagon_session::flush_sync(bool all) {
@@ -1823,6 +1833,8 @@ void ggml_hexagon_session::start_batch() {
 
 void ggml_hexagon_session::flush_batch(size_t min_ops) {
     if (op_batch->n_ops < min_ops) { return; }
+
+    const auto submit_begin = std::chrono::steady_clock::now();
 
     op_batch->sort_buffers();
     this->mmap_buffers();
@@ -1865,6 +1877,10 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
     if (err != 0) {
         GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x\n", this->c_name(), (unsigned) err);
     }
+
+    this->stat_submit_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - submit_begin).count();
+    this->stat_batches += 1;
 
     op_batch->reset();
 }
@@ -3386,8 +3402,18 @@ static ggml_backend_buffer_type_t ggml_backend_hexagon_split_buffer_type(int mai
     return &dev_ctx->buffer_type;
 }
 
+static void ggml_backend_hexagon_get_stats(ggml_backend_t backend, double * submit_ms, double * wait_ms, uint64_t * batches) {
+    auto sess = static_cast<ggml_hexagon_session *>(backend->context);
+    *submit_ms = sess->stat_submit_ms;
+    *wait_ms   = sess->stat_wait_ms;
+    *batches   = sess->stat_batches;
+}
+
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_hexagon_get_stats") == 0) {
+        return (void *) ggml_backend_hexagon_get_stats;
+    }
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
         return (void *) ggml_backend_hexagon_split_buffer_type;
     }

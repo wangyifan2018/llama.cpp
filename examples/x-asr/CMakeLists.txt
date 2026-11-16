@@ -1,0 +1,5 @@
+add_executable(llama-x-asr main.cpp xasr.cpp kaldi-fbank.cpp)
+target_compile_features(llama-x-asr PRIVATE cxx_std_17)
+target_include_directories(llama-x-asr SYSTEM PRIVATE ${PROJECT_SOURCE_DIR}/vendor)
+target_link_libraries(llama-x-asr PRIVATE ggml Threads::Threads ${CMAKE_DL_LIBS})
+install(TARGETS llama-x-asr RUNTIME)
