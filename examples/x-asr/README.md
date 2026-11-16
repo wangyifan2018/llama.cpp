@@ -108,8 +108,13 @@ one COMMIT at its endpoint. The server returns only final text.
 - COMMIT has priority: when one is queued, that session's earlier APPENDs are
   drained and run first, then the commit. Other sessions' audio cannot delay a
   finished utterance, and per-session order is preserved.
-- There is no idle eviction yet. A client that disconnects without CLOSE still
-  releases its slot.
+- A client that disconnects without CLOSE is reaped by the idle timeout.
+- Degenerate input: an all-zero segment drives the encoder normalisation to zero
+  variance and the logits to NaN. The decoder now clamps an out of range argmax
+  to blank, so the process survives, but the transcript for such a segment is
+  not meaningful: a 2 s silent clip returns empty text, while 20 ms of digital
+  silence returned a stray token on one backend and nothing on the other. Real
+  VAD segments carry noise; this is a guard, not a supported input class.
 
 ### Verification
 
