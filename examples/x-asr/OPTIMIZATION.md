@@ -131,6 +131,11 @@ host work. Text is unchanged on both fixtures and on every paced run.
 
 **What it does not cover.** Only the broadcast-bias case is enabled. HMX
 devices keep the old guard; the fused solver has not been measured there.
+Removing the guard entirely, so that a full residual tensor may fuse, was tried
+and changed nothing: the DSP op count and the profile stayed at 5,684 ADD ops,
+so the fused solver rejects the residual shape on its own. That path is closed
+until the solver or the kernel is extended, and it should not be retried as a
+one-line change.
 Two-thirds of the remaining DSP time is still in small ops: 585 CONT, 115 CPY,
 240 SCALE and 99 SOFTPLUS per chunk, 7.8 + 5.7 + 3.0 + 3.0 ms. Those are the
 next HTP target, together with the two f32 ConvNeXt projections, which run at
