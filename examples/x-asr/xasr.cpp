@@ -1064,7 +1064,7 @@ bool greedy_run_dev(xasr_context * c, greedy_state & gs, const float * enc, int 
         st->joiner_dev_ms += span_ms(t);
         ++st->joiner_dev_calls;
         const int start = f;
-        for (; f < n_enc; ++f) {
+        for (; f < start + n; ++f) {
             int best = idx[(size_t) (f - start)];
             // A degenerate input (digital silence) drives the normalisation to
             // NaN, and the argmax of NaN logits is not a valid token id.
