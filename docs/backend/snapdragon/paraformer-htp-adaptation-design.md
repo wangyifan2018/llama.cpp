@@ -411,7 +411,53 @@ RECOGNIZE 作为独立任务入队并等 `std::future`；两个 worker（各绑�
 - 延迟：偏置是 argmax 内一次数组读，base/bias p50 253.9/252.9 ms（噪声内，零开销）。
 
 ### 13.4 边界与遗留
-- 只能修整词功能词；`seat→seed` 等 BPE 名词混淆需另一条路（词典式 ITN / 重训），本批不碰。
+- 只能修整词功能词；`seat→seed` 等 BPE 名词混淆由 §14 的前缀条件偏置处理。
 - gain 是全局作用于所有 CIF 位置的：`set`=3.2 之所以安全，是因为 `set`/`said` 在句中其他位置
   的 gap 均 >8（见 13.1 全位置 dump），3.2 不足以误伤。换词表/模型必须重新量全位置 gap。
 - 未做：hardneg/controls 独立包对拍（本夹具 negative_clips=0），上线前应补；第三引擎可行性。
+
+## 14. M6 实测：BPE 词尾的条件偏置（2026-11-17，SM6650）
+
+### 14.1 什么能修、什么不能修——由 BPE token 数决定
+§13 之后残余 8 条失败里 5 条是英文名词 BPE 混淆。查词表 + dump 得出一条硬判据：
+
+**只有当正确词与错误词的 BPE token 数相同、且只差最后一个 token 时，logit 偏置才能修。**
+
+| 错误→正确 | BPE 路径 | token 数 | 词尾 gap | 可修 |
+|---|---|---:|---:|---|
+| `seed`→`seat` | `se@@ ed` → `se@@ at` | 2→2 | at vs ed = 3.26–3.46 | **是** |
+| `footwall`→`footwell` | `t@@ w@@ all`(3) → `t@@ well`(2) | 3→需删 1 | well vs all = 3.86 | 否（需删 token） |
+| `likes`→`lights` | `li@@ kes`(2) → `li@@ ght s`(3) | 2→需加 1 | ght vs kes = 9.82 | 否（需加 token + gap 大） |
+
+`footwell`/`lights` 不是 logits 能解决的——需要 token 插入/删除，属另一类机制（重训或
+token-level 编辑，与 NAR argmax 无关）。这是为什么文本层 ITN 也危险：它会在 `footwwell`
+这种 BPE 拼接处制造新错误（实测：直接给 `w@@>well` 加成得到 `footwwell`，因为多出的 `w@@`
+仍在）。因此本批**不改文本层**，只在解码层做 token 数相同的替换。
+
+### 14.2 前缀条件偏置（prefix-conditional gain）
+全局给 `at` 加成会污染所有 `at`，故新增第二种热词格式：`<gain> <prefix>><token>`，
+仅当**上一个已选 token == prefix** 时才给当前位置的 target 加成。NAR 循环里维护 `prev_token`
+即可，无需自回归。`se@@` 在词表里是单 token 且几乎只出现在 `seat`，规则极窄。
+
+### 14.3 结果（宿主 CPU + SM6650 HTP 一致）
+在 §13 的 `3.2 set / 1.5 two` 之上加 `3.8 se@@>at`，全 32 条仅 2 条转写改变
+（seat_en03 `seed→seat`、seat_en04 `seed→seat`），零回退、零误触发：
+
+| 指标 | §13 (M5) + 标点 | §14 (M6) + 标点 |
+|---|---:|---:|
+| 命令字段 | 75.0% (24/32) | **78.1% (25/32)** |
+| device / state / clause | 78.6% | 83.3% |
+| en WER | 9.92% | 8.40% |
+| zh CER | 0.60% | 0.60% |
+
+命令字段只 +1 条：seat_en03 的 value（`level one`）此前因 device 字段解析失败被连带丢弃，
+修 seat 后整条命令通过；seat_en04 因 `massaician` 粘连仍失败。HTP 真机 A/B：两条 `seed→seat`
+均生效，`footwall` clip 不受影响。延迟开销仍在噪声内。
+
+### 14.4 边界与遗留
+- 前缀条件偏置依赖"正确/错误 BPE token 数相同"，这是一条可复用的判据：先 dump 两条 BPE 路径
+  和词尾 gap，再决定是否加成；token 数不同就不要碰。
+- `se@@>at` 安全是因为 `se@@` 几乎唯一对应 seat；换词表要重新确认前缀的歧义度。
+- 残余失败（hardneg 未验）：`footwall/likes/reevent/and` 名词粘连、`driversee peater`/
+  `massaician` 双错粘连、中文「掉/调」同音、标点插错位。这些要么需重训 / token 编辑，
+  要么属后处理层，且 hardneg 陈述句易误触发，不在解码偏置范围。上线前应补独立包对拍。

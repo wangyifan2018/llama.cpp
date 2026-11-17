@@ -1,7 +1,18 @@
-# Paraformer NAR whole-word logit bias for cabin English commands.
-# Gains measured 2026-11-17 (SM6650 / host CPU) with PF_DUMP_LOGITS; see design
-# doc §13. Only single-token words; BPE-fragment nouns cannot be biased here.
-# said->set gap 2.89-3.00 ; too->two gap 0.96.
-# 'and' (gap 4.16, also perturbs a neighbouring 'on') is intentionally excluded.
+# Paraformer NAR logit bias for cabin English confusables (measured 2026-11-17,
+# SM6650 + host CPU). Two forms:
+#   <gain> <token>            global gain at every CIF position
+#   <gain> <prefix>><token>   conditional: only when previous token == prefix
+# Only single tokens / BPE tails; see design doc §13-14.
+
+# --- §13 whole-word: single-token words, gap measured by PF_DUMP_LOGITS ---
+# said->set 2.89-3.00 ; too->two 0.96.
 3.2 set
 1.5 two
+# 'and' (gap 4.16, also perturbs a neighbouring 'on') is intentionally excluded.
+
+# --- §14 BPE-tail: same token count, so a tail swap is biassable ---
+# seat = se@@ + at ; wrong "seed" = se@@ + ed ; at-vs-ed gap 3.26-3.46.
+# 'se@@' is a single vocab token and is almost always "seat", so the rule is
+# narrow. Footwell/lights have a different BPE token COUNT than the error and
+# cannot be fixed by a logit bias (they need token insertion/deletion).
+3.8 se@@>at

@@ -34,30 +34,36 @@ omit it for pure CPU. `--timestamps` also exposes CIF fire frames through
 `paraformer_transcribe_with_timestamps()` (currently only the char count is
 printed by the CLI).
 
-### Whole-word logit bias (off by default)
+### Whole-word / prefix-conditional logit bias (off by default)
 
-`--hotwords FILE` applies a fixed logit gain to whole-word tokens in the NAR
-decoder's argmax. File format is `<gain> <token>` per line (`#` comments OK),
-gain in [0,5], token must exist verbatim in the GGUF vocab. Only single-token
-words are biassable (`set`, `said`, `two`, `too`, `and`, `in`); BPE-fragment
-words (`seat`, `footwell`) are not. Without the flag the baseline is bit-identical.
+`--hotwords FILE` applies a fixed logit gain in the NAR decoder's argmax. Two
+line forms (`#` comments OK, gain in [0,5], tokens must exist in the GGUF vocab):
+
+```text
+<gain> <token>              global gain at every CIF position
+<gain> <prefix>><token>     conditional: only when previous token == prefix
+```
+
+The second form handles BPE word-tail swaps, and works only when the right and
+wrong words have the **same token count** and differ in the last token —
+`se@@ ed`→`se@@ at` ("seed"→"seat") works; `footwall`→`footwell` (3→2 tokens)
+and `likes`→`lights` (2→3) cannot be fixed by a bias. Without the flag the
+baseline is bit-identical. `hotwords_vehicle.txt` ships the recommended config:
 
 ```sh
-cat > hotwords.txt <<'EOF'
-3.2 set
-1.5 two
-EOF
-llama-paraformer MODEL.gguf WAV --hotwords hotwords.txt [--device HTP0:0]
+llama-paraformer MODEL.gguf WAV --hotwords hotwords_vehicle.txt [--device HTP0:0]
 ```
 
 `--dump-logits N` prints the top-5 logits (with gain applied) at the first N CIF
 positions; `PF_WATCH_TOKENS=a,b` (env) appends the exact gap of named tokens.
 Use these to measure the gap a bias must overcome before picking a gain — on
-this model `said→set` is 2.89–3.00 and `too→two` is 0.96, while `in→and` is 4.16
-and also disturbs a neighbouring position, so it is deliberately excluded.
-See design doc §13 for the full A/B: with `3.2 set / 1.5 two` plus the existing
-punctuation layer, the cabin command field goes 68.8% → **75.0%** (matching the
-x-asr baseline), en WER 12.21% → 9.92%, no regressions, zero false triggers.
+this model `said→set` is 2.89–3.00, `too→two` 0.96, `se@@+ed→at` 3.26–3.46,
+while `in→and` is 4.16 and also disturbs a neighbouring position, so excluded.
+
+With the existing punctuation layer, the 32-clip cabin command field goes
+68.8% → 75.0% (§13, matching x-asr) → **78.1%** (§14, adding `3.8 se@@>at`);
+en WER 12.21% → 8.40%, zh CER unchanged, no regressions or false triggers.
+See design doc §13–14.
 
 ## Status (2026-11-17, host CPU, Q8_0)
 

@@ -163,6 +163,12 @@ struct paraformer_context {
     // entry adds a fixed gain to one token id at every CIF position (NAR has
     // no autoregressive prefix, so no head/prefix weighting is possible).
     std::vector<float> hotword_bonus; // size == vocab_size, 0 where unbiased
+    // §13: prefix-conditional bias for BPE-fragment nouns. Rule applies gain to
+    // `target` at position n only when the token emitted at n-1 was `prefix`.
+    // e.g. se@@ -> at turns "se@@ ed" (seed) into "se@@ at" (seat), without
+    // globally boosting `at` everywhere (which would corrupt other words).
+    struct SeqRule { int prefix, target; float gain; };
+    std::vector<SeqRule> hotword_seq;
     int hotword_count = 0;
     bool hotword_loaded = false;
 
@@ -241,6 +247,23 @@ static void paraformer_load_hotwords(paraformer_context* ctx) {
         const std::string tok(tokbuf);
         if (gain <= 0.0f || gain > 5.0f || !std::isfinite(gain)) {
             fprintf(stderr, "paraformer: hotword gain out of range [0,5]: %s\n", text.c_str());
+            continue;
+        }
+        // Two forms:
+        //   "<gain> <token>"          global bias at every position (existing)
+        //   "<gain> <prefix>><token>" conditional: only when previous token==prefix
+        // The '>' form targets BPE word-tail fragments (se@@>at for "seat").
+        const size_t arrow = tok.find('>');
+        if (arrow != std::string::npos && arrow > 0 && arrow + 1 < tok.size()) {
+            const std::string pfx = tok.substr(0, arrow);
+            const std::string tgt = tok.substr(arrow + 1);
+            const int pid = find_token(pfx), tid = find_token(tgt);
+            if (pid < 0 || tid < 0) {
+                fprintf(stderr, "paraformer: seq hotword token not in vocab: '%s'\n", tok.c_str());
+                continue;
+            }
+            ctx->hotword_seq.push_back({ pid, tid, gain });
+            ++ctx->hotword_count;
             continue;
         }
         const int id = find_token(tok);
@@ -1125,21 +1148,36 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     // §13: optional diagnostics — how many positions to dump top-K logits at.
     const char* dump_env = std::getenv("PF_DUMP_LOGITS");
     const int dump_n = dump_env ? std::atoi(dump_env) : 0;
-    const bool apply_bias = !ctx->hotword_bonus.empty();
+    const bool apply_bias = !ctx->hotword_bonus.empty() || !ctx->hotword_seq.empty();
     std::vector<float> biased_row; // only allocated when dumping with bias on
     if (dump_n > 0 && apply_bias)
         biased_row.resize(V);
 
     std::string result;
     bool prev_was_bpe_cont = false; // true if previous token ended with @@
+    int prev_token = -1;            // §13: token chosen at n-1, for seq rules
     for (int n = 0; n < N_tokens; n++) {
         const float* row = logits_data.data() + (size_t)n * V;
+        // §13: prefix-conditional gains for this position (depends on prev token).
+        std::vector<std::pair<int, float>> seq_here;
+        if (apply_bias && prev_token >= 0) {
+            for (const auto& r : ctx->hotword_seq)
+                if (r.prefix == prev_token)
+                    seq_here.push_back({ r.target, r.gain });
+        }
+        auto bias_of = [&](int v) -> float {
+            float b = ctx->hotword_bonus.empty() ? 0.0f : ctx->hotword_bonus[(size_t) v];
+            for (const auto& kv : seq_here)
+                if (kv.first == v)
+                    b += kv.second;
+            return b;
+        };
         int best = 0;
         float best_val = -1e30f;
         for (int v = 0; v < V; v++) {
             float val = row[v];
             if (apply_bias)
-                val += ctx->hotword_bonus[(size_t) v];
+                val += bias_of(v);
             if (val > best_val) {
                 best_val = val;
                 best = v;
@@ -1148,12 +1186,13 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
         if (dump_n > 0 && n < dump_n) {
             if (apply_bias) {
                 for (int v = 0; v < V; ++v)
-                    biased_row[(size_t) v] = row[v] + ctx->hotword_bonus[(size_t) v];
+                    biased_row[(size_t) v] = row[v] + bias_of(v);
                 paraformer_dump_logits(ctx, biased_row.data(), V, n, 5);
             } else {
                 paraformer_dump_logits(ctx, row, V, n, 5);
             }
         }
+        prev_token = best;
         // Skip special tokens: 0=<blank>, 1=<s>, 2=</s>, last=<unk>
         if (best <= 2 || best == V - 1)
             continue;
