@@ -54,6 +54,7 @@ span rewrite（`footwall→footwell` 这类跨 token 数的纠正）原先只在
 | 车控夹具 | `…/paraformer-models/tingting/` | 32 条 | — | `tools/make_eval_pack.sh` + Tingting/Samantha |
 | 独立音色夹具 | `…/paraformer-models/voice2/` | 32 条 | — | Flo + Daniel |
 | SeACo 权重（研究用） | `…/seaco/model.pt` | 944 MB | — | ModelScope，未移植 |
+| Silero VAD（ONNX） | `~/Library/Caches/qwen3-asr-htp/vad/silero_vad.onnx` | 2.2 MB | `2623a2953f6ff3d2` | ModelScope `pengzhendong/silero-vad`，经 sherpa 封装在设备跑 0.7% 实时 |
 
 ## 3. 复现步骤
 
