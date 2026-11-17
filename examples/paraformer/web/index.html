@@ -70,6 +70,8 @@
         <dt>服务端推理</dt><dd id="mInfer">—</dd>
         <dt>服务端语言</dt><dd id="mLang">—</dd>
         <dt>分段数</dt><dd id="mSegs">0</dd>
+        <dt>历史 p50 / p95</dt><dd id="mPct">—</dd>
+        <dt>近 8 段</dt><dd id="mSpark" style="font-family:ui-monospace,monospace">—</dd>
       </dl>
     </section>
     <section style="margin-top:14px">
@@ -90,6 +92,7 @@
   let pending = [], sentSamples = 0, recording = false;
   let endpointAt = 0, committed = 0, segments = 0;
   let lastPartial = '';
+  const history = [];
   const trace = new Array(320).fill(0);   // scrolling waveform, one point per ~5 ms
 
   function log(msg) {
@@ -157,6 +160,13 @@
             $('mE2E').textContent = e2e + ' ms';
             segments += 1;
             $('mSegs').textContent = segments;
+            if (e2e) {
+              history.push(e2e);
+              const sorted = history.slice().sort((a, b) => a - b);
+              const pct = (q) => sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * q))];
+              $('mPct').textContent = pct(0.5) + ' / ' + pct(0.95) + ' ms (n=' + sorted.length + ')';
+              $('mSpark').textContent = history.slice(-8).join(' ');
+            }
             log('completed (' + e2e + ' ms): ' + m.transcript);
             committed = 0;
             lastPartial = '';
@@ -252,6 +262,9 @@
   async function clearAll() {
     recording = false;
     pending = []; sentSamples = 0; lastPartial = '';
+    history.length = 0;
+    $('mPct').textContent = '—';
+    $('mSpark').textContent = '—';
     $('mBytes').textContent = '0.00 s';
     $('partials').textContent = '';
     $('transcript').textContent = '—';

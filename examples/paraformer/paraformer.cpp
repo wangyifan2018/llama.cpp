@@ -1561,6 +1561,15 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     // Choose first, rewrite spans, then render. Without replacement rules the
     // output is byte-identical to the single-pass version.
     std::vector<int> chosen((size_t) N_tokens, -1);
+    // Token records are built after the span rewrite, so a rewritten token keeps
+    // the time of its position and the rewrite is not silently skipped whenever
+    // the caller asks for timestamps.
+    std::vector<int64_t> pos_t_ms;
+    std::vector<float> pos_posterior;
+    if (out_tokens) {
+        pos_t_ms.assign((size_t) N_tokens, 0);
+        pos_posterior.assign((size_t) N_tokens, 1.0f);
+    }
     for (int n = 0; n < N_tokens; n++) {
         const float* row = logits_data.data() + (size_t)n * V;
         // §13: prefix-conditional gains for this position (depends on prev token).
@@ -1653,7 +1662,6 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
         if (best <= 2 || best == V - 1)
             continue;
         if ((size_t)best < ctx->vocab.size()) {
-            std::string tok = ctx->vocab[best];
             // §15: record time/confidence for the long-audio stitcher. Posterior
             // is a numerically stable softmax over the (biased) row; cost is
             // only paid when out_tokens is requested, so the plain path is
@@ -1671,19 +1679,32 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
                 const float best_biased = row[best] + (apply_bias ? bias_of(best) : 0.0f);
                 const float posterior = (float) (std::exp((double) (best_biased - mx)) / sum);
                 const int frame = (n < (int) fire_frames_vec.size()) ? fire_frames_vec[(size_t) n] : 0;
-                pf_token rec;
-                rec.text = tok;
-                rec.t_ms = (int64_t) frame * (int64_t) hp.lfr_n * 10;
-                rec.posterior = posterior;
-                rec.local_index = n;
-                out_tokens->push_back(std::move(rec));
+                pos_t_ms[(size_t) n] = (int64_t) frame * (int64_t) hp.lfr_n * 10;
+                pos_posterior[(size_t) n] = posterior;
             }
         }
     }
 
-    if (!ctx->hotword_repl.empty() && !out_tokens) {
+    if (!ctx->hotword_repl.empty()) {
         const char* dbg = std::getenv("PF_REPLACE_LOG");
         pf_apply_replacements(chosen, logits_data.data(), V, ctx->hotword_repl, ctx->vocab, dbg != nullptr);
+    }
+
+    if (out_tokens) {
+        // Build the records from the rewritten sequence: text from the chosen id,
+        // time/posterior from the position it occupies.
+        for (size_t n = 0; n < chosen.size(); ++n) {
+            const int id = chosen[n];
+            if (id <= 2 || id == V - 1 || (size_t) id >= ctx->vocab.size()) {
+                continue;
+            }
+            pf_token rec;
+            rec.text = ctx->vocab[(size_t) id];
+            rec.t_ms = n < pos_t_ms.size() ? pos_t_ms[n] : 0;
+            rec.posterior = n < pos_posterior.size() ? pos_posterior[n] : 1.0f;
+            rec.local_index = (int) n;
+            out_tokens->push_back(std::move(rec));
+        }
     }
 
     if (const char* vsub = std::getenv("PF_DUMP_VOCAB")) {

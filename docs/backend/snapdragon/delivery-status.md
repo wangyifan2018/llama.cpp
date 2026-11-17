@@ -24,8 +24,24 @@
 | 4 路齐发 p50/p95 | 447/626 ms | 三引擎；两引擎 494/705 |
 | zh CER（32 条车控夹具） | 0.60% | Tingting |
 | en WER | 6.87% | 热词 + span rewrite |
-| 命令字段 | **78.1%** | 热词 + span rewrite + 停顿标点 |
+| 命令字段 | **84.4%** | 热词 + span rewrite + 停顿标点（API `punctuate=true`） |
+| device / state / value 字段 | 90.5% / 88.1% / **100%** | 同上，32 条夹具 |
 | 内存（单进程） | 252 MB | Q8_0；Q4_K 146 MB |
+
+## 1.1 本批修掉的一个质量 bug
+
+span rewrite（`footwall→footwell` 这类跨 token 数的纠正）原先只在**不请求时间戳**时生效
+（代码里 `if (!hotword_repl.empty() && !out_tokens)`）。而 `verbose_json`、`punctuate=true`、
+`srt` 都要 token 时间，于是**产品实际走的路径一直丢掉了这条纠正**。
+
+改成"先重写、再从重写后的序列生成 token 记录（时间取该位置的时间）"之后：
+
+| 口径 | 修复前 | 修复后 |
+|---|---:|---:|
+| 命令字段（API punctuate） | 78.1% | **84.4%** |
+| device / state / value | 85.7% / 83.3% / 94.4% | **90.5% / 88.1% / 100%** |
+| en WER | 8.40% | **6.87%** |
+| zh CER | 0.60% | 0.60% |
 
 ## 2. 资产清单
 
