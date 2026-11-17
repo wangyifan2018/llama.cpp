@@ -910,3 +910,20 @@ Q4_0 与 Q4_K 速度接近（+25% vs +32%），但 Q4_K 的精度结构更好，
 
 **边界**：只测了一条 2.70 s 音频的 profile（encoder 主项稳定，但 decoder 的百分比会随 N 变）；
 没有测 imatrix 辅助量化；holdout 仍是合成音色，没有真实座舱录音。
+
+### 26.1 还试过哪些旋钮（都不行）
+
+| 旋钮 | 结果 | 说明 |
+|---|---|---|
+| `GGML_HEXAGON_MM_SELECT=1` | 无变化 | 该值只影响 HMX 优先，v73 没有 HMX，2 与 1 等价 |
+| `GGML_HEXAGON_NHVX=1` | p50 279 -> **469 ms**（+68%） | 少一半 HVX，符合预期，默认 2 是对的 |
+| 换 tile repack | 不适用 | q4_K/q4_0 已有 tiled repack，慢在解包不在布局 |
+| 混合精度（FFN 用 Q8_0、其余 4-bit） | 不建议 | 4-bit 只占 37% 的 matmul 时间，省 26 MB 却要 +5% 总时间 |
+
+结论：**这颗 DSP 上没有能救 4-bit 的旋钮**，kernel 的解包成本是编译期决定的；要么接受 Q8_0 的
+内存，要么用 Q5_0 换内存并接受 +19%。
+
+唯一还有理论上限的方向是**让 M 变大**（两条流共用一个 encoder 图，M 45 -> 90），把每个权重 tile
+的加载摊薄到两倍帧数上。这条要改 SANM encoder 的 batch 维与 FSMN/CIF，属于结构改动，本批不做；
+按 x-asr 固定车道探测的经验（B=2 省 21%、B=4 省 31%），Paraformer 的 encoder 是 compute-bound，
+预期收益低于 x-asr，建议先用一个小实验（固定两条流、只测 encoder）验证再决定。
