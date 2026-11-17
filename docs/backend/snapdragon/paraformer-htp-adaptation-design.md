@@ -594,3 +594,60 @@ en WER −3.8 点，中文零变化、零回退。这与 §13 的“62.5%（仅 
 - 噪声是合成混合，不是真实车内录音；SNR 按全段 RMS 计算，未做语音活动对齐。
 - 硬负样本是合成音色，未覆盖真实说话人和方言。
 - 标点实验只改了文本层，未接模型；hotword 只覆盖整词/等长 BPE 词尾。
+
+## 19. M10 实测：说话人鲁棒性、热词覆盖边界、量化受阻（2026-11-17）
+
+### 19.1 换说话人比任何解码调优都重要
+
+同一 32 条文本、同一权重、同一评测器，只换合成音色（中文 Flo、英文 Daniel(en_GB)）：
+
+| 音色 | 偏置 | zh CER | en WER | command | device | value |
+|---|---|---:|---:|---:|---:|---:|
+| Tingting + Samantha | 关 | 0.60% | 12.21% | 56.2% | 69.0% | 77.8% |
+| Tingting + Samantha | 开 | 0.60% | 8.40% | 65.6% | 73.8% | 88.9% |
+| Flo + Daniel | 关 | **34.34%** | **22.90%** | **18.8%** | 38.1% | 27.8% |
+| Flo + Daniel | 开 | 34.34% | 18.32% | 21.9% | 42.9% | 27.8% |
+
+- 只换中文音色，CER 从 0.6% 掉到 34.3%，命令字段从 56.2% 掉到 18.8%；热词偏置对这个退化
+  几乎没有作用（中文 CER 不变，命令只 +3 点，全部来自英文）。
+- 英文换 en_GB 口音，WER 12.2% → 22.9%，偏置仍能修 −4.6 点（说明偏置修的是“模型知道但没选”
+  的混淆，不是口音导致的声学错误）。
+- 结论：**当前夹具上的 0.6% CER 是 Tingting 这一把音色的成绩，不能当作模型能力上界**。
+  任何“上线”判断都必须用真实座舱录音或至少多音色；此前 x-asr 在同一把音色上也测到
+  Flo 55%/Tingting 8% 的差异，方向一致。
+
+### 19.2 热词机制的覆盖边界（复核 §14.1 判据）
+
+按 §14.1 的判据（正确/错误词 BPE token 数相同、只差末 token）复核当前偏置表的覆盖：
+
+| 残余错误（Tingting，偏置后） | BPE 路径 | 能否用现有机制修 |
+|---|---|---|
+| `footwall` → `footwell` | 3 → 2 | 否（要删 token） |
+| `likes` → `lights` | 2 → 3 | 否（要加 token，且 gap 9.82） |
+| `reevent` → `rear vents` | 1 → 2 | 否（要插 token） |
+| `said` → `set` | 1 → 1 | 已修 |
+| `too` → `two` | 1 → 1 | 已修 |
+| `seed` → `seat` | 2 → 2，末 token 不同 | 已修（前缀条件） |
+
+也就是说，偏置这一类**解码期 logit 干预**已经吃干净了：剩下 3 类都需要 token 插入/删除，
+属于“词表级 / 上下文偏置”问题，不是增益能解决的。要做“热词模型”，方向应是
+（a）上下文感知的 shallow fusion（给每个 VAD 段一个候选词表，按 prefix trie 约束解码），
+或（b）重训/微调带 domain biasing 的 decoder；两者都需要新权重或训练数据，超出本仓库范围。
+
+### 19.3 Q4_K 量化 A/B：本机无外网，未执行
+
+`curl https://huggingface.co/cstr/paraformer-zh-GGUF/resolve/main/paraformer-zh-q4_k.gguf`
+在本轮连续两次 75 s 超时（`Failed to connect to huggingface.co port 443`），仓库内也没有
+`llama-quantize` 可用的转换路径（Paraformer 是自定义 GGUF 布局，转换器写死 zh 超参）。
+因此 Q4_K 只留下计划与预期上界：
+
+- 预期内存：227 MB → 123 MB/引擎，双引擎 454 → 246 MB（配合 §16 的 arena 缩减，三引擎可行）。
+- 预期延迟上界：encoder 里 MUL_MAT+ADD 占 62.7%，Q4_K 权重字节减半，若 DSP 走 int4 路径
+  且仍 compute-bound，理论上限约 −20~30% encoder 时间（235 ms → 165~190 ms）。
+- 验收门：先跑 32 条 CER/WER/command 与逐条转写对拍，退化就停；再报 p50/p95 与 VmHWM。
+- 复现命令（有网时）：
+  ```sh
+  curl -L -o paraformer-zh-q4_k.gguf \
+    https://huggingface.co/cstr/paraformer-zh-GGUF/resolve/main/paraformer-zh-q4_k.gguf
+  ./build-x-asr/bin/llama-paraformer paraformer-zh-q4_k.gguf fixtures-tingting/*.wav
+  ```
