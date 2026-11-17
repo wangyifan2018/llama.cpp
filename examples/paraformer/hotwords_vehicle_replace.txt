@@ -1,0 +1,9 @@
+# Whole-word gains plus span rewrites (see design doc section 21).
+3.2 set
+1.5 two
+3.8 se@@>at
+# A logit gain cannot change the token count. Each R line rewrites an exact
+# wrong token sequence after argmax when the per-position average logit of the
+# right sequence is within <margin> of the wrong one.
+R 5.0 f@@+oo@@+t@@+w@@+all => f@@+oo@@+t@@+well
+R 5.0 li@@+kes => li@@+gh@@+ts

@@ -150,6 +150,16 @@ struct paraformer_model {
 // decoder keep separate schedulers: allocating a graph on a scheduler
 // invalidates the other graph's buffers, which is what forced the old
 // rebuild-every-call workaround.
+// §21: span rewrite. A logit gain cannot change the number of tokens, so the
+// BPE mismatches (footwall 3 tokens vs footwell 2) need a different tool: after
+// argmax, an exact wrong-sequence match is replaced by the right one when the
+// per-position logit average does not fall too far behind.
+struct pf_repl {
+    std::vector<int> wrong;
+    std::vector<int> right;
+    float margin = 0.0f;
+};
+
 struct pf_stage_cache {
     ggml_backend_sched_t sched = nullptr;
     ggml_context* ctx = nullptr;
@@ -184,6 +194,7 @@ struct paraformer_context {
     // globally boosting `at` everywhere (which would corrupt other words).
     struct SeqRule { int prefix, target; float gain; };
     std::vector<SeqRule> hotword_seq;
+    std::vector<pf_repl> hotword_repl;
     int hotword_count = 0;
     bool hotword_loaded = false;
 
@@ -222,6 +233,69 @@ static inline ggml_tensor* mm_bias(ggml_context* ctx0, ggml_tensor* W, ggml_tens
 // [0, 5]. Bias is applied to every CIF position; NAR decoding has no
 // autoregressive prefix, so x-asr's head/prefix weighting does not apply.
 // Empty/invalid config leaves hotword_bonus empty => bit-identical baseline.
+// Rewrite exact wrong spans in place. Returns the number of rewrites.
+static int pf_apply_replacements(std::vector<int>& chosen, const float* logits, int V, const std::vector<pf_repl>& repls,
+                                 const std::vector<std::string>& vocab, bool verbose) {
+    int applied = 0;
+    if (verbose) {
+        fprintf(stderr, "pf-repl: %zu rules, %zu chosen\n", repls.size(), chosen.size());
+    }
+    for (const auto& r : repls) {
+        const size_t nw = r.wrong.size(), nr = r.right.size();
+        if (verbose) {
+            std::string w, c;
+            for (int id : r.wrong) w += vocab[(size_t) id] + "|";
+            for (size_t i = 0; i < chosen.size() && i < 8; ++i) {
+                const int id = chosen[i];
+                c += (id >= 0 && (size_t) id < vocab.size()) ? vocab[(size_t) id] + "|" : "?|";
+            }
+            fprintf(stderr, "pf-repl: rule [%s] chosen head [%s]\n", w.c_str(), c.c_str());
+        }
+        if (nw == 0 || nr == 0 || chosen.size() < nw) {
+            continue;
+        }
+        size_t p = 0;
+        while (p + nw <= chosen.size()) {
+            // Compare token text, not ids: the vocab can hold duplicate strings.
+            bool match = true;
+            for (size_t i = 0; i < nw; ++i) {
+                const int a = chosen[p + i], b = r.wrong[i];
+                if (a < 0 || (size_t) a >= vocab.size() || (size_t) b >= vocab.size() ||
+                    vocab[(size_t) a] != vocab[(size_t) b]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (!match) {
+                ++p;
+                continue;
+            }
+            double sw = 0.0, sr = 0.0;
+            for (size_t i = 0; i < nw; ++i)
+                sw += logits[(p + i) * (size_t) V + r.wrong[i]];
+            for (size_t i = 0; i < nr; ++i)
+                sr += logits[(p + std::min(i, nw - 1)) * (size_t) V + r.right[i]];
+            const double avg_w = sw / (double) nw, avg_r = sr / (double) nr;
+            if (verbose) {
+                fprintf(stderr, "pf-repl: match at %zu, avg_wrong %.2f avg_right %.2f deficit %.2f\n", p, avg_w, avg_r,
+                        avg_w - avg_r);
+            }
+            if (avg_r + r.margin < avg_w) {
+                ++p;
+                continue;
+            }
+            chosen.erase(chosen.begin() + (long) p, chosen.begin() + (long) (p + nw));
+            chosen.insert(chosen.begin() + (long) p, r.right.begin(), r.right.end());
+            ++applied;
+            if (verbose) {
+                fprintf(stderr, "paraformer: span rewrite at %zu, avg %.2f -> %.2f\n", p, avg_w, avg_r);
+            }
+            p += nr;
+        }
+    }
+    return applied;
+}
+
 static void paraformer_load_hotwords(paraformer_context* ctx) {
     if (!ctx || ctx->hotword_loaded || ctx->vocab.empty())
         return;
@@ -250,6 +324,48 @@ static void paraformer_load_hotwords(paraformer_context* ctx) {
         const size_t c = text.find('#');
         if (c != std::string::npos)
             text.resize(c);
+        while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' ' || text.back() == '\t'))
+            text.pop_back();
+        // "R <margin> <w1+w2+...> => <r1+r2+...>" is a span rewrite, not a gain.
+        if (text.size() > 2 && (text[0] == 'R' || text[0] == 'r') && (text[1] == ' ' || text[1] == '\t')) {
+            const size_t arrow = text.find("=>");
+            if (arrow == std::string::npos)
+                continue;
+            float margin = 0.0f;
+            char lhs[256] = { 0 };
+            if (std::sscanf(text.c_str() + 2, "%f %255s", &margin, lhs) != 2)
+                continue;
+            std::string rhs = text.substr(arrow + 2);
+            auto split = [&](std::string s) {
+                std::vector<int> ids;
+                for (size_t i = 0; i < s.size();) {
+                    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r'))
+                        ++i;
+                    size_t j = i;
+                    while (j < s.size() && s[j] != '+')
+                        ++j;
+                    if (j > i) {
+                        const int id = find_token(s.substr(i, j - i));
+                        if (id < 0) {
+                            fprintf(stderr, "paraformer: replacement token not in vocab: '%s'\n", s.substr(i, j - i).c_str());
+                            return std::vector<int>();
+                        }
+                        ids.push_back(id);
+                    }
+                    i = j + (j < s.size() ? 1 : 0);
+                }
+                return ids;
+            };
+            pf_repl r;
+            r.wrong = split(std::string(lhs));
+            r.right = split(rhs);
+            r.margin = margin;
+            if (!r.wrong.empty() && !r.right.empty()) {
+                ctx->hotword_repl.push_back(std::move(r));
+                ++ctx->hotword_count;
+            }
+            continue;
+        }
         float gain = 0.0f;
         char tokbuf[256] = { 0 };
         if (std::sscanf(text.c_str(), "%f %255s", &gain, tokbuf) != 2 || tokbuf[0] == '\0')
@@ -1244,6 +1360,9 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     std::string result;
     bool prev_was_bpe_cont = false; // true if previous token ended with @@
     int prev_token = -1;            // §13: token chosen at n-1, for seq rules
+    // Choose first, rewrite spans, then render. Without replacement rules the
+    // output is byte-identical to the single-pass version.
+    std::vector<int> chosen((size_t) N_tokens, -1);
     for (int n = 0; n < N_tokens; n++) {
         const float* row = logits_data.data() + (size_t)n * V;
         // §13: prefix-conditional gains for this position (depends on prev token).
@@ -1281,12 +1400,12 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
             }
         }
         prev_token = best;
+        chosen[(size_t) n] = best;
         // Skip special tokens: 0=<blank>, 1=<s>, 2=</s>, last=<unk>
         if (best <= 2 || best == V - 1)
             continue;
         if ((size_t)best < ctx->vocab.size()) {
             std::string tok = ctx->vocab[best];
-            bool is_bpe_cont = (tok.size() >= 2 && tok.substr(tok.size() - 2) == "@@");
             // §15: record time/confidence for the long-audio stitcher. Posterior
             // is a numerically stable softmax over the (biased) row; cost is
             // only paid when out_tokens is requested, so the plain path is
@@ -1311,27 +1430,57 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
                 rec.local_index = n;
                 out_tokens->push_back(std::move(rec));
             }
-            // Insert space before Latin-script tokens that start a new word.
-            // Paraformer-zh uses character-level Chinese + word-level English
-            // with @@ BPE continuation markers. Space is needed between
-            // consecutive English words (tokens without @@ on either side).
-            if (!result.empty() && !prev_was_bpe_cont) {
-                unsigned char first_byte = (unsigned char)tok[0];
-                unsigned char last_byte = (unsigned char)result.back();
-                bool cur_is_latin =
-                    (first_byte >= 'a' && first_byte <= 'z') || (first_byte >= 'A' && first_byte <= 'Z');
-                bool prev_is_latin = (last_byte >= 'a' && last_byte <= 'z') || (last_byte >= 'A' && last_byte <= 'Z');
-                if (cur_is_latin && prev_is_latin) {
-                    result += ' ';
-                }
-            }
-            if (is_bpe_cont) {
-                result += tok.substr(0, tok.size() - 2);
-            } else {
-                result += tok;
-            }
-            prev_was_bpe_cont = is_bpe_cont;
         }
+    }
+
+    if (!ctx->hotword_repl.empty() && !out_tokens) {
+        const char* dbg = std::getenv("PF_REPLACE_LOG");
+        pf_apply_replacements(chosen, logits_data.data(), V, ctx->hotword_repl, ctx->vocab, dbg != nullptr);
+    }
+
+    if (const char* vsub = std::getenv("PF_DUMP_VOCAB")) {
+        for (size_t i = 0; i < ctx->vocab.size(); ++i) {
+            if (ctx->vocab[i].find(vsub) != std::string::npos)
+                fprintf(stderr, "pf-vocab: %zu %s\n", i, ctx->vocab[i].c_str());
+        }
+    }
+
+    if (std::getenv("PF_DUMP_TOKENS")) {
+        std::string ids;
+        for (size_t n = 0; n < chosen.size(); ++n) {
+            const int id = chosen[n];
+            if (id >= 0 && (size_t) id < ctx->vocab.size())
+                ids += ctx->vocab[(size_t) id] + "|";
+        }
+        fprintf(stderr, "pf-tokens: %s\n", ids.c_str());
+    }
+
+    for (size_t n = 0; n < chosen.size(); n++) {
+        const int best = chosen[n];
+        if (best < 0 || best <= 2 || best == V - 1 || (size_t) best >= ctx->vocab.size())
+            continue;
+        const std::string& tok = ctx->vocab[best];
+        const bool is_bpe_cont = (tok.size() >= 2 && tok.substr(tok.size() - 2) == "@@");
+        // Insert space before Latin-script tokens that start a new word.
+        // Paraformer-zh uses character-level Chinese + word-level English
+        // with @@ BPE continuation markers. Space is needed between
+        // consecutive English words (tokens without @@ on either side).
+        if (!result.empty() && !prev_was_bpe_cont) {
+            unsigned char first_byte = (unsigned char)tok[0];
+            unsigned char last_byte = (unsigned char)result.back();
+            bool cur_is_latin =
+                (first_byte >= 'a' && first_byte <= 'z') || (first_byte >= 'A' && first_byte <= 'Z');
+            bool prev_is_latin = (last_byte >= 'a' && last_byte <= 'z') || (last_byte >= 'A' && last_byte <= 'Z');
+            if (cur_is_latin && prev_is_latin) {
+                result += ' ';
+            }
+        }
+        if (is_bpe_cont) {
+            result += tok.substr(0, tok.size() - 2);
+        } else {
+            result += tok;
+        }
+        prev_was_bpe_cont = is_bpe_cont;
     }
 
     ggml_free(ctx0);
