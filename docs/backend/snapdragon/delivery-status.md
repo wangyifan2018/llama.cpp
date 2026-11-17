@@ -114,7 +114,10 @@ python3 examples/paraformer/tools/ws_client.py --url ws://127.0.0.1:8899/v1/real
 2. Realtime 的 partial 是"整段重解码"，间隔 ≥600 ms；不是流式模型。
 3. 英文 OOV 名字的分词无法与模型对齐（GGUF 无 merge 表），需要 `a+b+c` 显式 token。
 4. CAM++ 只导出**定长 2 s** 图（动态轴在部分长度上数值错误，实测 T=100 余弦 0.571、T=300 0.940）；
-   音频按 2 s 分块、尾部均值补齐后平均 embedding，门控余量 0.25（本人最小 0.793 / 冒充最大 0.541）。
+   音频按 2 s 分块、尾部均值补齐后平均 embedding，宿主门控余量 0.25（本人最小 0.793 / 冒充最大 0.541）。
+5. **设备端**用 sherpa-onnx 的 speaker extractor 跑同一张 ONNX（补 metadata 后），2.3 s 音频
+   107–123 ms（CPU，与 HTP 上的 ASR 并行），本人最小 0.747 / 冒充最大 0.445，余量 **0.302**，
+   阈值 0.45–0.74 时 FRR/FAR 均为 0。**门控尚未接进 API 服务**（下一批：`--speaker-gate`）。
 5. 设备端尚未集成声纹（缺 `onnxruntime_c_api.h`），门控目前只在本机 Python 侧验证。
 
 ## 7. 下一批（按优先级）
