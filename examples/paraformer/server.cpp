@@ -38,6 +38,8 @@
 #include <cstring>
 #include <future>
 #include <memory>
+#include <algorithm>
+#include <cerrno>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -61,13 +63,32 @@ struct Engine {
 
 struct Task {
     std::vector<float> samples;
-    std::promise<std::string> result;
+    std::promise<std::pair<int, std::string>> result; // status, text or error
+    int fd = -1;
+    double enqueued_ms = 0;
 };
 
 static std::queue<std::unique_ptr<Task>> g_queue;
 static std::mutex g_queue_mutex;
 static std::condition_variable g_queue_cv;
 static bool g_stop = false;
+static size_t queue_limit = 32;      // pending requests before OPEN-side reject
+static double queue_timeout_ms = 15000; // a request that waited longer is dropped
+static double g_queue_ms = 0;        // last request's queue wait, for the log
+static double g_infer_ms = 0;
+
+// A client that hung up before its turn must not consume an engine slot.
+static bool peer_alive(int fd) {
+    if (fd < 0)
+        return false;
+    char c = 0;
+    const ssize_t n = recv(fd, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n == 0)
+        return false;
+    if (n < 0)
+        return errno == EAGAIN || errno == EWOULDBLOCK;
+    return true;
+}
 static std::vector<Engine*> g_engines;
 static std::atomic<uint64_t> g_requests{0};
 static std::atomic<double> g_total_ms{0};
@@ -144,20 +165,37 @@ static void worker_loop(Engine* eng) {
             task = std::move(g_queue.front());
             g_queue.pop();
         }
-        const double t0 = now_ms();
-        std::string text;
-        std::unique_ptr<char, decltype(&std::free)> out(
-            paraformer_transcribe(eng->ctx, task->samples.data(), (int) task->samples.size()), &std::free);
-        if (out)
-            text = out.get();
-        const double dt = now_ms() - t0;
-        eng->requests.fetch_add(1);
-        double cur = eng->total_ms.load();
-        while (!eng->total_ms.compare_exchange_weak(cur, cur + dt)) {}
-        g_requests.fetch_add(1);
-        cur = g_total_ms.load();
-        while (!g_total_ms.compare_exchange_weak(cur, cur + dt)) {}
-        task->result.set_value(std::move(text));
+        const double queue_ms = now_ms() - task->enqueued_ms;
+        std::pair<int, std::string> reply;
+        if (queue_timeout_ms > 0 && queue_ms > queue_timeout_ms) {
+            reply = {ST_ERROR, "queue timeout"};
+            if (getenv("PF_TIMING"))
+                std::fprintf(stderr, "pf-server: dropped request after %.1f ms in queue\n", queue_ms);
+        } else if (!peer_alive(task->fd)) {
+            reply = {ST_ERROR, "client closed"};
+            if (getenv("PF_TIMING"))
+                std::fprintf(stderr, "pf-server: dropped request after %.1f ms, client gone\n", queue_ms);
+        } else {
+            const double t0 = now_ms();
+            std::unique_ptr<char, decltype(&std::free)> out(
+                paraformer_transcribe(eng->ctx, task->samples.data(), (int) task->samples.size()), &std::free);
+            const double dt = now_ms() - t0;
+            eng->requests.fetch_add(1);
+            double cur = eng->total_ms.load();
+            while (!eng->total_ms.compare_exchange_weak(cur, cur + dt)) {}
+            g_requests.fetch_add(1);
+            cur = g_total_ms.load();
+            while (!g_total_ms.compare_exchange_weak(cur, cur + dt)) {}
+            if (getenv("PF_TIMING")) {
+                static std::mutex log_mutex;
+                std::lock_guard<std::mutex> lock(log_mutex);
+                std::fprintf(stderr, "pf-server: queue_ms=%.3f infer_ms=%.3f engine=%s\n", queue_ms, dt, eng->name);
+            }
+            g_queue_ms = queue_ms;
+            g_infer_ms = dt;
+            reply = out ? std::make_pair((int) ST_FINAL, std::string(out.get())) : std::make_pair((int) ST_ERROR, std::string("inference failed"));
+        }
+        task->result.set_value(std::move(reply));
     }
 }
 
@@ -190,19 +228,21 @@ static void handle_connection(int fd) {
 
         auto task = std::unique_ptr<Task>(new Task());
         task->samples = std::move(samples);
+        task->fd = fd;
+        task->enqueued_ms = now_ms();
         auto result = task->result.get_future();
         {
             std::lock_guard<std::mutex> lock(g_queue_mutex);
+            if (g_queue.size() >= queue_limit) {
+                respond(fd, ST_ERROR, "busy: queue full");
+                continue;
+            }
             g_queue.push(std::move(task));
         }
         g_queue_cv.notify_one();
 
-        std::string text = result.get(); // wait for the worker that picked it up
-        if (text.empty()) {
-            respond(fd, ST_ERROR, "inference failed");
-            continue;
-        }
-        if (!respond(fd, ST_FINAL, text))
+        const std::pair<int, std::string> reply = result.get();
+        if (!respond(fd, (uint32_t) reply.first, reply.second))
             break;
     }
     close(fd);
@@ -212,7 +252,7 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr,
                      "usage: %s MODEL.gguf [DEVICE] [--port N] [--warmup F32] [--threads N] "
-                     "[--engines 1|2] [--bind ADDR]\n",
+                     "[--engines 1|2] [--bind ADDR] [--queue N] [--timeout-ms N] [--no-warmup]\n",
                      argv[0]);
         return 1;
     }
@@ -223,6 +263,7 @@ int main(int argc, char** argv) {
     const char* warmup = nullptr;
     int threads = 2;
     int n_engines = 2;
+    bool no_warmup = false;
     bool device_set = false;
     for (int i = 2; i < argc; ++i) {
         if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -235,6 +276,12 @@ int main(int argc, char** argv) {
             threads = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--engines") == 0 && i + 1 < argc) {
             n_engines = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--queue") == 0 && i + 1 < argc) {
+            queue_limit = (size_t) std::max(1, std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--timeout-ms") == 0 && i + 1 < argc) {
+            queue_timeout_ms = std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--no-warmup") == 0) {
+            no_warmup = true;
         } else if (argv[i][0] != '-' && !device_set) {
             device = argv[i];
             device_set = true;
@@ -256,6 +303,13 @@ int main(int argc, char** argv) {
     if (warmup && !read_wav_bytes(warmup, warm)) {
         std::fprintf(stderr, "pf-server: cannot read warmup f32 %s\n", warmup);
         return 3;
+    }
+    if (warm.empty() && !no_warmup) {
+        // The first request otherwise pays the DSP-side graph registration
+        // (about 1 s). Shape does not matter for that cost, so synthesize a
+        // representative 1.2 s of silence and keep warmup inside startup.
+        warm.assign((size_t) 16000 * 12 / 10, 0.0f);
+        std::fprintf(stderr, "pf-server: no --warmup file, warming with 1.2 s of silence\n");
     }
 
     // Load the GGUF once into a canonical host-buffer weight set.
