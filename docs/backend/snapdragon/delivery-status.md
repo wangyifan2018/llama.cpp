@@ -118,7 +118,11 @@ python3 examples/paraformer/tools/ws_client.py --url ws://127.0.0.1:8899/v1/real
    音频按 2 s 分块、尾部均值补齐后平均 embedding，宿主门控余量 0.25（本人最小 0.793 / 冒充最大 0.541）。
 5. **设备端**用 sherpa-onnx 的 speaker extractor 跑同一张 ONNX（补 metadata 后），2.3 s 音频
    107–123 ms（CPU，与 HTP 上的 ASR 并行），本人最小 0.747 / 冒充最大 0.445，余量 **0.302**，
-   阈值 0.45–0.74 时 FRR/FAR 均为 0。**门控尚未接进 API 服务**（下一批：`--speaker-gate`）。
+   阈值 0.45–0.74 时 FRR/FAR 均为 0。
+6. **门控已接进服务**（`-DXASR_SPEAKER=ON`）：`--speaker-model` + `--enroll-dir`，commit 时
+   ASR（HTP）与声纹（CPU，`std::async`）并行；真机司机 **0.921** / 乘客 **0.363**，阈值 0.55，
+   infer 282–344 ms（与未开时同噪声带）。构建要把 sherpa 头/库挂进容器，运行时
+   `LD_LIBRARY_PATH` 需含 `onnx/bin`。评分只上报、不拦截。
 5. 设备端尚未集成声纹（缺 `onnxruntime_c_api.h`），门控目前只在本机 Python 侧验证。
 
 ## 7. 下一批（按优先级）

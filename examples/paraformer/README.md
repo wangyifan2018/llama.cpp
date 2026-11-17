@@ -179,6 +179,33 @@ python3 tools/ws_client.py --url ws://127.0.0.1:8080/v1/realtime --wav a.wav --p
 See docs/backend/snapdragon/asr-server-api-design.md for the full surface,
 including the Realtime event mapping and what a general ASR server needs.
 
+### Speaker gate (optional)
+
+The API can score each committed segment against the enrolled driver's voiceprint
+with CAM++ through sherpa-onnx, on the CPU, while the ASR runs on HTP. It is a
+compile-time option so a plain build has no sherpa dependency:
+
+```sh
+# Android build (sherpa headers and libs mounted into the container)
+docker run --rm -v "$PWD:/workspace" -v /tmp/sherpa:/sherpa:ro \
+    --platform linux/amd64 -u 501:20 ghcr.io/snapdragon-toolchain/arm64-android:v0.8 \
+    bash -c 'cmake -S /workspace -B /workspace/build-android-xasr -DXASR_SPEAKER=ON \
+        -DXASR_SHERPA_INCLUDE_DIR=/sherpa/inc -DXASR_SHERPA_LIB_DIR=/sherpa/lib && \
+        cmake --build /workspace/build-android-xasr --target llama-paraformer-api -j 6'
+
+# on the phone: LD_LIBRARY_PATH needs lib/ and onnx/bin (sherpa + onnxruntime)
+export LD_LIBRARY_PATH=$PWD/lib:$PWD/onnx/bin
+bin/llama-paraformer-api MODEL.gguf --device HTP0:0 --port 8899 --engines 2 \
+    --speaker-model onnx/model/spk_od.onnx --enroll-dir pf-enroll --speaker-threshold 0.55
+```
+
+`--enroll-dir` holds a handful of the driver's 16 kHz WAVs; startup prints the clip
+count and the mean self-cosine. Each commit then returns `X-Speaker-Score`,
+`X-Speaker-Ok` (REST) or `speaker_score`/`speaker_ok` (verbose_json and the
+Realtime completed event). Measured on SM6650: enrolment self-cosine 0.904, driver
+0.921, passenger 0.363, and inference stays inside the no-gate noise because the
+110 ms embedding overlaps the 320 ms ASR. The score is reported, not enforced.
+
 ## Profiling
 
 Capture a per-op HTP profile (one warmup + one measured utterance) and
