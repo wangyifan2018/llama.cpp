@@ -42,6 +42,8 @@ for arm in ${XASR_ARMS:-request chunk}; do
     case $arm in
         request) ;;
         chunk) flag=--chunk-scheduler ;;
+        batch2) flag="--encoder-batch 2" ;;
+        batch4) flag="--encoder-batch 4" ;;
         *) echo "unknown arm: $arm" >&2; exit 2 ;;
     esac
     remote_pid=$("$adb_bin" shell -T "cd '$remote' && (
@@ -72,24 +74,25 @@ for arm in ${XASR_ARMS:-request chunk}; do
     stop_server
 done
 
-if [[ "${XASR_ARMS:-request chunk}" == "request chunk" || "${XASR_ARMS:-request chunk}" == "chunk request" ]]; then
-    python3 - "$out" <<'PY'
+python3 - "$out" ${XASR_ARMS:-request chunk} <<'PY'
 import json
 import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
+arms = sys.argv[2:]
 
 def transcripts(arm):
     rows = [json.loads(line) for line in (root / f"{arm}.jsonl").read_text().splitlines()]
     return {(r["scenario"], r["rep"], r["session"]): r["text"] for r in rows}
 
-request = transcripts("request")
-chunk = transcripts("chunk")
-assert request and request.keys() == chunk.keys(), "different A/B workload"
-different = [key for key in request if request[key] != chunk[key]]
-if different:
-    raise SystemExit(f"transcript mismatches: {different}")
-print(f"{len(request)} matching transcripts")
+reference = transcripts(arms[0])
+for arm in arms[1:]:
+    actual = transcripts(arm)
+    if not reference or reference.keys() != actual.keys():
+        raise SystemExit(f"different A/B workload: {arm}")
+    different = [key for key in reference if reference[key] != actual[key]]
+    if different:
+        raise SystemExit(f"transcript mismatches in {arm}: {different}")
+    print(f"{len(reference)} matching transcripts: {arms[0]} vs {arm}")
 PY
-fi

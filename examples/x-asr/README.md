@@ -113,6 +113,13 @@ one COMMIT at its endpoint. The server returns only final text.
   alternates new work with resumable requests while preserving the order of
   operations for a session. The default remains request-level scheduling.
   See the [scheduler A/B](BENCHMARK.md#b1-chunk-scheduler) for reproduction.
+- `--encoder-batch 2` or `--encoder-batch 4` enables experimental HTP
+  encoder batching and implies the chunk scheduler. Set `--streams` to at
+  least the batch width. Each dispatch takes 1, 2, or 4 ready streams without
+  a timer-based batching window. The graphs share model weights. The worker
+  gathers each stream's state before encoding, returns the cache to that
+  stream afterward, and runs its joiner with its own token history. An optional
+  CPU engine uses width 1.
 - A client that disconnects without CLOSE is reaped by the idle timeout.
 - Degenerate input: an all-zero segment drives the encoder normalisation to zero
   variance and the logits to NaN. The decoder now clamps an out of range argmax
@@ -154,4 +161,4 @@ See [BENCHMARK.md](BENCHMARK.md) for the reproducible device benchmark, fixture 
 
 Use [VEHICLE-EVAL.md](VEHICLE-EVAL.md) to reproduce the window, climate, seat, and cabin-light command baseline.
 
-For encoder-only throughput and numerical checks on HTP, see the [fixed-lane B=2/B=4 probe](BENCHMARK.md#fixed-lane-htp-encoder-batch-probe). The server scheduler continues to execute one stream per graph.
+For encoder-only throughput and numerical checks on HTP, see the [fixed-lane B=2/B=4 probe](BENCHMARK.md#fixed-lane-htp-encoder-batch-probe). The default server configuration uses width 1. See the [dynamic HTP batch A/B](BENCHMARK.md#dynamic-htp-encoder-batching) for the opt-in service path.

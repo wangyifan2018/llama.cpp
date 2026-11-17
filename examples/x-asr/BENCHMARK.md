@@ -628,6 +628,81 @@ allow B=1 immediately when no other lane is ready. Verify distinct sequence
 positions, arbitrary lane reuse, and cancel/reset before measuring end-to-final
 P95/P99 under staggered starts and aligned commits.
 
+## Dynamic HTP encoder batching
+
+`llama-x-asr-server --encoder-batch 2|4` batches ready encoder chunks. The
+worker processes a bounded number of already queued requests before choosing
+the largest available graph width (4, 2, or 1). There is no timer-based wait
+to fill a batch. Every lane uploads features and a mask for that stream's
+current position. Its 4,148,736 bytes of state are gathered and scattered over
+the public tensor get/set interface, through a reusable host staging buffer.
+The encoder graph executes on HTP. Transducer joiner and predictor work
+continues per stream after the batched projection.
+
+SM6650, HTP polling, command limit 2048, same GGUF and ARM64 server binary
+across all three arms. The client is on the host via ADB forward. Two paced
+rounds per scenario with four clients each, plus one single-stream warmup per
+arm. Batch states and request handling were not changed between runs other
+than the selected scheduler/width. A second ASR server process was present
+on the phone. Treat these as smoke comparisons because of the sample count
+and possible device contention.
+
+| Workload | N/arm | B=1 chunk p50 / p95 | Up to B=2 p50 / p95 | Up to B=4 p50 / p95 |
+|---|---:|---:|---:|---:|
+| Aligned starts and endpoints | 8 | 698 / 963 ms | 608 / 873 ms | 605 / 808 ms |
+| Staggered starts, clustered endpoints | 8 | 418 / 760 ms | 425 / 749 ms | 453 / 716 ms |
+| Mixed short/long clips | 8 | 262 / 576 ms | 314 / 533 ms | 327 / 482 ms |
+
+All 24 final transcripts per arm matched the B=1 chunk path. The up-to-B=2
+arm made 61 true B=2 encoder dispatches. The up-to-B=4 arm made 50 B=2 and
+10 B=4 dispatches. In B=2-only mode the median gather plus scatter cost was
+4.91 ms, with median encoder compute 137.32 ms. Under the B=4 cap, width-4
+gather plus scatter had median 13.37 ms and compute had median 237.13 ms.
+The p95 improved on these three workloads, while the median rose for
+staggered starts and mixed lengths. Keep batching opt-in pending repeated
+arrival sequences under representative load.
+
+Reproduce after the [Android build and deployment](BUILD.md):
+
+```sh
+export ANDROID_SERIAL=ADNQ6R5823007930
+export XASR_REMOTE=/data/local/tmp/llama-x-asr
+export XASR_ARMS='chunk batch2 batch4'
+export XASR_SCENARIOS='aligned4,stagger-start4,mixed4'
+export XASR_REPS=2
+CACHE="$HOME/Library/Caches/qwen3-asr-htp"
+bash examples/x-asr/tools/bench_chunk_scheduler.sh \
+    build-android-xasr/bin/llama-x-asr-server "$CACHE/zh.wav" \
+    "$CACHE/cabin-asr-probe/long-perf/zh-10.wav" \
+    "$CACHE/cabin-asr-probe/long-perf/en-20.wav"
+```
+
+For the slot smoke test, start the server with `--streams 4 --encoder-batch 4`
+and forward its port. Then pass the four local WAVs to:
+
+```sh
+python3 examples/x-asr/tools/test_batch_slots.py --port 18768 \
+    zh.wav en.wav zh-10.wav en-20.wav
+```
+
+The SM6650 smoke log shows real width-2 and width-4 dispatches during a
+four-client test with one large APPEND per client, one cancel, equal
+transcripts for surviving streams, and successful reuse of the cancelled
+slot. The host CPU CLI-to-server smoke test also matched on both short files.
+
+A separate sherpa-onnx CPU control on the same phone, two threads and
+unpaced, measured RTF 0.148 / 0.122 / 0.115 and median decoder-ready
+chunk times 52.58 / 52.23 / 52.59 ms for the short Mandarin, 10 s Mandarin,
+and 20 s English inputs. It uses the same INT8 export and 1,200 ms tail
+as the [unified benchmark](#unified-benchmark-onnx-int8-gguf-cpu-gguf-htp).
+This is an in-process single-stream reference. A same-arrival-sequence
+ONNX multi-stream service control remains to be measured.
+
+Read `xasr-batch` records in the server logs for width and phase times. The
+run archive holds raw JSONL, placement logs, binary, model and input hashes,
+source digest, build log, and the initial background-process sample under
+`$HOME/Library/Caches/qwen3-asr-htp/xasr-multistream/service-real-batch.SaUcxi`.
+
 ## Reproduce on Android
 
 Run these blocks from the repository root in the same Bash session. The [Snapdragon toolchain guide](../../docs/backend/snapdragon/README.md) covers Docker and ADB setup. Set `ANDROID_SERIAL` if several devices are attached.

@@ -9,6 +9,7 @@ struct xasr_stream;
 struct xasr_context_params {
     const char * device = "CPU";
     int n_threads = 2;
+    int encoder_batch = 1; // HTP graph widths: 1, 2 or 4
     int n_streams = 1;      // independent encoder state slots in one context
     int tail_pad_ms = 1200; // negative selects the minimal phase-aware tail padding
     int verbosity = 1;
@@ -57,6 +58,10 @@ bool xasr_commit(xasr_stream * stream, std::string & text);
 enum class xasr_step_result { pending, done, error };
 bool xasr_begin_step(xasr_stream * stream, const float * samples, int count, bool commit);
 xasr_step_result xasr_step(xasr_stream * stream, std::string & text);
+bool xasr_step_ready(const xasr_stream * stream);
+// Execute one encoder chunk per ready stream. Every stream must be distinct and
+// use the same context. Results and texts are written in lane order.
+void xasr_step_batch(xasr_stream * const * streams, int count, xasr_step_result * results, std::string * texts);
 void xasr_stream_free(xasr_stream * stream);
 
 // Compare independent B=1 slots with a fixed-lane B=2 or B=4 encoder graph.

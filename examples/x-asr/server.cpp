@@ -31,6 +31,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -65,6 +66,7 @@ struct request {
     std::vector<float> audio;
     socket_ref connection;
     bool started = false;
+    xasr_stream * ready_stream = nullptr;
     double queue_ms = 0;
 };
 
@@ -80,6 +82,7 @@ struct engine {
     xasr_context * ctx = nullptr;
     const char * device = "";
     int max_sessions = 0;
+    int max_batch = 1;
     int live = 0;
     std::deque<request> queue;
     std::mutex mutex;
@@ -208,8 +211,10 @@ static void worker_loop(engine * eng) {
     std::vector<request> batch;
     std::deque<request> pending;
     bool resume_next = false;
+    int admissions = 0;
     for (;;) {
         batch.clear();
+        bool dispatch = false;
         {
             std::unique_lock<std::mutex> lock(eng->mutex);
             if (pending.empty()) {
@@ -226,7 +231,9 @@ static void worker_loop(engine * eng) {
                     });
                 };
                 auto next = eng->queue.end();
-                if (!resume_next || pending.empty()) {
+                const bool admit = eng->max_batch == 1 ? (!resume_next || pending.empty()) :
+                    (pending.empty() || (pending.size() < size_t(eng->max_batch) && admissions < eng->max_batch));
+                if (admit) {
                     // A commit may pass unrelated clients, but not its own earlier frames.
                     const auto commit = std::find_if(eng->queue.begin(), eng->queue.end(), [&](const request & item) {
                         return item.op == OP_COMMIT && eligible(item);
@@ -243,10 +250,18 @@ static void worker_loop(engine * eng) {
                     batch.push_back(std::move(*next));
                     eng->queue.erase(next);
                     resume_next = !pending.empty();
+                    if (eng->max_batch > 1 && !pending.empty()) {
+                        ++admissions;
+                    }
                 } else {
-                    batch.push_back(std::move(pending.front()));
-                    pending.pop_front();
+                    const size_t count = pending.size() >= 4 && eng->max_batch == 4 ? 4 : pending.size() >= 2 && eng->max_batch > 1 ? 2 : 1;
+                    for (size_t i = 0; i < count; ++i) {
+                        batch.push_back(std::move(pending.front()));
+                        pending.pop_front();
+                    }
+                    dispatch = eng->max_batch > 1;
                     resume_next = false;
+                    admissions = 0;
                 }
             } else {
                 size_t commit_at = eng->queue.size();
@@ -276,7 +291,17 @@ static void worker_loop(engine * eng) {
             }
         }
         eng->space.notify_all();
-        for (auto & req : batch) {
+        std::array<std::string, 4> batch_text;
+        std::array<xasr_step_result, 4> batch_result;
+        if (dispatch && batch.size() > 1) {
+            std::array<xasr_stream *, 4> streams;
+            for (size_t lane = 0; lane < batch.size(); ++lane) {
+                streams[lane] = batch[lane].ready_stream;
+            }
+            xasr_step_batch(streams.data(), static_cast<int>(batch.size()), batch_result.data(), batch_text.data());
+        }
+        for (size_t lane = 0; lane < batch.size(); ++lane) {
+            auto & req = batch[lane];
             xasr_stream * s = nullptr;
             {
                 std::lock_guard<std::mutex> lock(sessions_mutex);
@@ -321,7 +346,21 @@ static void worker_loop(engine * eng) {
                             req.started = true;
                             std::vector<float>().swap(req.audio);
                         }
-                        const auto result = ok ? xasr_step(s, text) : xasr_step_result::error;
+                        if (ok && eng->max_batch > 1 && !dispatch && xasr_step_ready(s)) {
+                            req.ready_stream = s;
+                            if (pending.empty()) {
+                                admissions = 0;
+                            }
+                            pending.push_back(std::move(req));
+                            break;
+                        }
+                        auto result = xasr_step_result::error;
+                        if (ok && dispatch && batch.size() > 1) {
+                            result = batch_result[lane];
+                            text = std::move(batch_text[lane]);
+                        } else if (ok) {
+                            result = xasr_step(s, text);
+                        }
                         if (result == xasr_step_result::pending) {
                             pending.push_back(std::move(req));
                             break;
@@ -445,7 +484,7 @@ static void reader_thread(int fd, std::vector<engine *> engines) {
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s MODEL.gguf DEVICE [--port N] [--streams N] [--cpu-streams N] [--queue N] [--bind ADDR] [--chunk-scheduler]\n", argv[0]);
+        fprintf(stderr, "usage: %s MODEL.gguf DEVICE [--port N] [--streams N] [--cpu-streams N] [--queue N] [--bind ADDR] [--chunk-scheduler] [--encoder-batch 1|2|4]\n", argv[0]);
         return 1;
     }
     xasr_context_params params;
@@ -468,12 +507,19 @@ int main(int argc, char ** argv) {
             bind_addr = argv[++i];
         } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
             params.n_threads = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--encoder-batch") == 0) {
+            if (i + 1 >= argc || (std::strcmp(argv[i + 1], "1") && std::strcmp(argv[i + 1], "2") && std::strcmp(argv[i + 1], "4"))) {
+                fprintf(stderr, "xasr-server: --encoder-batch expects 1, 2 or 4\n");
+                return 1;
+            }
+            params.encoder_batch = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--chunk-scheduler") == 0) {
             chunk_scheduler = true;
         } else if (std::strcmp(argv[i], "--joiner-host") == 0) {
             params.joiner_on_device = false;
         }
     }
+    chunk_scheduler = chunk_scheduler || params.encoder_batch > 1;
     ggml_backend_load_all();
 
     std::vector<std::unique_ptr<engine>> engines;
@@ -484,6 +530,9 @@ int main(int argc, char ** argv) {
         xasr_context_params local = params;
         local.device = device;
         local.n_streams = streams;
+        if (std::strcmp(device, "CPU") == 0 && std::strcmp(params.device, "CPU") != 0) {
+            local.encoder_batch = 1;
+        }
         xasr_context * ctx = xasr_init_from_file(argv[1], local);
         if (!ctx) {
             fprintf(stderr, "xasr-server: cannot load %s on %s\n", argv[1], device);
@@ -493,6 +542,7 @@ int main(int argc, char ** argv) {
         eng->ctx = ctx;
         eng->device = device;
         eng->max_sessions = streams;
+        eng->max_batch = local.encoder_batch;
         engines.push_back(std::move(eng));
         return true;
     };

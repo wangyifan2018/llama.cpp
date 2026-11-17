@@ -130,6 +130,8 @@ struct xasr_context {
     geom g;
     ggml_backend_t backend = nullptr, backend_cpu = nullptr;
     std::vector<std::unique_ptr<xasr_slot>> slots;
+    std::unique_ptr<xasr_slot> batch_two, batch_four;
+    std::vector<float> cache_copy;
     xasr_slot * building = nullptr; // slot being built, used by fixed_input
     xasr_joiner joiner;
     void (*dsp_stats)(ggml_backend_t, double *, double *, uint64_t *) = nullptr;
@@ -1230,6 +1232,28 @@ xasr_context * xasr_init_from_file(const char * path, xasr_context_params params
             }
             c->slots.push_back(std::move(slot));
         }
+        if (params.encoder_batch != 1 &&
+            (!c->dsp_stats || (params.encoder_batch != 2 && params.encoder_batch != 4) || n_streams < params.encoder_batch)) {
+            fprintf(stderr, "xasr: batch 2 or 4 requires HTP and at least that many streams\n");
+            return nullptr;
+        }
+        for (int width = 2; width <= params.encoder_batch; width *= 2) {
+            auto & slot = width == 2 ? c->batch_two : c->batch_four;
+            slot = std::make_unique<xasr_slot>();
+            slot->batch_size = width;
+            slot->meta.resize(ggml_tensor_overhead() * graph_nodes + ggml_graph_overhead_custom(graph_nodes, false));
+            if (!prepare_slot(c.get(), *slot)) {
+                fprintf(stderr, "xasr: encoder batch %d is unsupported on the selected device\n", width);
+                return nullptr;
+            }
+        }
+        if (params.encoder_batch > 1) {
+            size_t cache_elements = 0;
+            for (const auto * cache : c->slots.front()->caches) {
+                cache_elements = std::max(cache_elements, size_t(ggml_nelements(cache)));
+            }
+            c->cache_copy.resize(cache_elements);
+        }
         if (params.joiner_on_device && !prepare_joiner(c.get())) {
             fprintf(stderr, "xasr: joiner graph unavailable, using the host decoder\n");
         }
@@ -1250,6 +1274,8 @@ void xasr_free(xasr_context * c) {
     if (c->joiner.ctx) {
         ggml_free(c->joiner.ctx);
     }
+    c->batch_four.reset();
+    c->batch_two.reset();
     c->slots.clear();
     if (c->model.aux_buf) {
         ggml_backend_buffer_free(c->model.aux_buf);
@@ -1340,6 +1366,20 @@ void stream_feed(xasr_stream * s, const float * pcm, int n, bool flush) {
     s->stats.n_frames = n_frames;
 }
 
+bool stream_decode_projection(xasr_stream * s, const float * enc, int frames) {
+    const auto t = xasr_clock::now();
+    if (s->c->joiner.ready) {
+        if (!greedy_run_dev(s->c, s->gs, enc, frames, &s->stats)) {
+            s->failed = true;
+            return false;
+        }
+    } else {
+        greedy_run(s->c->model, s->gs, enc, frames);
+    }
+    s->stats.greedy_ms += span_ms(t);
+    return true;
+}
+
 bool stream_decode(xasr_stream * s, bool flush, bool single_chunk) {
     const int n_frames = s->stats.n_frames;
     std::vector<float> enc;
@@ -1347,17 +1387,7 @@ bool stream_decode(xasr_stream * s, bool flush, bool single_chunk) {
         s->failed = true;
         return false;
     }
-    const auto t = xasr_clock::now();
-    if (s->c->joiner.ready) {
-        if (!greedy_run_dev(s->c, s->gs, enc.data(), (int)(enc.size() / (size_t)s->c->model.hp.joiner_dim), &s->stats)) {
-            s->failed = true;
-            return false;
-        }
-    } else {
-        greedy_run(s->c->model, s->gs, enc.data(), (int)(enc.size() / (size_t)s->c->model.hp.joiner_dim));
-    }
-    s->stats.greedy_ms += span_ms(t);
-    return true;
+    return stream_decode_projection(s, enc.data(), static_cast<int>(enc.size() / s->c->model.hp.joiner_dim));
 }
 
 bool stream_accept(xasr_stream * s, const float * pcm, int n, bool flush) {
@@ -1472,17 +1502,16 @@ bool xasr_begin_step(xasr_stream * s, const float * samples, int count, bool com
     return true;
 }
 
-xasr_step_result xasr_step(xasr_stream * s, std::string & text) {
-    if (!s || !s->stepping) {
-        return xasr_step_result::error;
-    }
-    const auto begin = xasr_clock::now();
-    if (!s->finished && !stream_decode(s, s->step_flush, true)) {
+bool xasr_step_ready(const xasr_stream * s) {
+    return s && s->stepping && !s->finished && !s->failed && s->pos + s->c->g.T < s->stats.n_frames;
+}
+
+static xasr_step_result finish_step(xasr_stream * s, std::string & text) {
+    if (s->failed) {
         s->stepping = false;
         return xasr_step_result::error;
     }
-    s->step_ms += span_ms(begin);
-    if (!s->finished && s->pos + s->c->g.T < s->stats.n_frames) {
+    if (xasr_step_ready(s)) {
         return xasr_step_result::pending;
     }
     s->stepping = false;
@@ -1493,6 +1522,105 @@ xasr_step_result xasr_step(xasr_stream * s, std::string & text) {
         s->stats.append_wall_ms += s->step_ms;
     }
     return xasr_step_result::done;
+}
+
+xasr_step_result xasr_step(xasr_stream * s, std::string & text) {
+    if (!s || !s->stepping) {
+        return xasr_step_result::error;
+    }
+    const auto begin = xasr_clock::now();
+    if (xasr_step_ready(s)) {
+        stream_decode(s, s->step_flush, true);
+    }
+    s->step_ms += span_ms(begin);
+    return finish_step(s, text);
+}
+
+static void copy_batch_caches(xasr_context * c, xasr_slot & batch, xasr_stream * const * streams, bool gather) {
+    for (int lane = 0; lane < batch.batch_size; ++lane) {
+        const auto & caches = streams[lane]->slot->caches;
+        for (size_t i = 0; i < caches.size(); ++i) {
+            auto * single = caches[i];
+            auto * combined = batch.caches[i];
+            const size_t size = ggml_nbytes(single);
+            const size_t offset = lane * size;
+            GGML_ASSERT(size * batch.batch_size == ggml_nbytes(combined));
+            if (gather) {
+                ggml_backend_tensor_get(single, c->cache_copy.data(), 0, size);
+                ggml_backend_tensor_set(combined, c->cache_copy.data(), offset, size);
+            } else {
+                ggml_backend_tensor_get(combined, c->cache_copy.data(), offset, size);
+                ggml_backend_tensor_set(single, c->cache_copy.data(), 0, size);
+            }
+        }
+    }
+}
+
+void xasr_step_batch(xasr_stream * const * streams, int count, xasr_step_result * results, std::string * texts) {
+    if (count != 2 && count != 4) {
+        return;
+    }
+    auto * c = streams[0] ? streams[0]->c : nullptr;
+    auto * batch = c ? (count == 2 ? c->batch_two.get() : c->batch_four.get()) : nullptr;
+    std::fill_n(results, count, xasr_step_result::error);
+    if (!batch) {
+        return;
+    }
+    for (int lane = 0; lane < count; ++lane) {
+        if (!xasr_step_ready(streams[lane]) || streams[lane]->c != c ||
+            std::find(streams, streams + lane, streams[lane]) != streams + lane) {
+            return;
+        }
+    }
+
+    const auto start = xasr_clock::now();
+    copy_batch_caches(c, *batch, streams, true);
+    const double gather_ms = span_ms(start);
+    for (int lane = 0; lane < count; ++lane) {
+        auto * s = streams[lane];
+        upload_encoder_lane(c, *batch, s->feats.data() + size_t(s->pos) * c->model.hp.feature_dim,
+                            s->pos, lane, &s->stats);
+    }
+    const auto compute = xasr_clock::now();
+    const auto rc = ggml_backend_sched_graph_compute(batch->sched, batch->graph);
+    const double compute_ms = span_ms(compute);
+    if (rc != GGML_STATUS_SUCCESS) {
+        for (int lane = 0; lane < count; ++lane) {
+            streams[lane]->failed = true;
+            streams[lane]->stepping = false;
+        }
+        return;
+    }
+    const auto scatter = xasr_clock::now();
+    copy_batch_caches(c, *batch, streams, false);
+    const double scatter_ms = span_ms(scatter);
+    const double shared_ms = span_ms(start);
+    if (timing_requested()) {
+        fprintf(stderr, "xasr-batch size=%d gather_ms=%.3f compute_ms=%.3f scatter_ms=%.3f\n",
+                count, gather_ms, compute_ms, scatter_ms);
+    }
+
+    const size_t out_elements = ggml_nelements(batch->output) / count;
+    const size_t out_size = out_elements * sizeof(float);
+    const int out_frames = static_cast<int>(out_elements / c->model.hp.joiner_dim);
+    std::vector<float> projection(out_elements);
+    for (int lane = 0; lane < count; ++lane) {
+        const auto begin = xasr_clock::now();
+        auto * s = streams[lane];
+        ggml_backend_tensor_get(batch->output, projection.data(), lane * out_size, out_size);
+        s->stats.readback_ms += span_ms(begin);
+        s->stats.compute_ms += compute_ms;
+        s->stats.chunk_ms.push_back(shared_ms + span_ms(begin));
+        if (s->step_flush) {
+            ++s->stats.chunks_commit;
+        } else {
+            ++s->stats.chunks_stream;
+        }
+        s->pos += c->g.decode_chunk_len;
+        stream_decode_projection(s, projection.data(), out_frames);
+        s->step_ms += shared_ms + span_ms(begin);
+        results[lane] = finish_step(s, texts[lane]);
+    }
 }
 
 
