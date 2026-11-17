@@ -161,8 +161,19 @@ curl -sS -X POST localhost:8080/asr/segment --data-binary @segment.f32
 `X-Queue-Ms` and `X-Infer-Ms` so the tail can be split into queueing and
 inference. Overload returns 429 and a queue timeout returns 503. Input must be
 16 kHz mono 16-bit PCM WAV; other formats are rejected rather than resampled.
+Realtime streaming is the same server on `/v1/realtime` (WebSocket): send
+`input_audio_buffer.append` with base64 PCM16 while the user speaks, then
+`input_audio_buffer.commit` at the VAD endpoint. The server answers with
+`conversation.item.input_audio_transcription.delta` (throttled partials, see
+`--partial-ms`/`--partial-interval-ms`) and `.completed`. Partials never delay a
+commit: commit tasks jump the engine queue.
+
+```sh
+python3 tools/ws_client.py --url ws://127.0.0.1:8080/v1/realtime --wav a.wav --paced
+```
+
 See docs/backend/snapdragon/asr-server-api-design.md for the full surface,
-including the Realtime WebSocket mapping and what a general ASR server needs.
+including the Realtime event mapping and what a general ASR server needs.
 
 ## Profiling
 

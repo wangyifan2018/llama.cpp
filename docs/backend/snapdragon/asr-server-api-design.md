@@ -29,7 +29,7 @@
 |---|---|---|---|
 | A. OpenAI 兼容 HTTP | `POST /v1/audio/transcriptions`、`GET /v1/models`、`GET /health`、`GET /metrics` | 对外标准、评测、第三方客户端直接复用 | **已实现** |
 | B. 设备端点 | `POST /asr/segment`（float32 PCM body） | 设备内/座舱前端最低开销调用 | **已实现** |
-| C. 流式 WS | `ws /v1/realtime` | 边说边出字、可打断 | 设计完成，未实现 |
+| C. 流式 WS | `ws /v1/realtime` | 边说边出字、可打断 | **已实现** |
 | D. 原生帧 | TCP `u32 op, u32 session, u32 bytes` | 内部压测、IPC | 已有（`server.cpp`） |
 
 ### 2.1 流式语义映射
@@ -142,8 +142,48 @@ curl -sS -X POST localhost:8899/v1/audio/transcriptions -F file=@a.wav -F respon
 - 不做 OpenAI 的 `/v1/audio/translations`（等有 en 专用模型再说）。
 - 不把 VAD 搬进服务端：前端已有，服务端只消费 commit。
 
-## 9. 实测（SM6650，`--device HTP0:0 --engines 2`）
+## 9. 实测：REST（SM6650，`--device HTP0:0 --engines 2`）
 
-见 `examples/paraformer/api_server.cpp` 的落地结果与 `BENCHMARK` 记录：单段 2.7 s 中文命令
-返回 `{"text":"把主驾空调调到二十一度"}`，四路并发 2x200/2x429（队列=1 时），设备侧经
-`adb forward` 与宿主行为一致。
+单段 2.7 s 中文命令返回 `{"text":"把主驾空调调到二十一度"}`，四路并发全部 200（0.31–0.67 s）
+且转写逐条一致；`--queue 1` 时 2x200 + 2x429；设备侧经 `adb forward` 与宿主行为一致。
+每个响应带 `X-Queue-Ms` / `X-Infer-Ms`（设备实测 0 / 299 ms）。
+
+## 10. 实测：Realtime WebSocket（已实现）
+
+客户端：`examples/paraformer/tools/ws_client.py`（20 ms 分包或一次性发送，收到 delta 打印）。
+
+**partial 策略**：Paraformer 是整句非自回归，partial 只能"把当前已收音频整体再解码一次"，所以：
+
+- 触发条件：新增音频 ≥ `--partial-ms`（默认 800 ms）且距上次 partial ≥
+  `--partial-interval-ms`（默认 600 ms），且该会话没有在飞的 partial；
+- partial 任务以**低优先级**入队，**commit 任务插队**，保证端点不被 partial 拖慢；
+- 结果用"与上次 partial 的最长公共前缀"求增量，只发改动部分（OpenAI 的 delta 语义）；
+- commit/clear 会让 `generation` 自增，在飞的 partial 回来时直接丢弃（不会把旧文本贴到新段上）。
+
+**实测（SM6650，HTP+CPU 两引擎）**：
+
+```text
+event: session.created
+event: session.updated
+delta: '把主驾'
+delta: '空调垫'
+delta: '调到二十'
+event: input_audio_buffer.committed
+completed: 把主驾空调调到二十一度
+endpoint_to_final_ms: 368
+server: queue_ms=1 infer_ms=355
+```
+
+宿主 CPU 上同一段是 `endpoint_to_final 165 ms`。设备上每次 partial 都要跑一次完整推理
+（约 330 ms），所以 partial 的间隔实际上是"每 600 ms 语音换一次增量"；如果产品要更细的增量，
+只能走滑窗解码（设计文档 §5 的 B 档），不是靠调小间隔。
+
+**打断/清空**：`input_audio_buffer.clear` 立刻清空缓冲并让在飞任务失效，随后可以立即开始新段。
+
+**已知偏差（写进文档以免误用）**：
+
+1. 只接受 16 kHz PCM16；24 kHz 会做线性重采样（质量说明见实现注释），产品路径请直接用
+   `/asr/segment` 或 16 kHz。
+2. 没有服务端 VAD：`speech_started/stopped` 事件不发，端点仍由客户端 commit 决定。
+3. 没有 `conversation.item.*` 的完整会话树，只发转写相关的四个事件 + `x.pf.metrics`
+   （非标准，便于观测 queue/infer）。
