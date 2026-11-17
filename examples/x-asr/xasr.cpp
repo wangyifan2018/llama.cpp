@@ -38,6 +38,22 @@ bool timing_requested() {
     return on;
 }
 
+// Print the five best joiner candidates for every emitted token on the host
+// path. The device path returns only the argmax, so without this there is no way
+// to tell "a bias could have flipped this" from "the winner was never close".
+bool logits_requested() {
+    static const bool on = std::getenv("XASR_DEBUG_LOGITS") != nullptr;
+    return on;
+}
+
+// Trace the first N frames even when the winner is blank. A token that is
+// emitted at the first frame of a chunk was decided on one frame of audio, and
+// only this shows whether a later frame would have decided differently.
+int first_frames_traced() {
+    static const int n = std::getenv("XASR_DEBUG_FIRST") ? std::atoi(std::getenv("XASR_DEBUG_FIRST")) : 0;
+    return n;
+}
+
 struct xasr_hparams {
     std::vector<int> n_layers, downsample, n_heads, dims, qd, vd, pd, kernel;
     int pos_dim = 48, decoder_dim = 512, joiner_dim = 512, context_size = 2, vocab = 0, blank_id = 0, feature_dim = 80;
@@ -75,6 +91,7 @@ struct xasr_model {
     ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
     std::vector<std::string> vocab;
+    float hotword_head = 0.3f; // gain multiplier for a word's first token
     // encoder_embed
     ggml_tensor *conv_w[3], *conv_b[3], *cnx_dw_w, *cnx_dw_b, *cnx_pw1_w, *cnx_pw1_b, *cnx_pw2_w, *cnx_pw2_b;
     ggml_tensor *cnx_pw1_q8 = nullptr, *cnx_pw2_q8 = nullptr; // optional Q8_0 copies of the pointwise projections
@@ -859,8 +876,25 @@ ggml_cgraph * build_chunk_graph(xasr_context * c, xasr_slot & slot) {
     return gf;
 }
 
+// One line per node: op, name, elements and bytes written. The per-operator
+// budget says which op is expensive; this says which node pays it, which is the
+// difference between "CONT is 5 ms" and "the two depthwise transposes per layer
+// are most of it".
+void dump_graph(ggml_cgraph * gf) {
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        fprintf(stderr, "xasr: node %d %s %s ne=%lld,%lld,%lld,%lld bytes=%zu\n", i,
+                ggml_op_name(node->op), node->name,
+                (long long) node->ne[0], (long long) node->ne[1],
+                (long long) node->ne[2], (long long) node->ne[3], ggml_nbytes(node));
+    }
+}
+
 bool prepare_slot(xasr_context * c, xasr_slot & slot) {
     slot.graph = build_chunk_graph(c, slot);
+    if (std::getenv("XASR_DUMP_GRAPH")) {
+        dump_graph(slot.graph);
+    }
     ggml_backend_t backends[] = {c->backend, c->backend_cpu};
     slot.sched = ggml_backend_sched_new(backends, nullptr, c->backend == c->backend_cpu ? 1 : 2, graph_nodes, false, false);
     if (!slot.sched) {
@@ -918,6 +952,13 @@ bool load_hotwords(xasr_model & m, const char * path) {
     if (!file) {
         fprintf(stderr, "xasr: cannot open hotword file %s\n", path);
         return false;
+    }
+    // A word's first token carries no left context, so it is biased by this
+    // fraction of the full gain. Raising it lets a bias reach words the model
+    // gets wrong at the start of an utterance; it also raises the cost of
+    // biasing words that merely sound alike.
+    if (const char * head = std::getenv("XASR_HOTWORD_HEAD")) {
+        m.hotword_head = (float) std::atof(head);
     }
 
     char line[512];
@@ -1194,7 +1235,7 @@ void update_hotword_bonus(const xasr_model & m, greedy_state & gs) {
         while (prefix && !std::equal(word.tokens.begin(), word.tokens.begin() + prefix, gs.toks.end() - prefix)) {
             --prefix;
         }
-        const float gain = prefix ? word.bonus : 0.3f * word.bonus;
+        const float gain = prefix ? word.bonus : m.hotword_head * word.bonus;
         auto & current = gs.bonus[word.tokens[prefix]];
         current = std::max(current, gain);
     }
@@ -1211,9 +1252,42 @@ void greedy_init(const xasr_model & m, greedy_state & gs) {
     }
 }
 
+// Top-5 joiner candidates at one frame, offsets from the winner. Ranked by raw
+// logit, so the reported gap is the one a bias would have to overcome rather
+// than the one it produced.
+void print_top_logits(const xasr_model & m, const std::vector<float> & logits, int f, int emit) {
+    const int V = (int) logits.size();
+    int top[5] = { 0, 1, 2, 3, 4 };
+    for (int k = 0; k < 5; ++k) {
+        for (int s = k + 1; s < 5; ++s) {
+            if (logits[(size_t) top[s]] > logits[(size_t) top[k]]) {
+                std::swap(top[k], top[s]);
+            }
+        }
+    }
+    for (int v = 5; v < V; ++v) {
+        if (logits[(size_t) v] <= logits[(size_t) top[4]]) {
+            continue;
+        }
+        int k = 4;
+        while (k > 0 && logits[(size_t) v] > logits[(size_t) top[k - 1]]) {
+            top[k] = top[k - 1];
+            --k;
+        }
+        top[k] = v;
+    }
+    fprintf(stderr, "xasr: logits f=%d emit=%d", f, emit);
+    for (int k = 0; k < 5; ++k) {
+        fprintf(stderr, " | %d \"%s\" %.2f", top[k], m.vocab[(size_t) top[k]].c_str(),
+                logits[(size_t) top[k]] - logits[(size_t) top[0]]);
+    }
+    fprintf(stderr, "\n");
+}
+
 void greedy_run(const xasr_model & m, greedy_state & gs, const float * enc, int n_enc) {
     const auto & hp = m.hp;
     const int J = hp.joiner_dim, V = hp.vocab;
+    const int trace_first = first_frames_traced();
     std::vector<float> t((size_t)J), logits((size_t)V);
     for (int f = 0; f < n_enc; f++) {
         const float * e = enc + (size_t)f * J;
@@ -1242,10 +1316,15 @@ void greedy_run(const xasr_model & m, greedy_state & gs, const float * enc, int 
             best = hp.blank_id;
         }
         if (best != hp.blank_id && best != hp.unk_id) {
+            if (logits_requested()) {
+                print_top_logits(m, logits, f, best);
+            }
             gs.toks.push_back(best);
             gs.hyp.push_back(best);
             gs.d = decoder_out(m, gs.hyp);
             update_hotword_bonus(m, gs);
+        } else if (f < trace_first) {
+            print_top_logits(m, logits, f, -1);
         }
     }
 }

@@ -589,6 +589,60 @@ pressure for everything that follows, so a single profile pass can attribute a
 global cache effect to individual operators. Use the pooled service numbers for
 the decision and the operator table only for ranking.
 
+### H8. Where the remaining operators go (measured, nothing kept)
+
+The operator table ranks by op type. That is the wrong axis for the next cut,
+because the same op type covers both a 3,072-element bias add and a 157 KB
+transpose copy. `XASR_DUMP_GRAPH=1` prints the graph as `op, name, ne, bytes`
+per node, so the count and the bytes can be attributed to a node family:
+
+```sh
+XASR_DUMP_GRAPH=1 build-x-asr/bin/llama-x-asr x-asr-zh-en-q8_0.gguf CPU clip.wav 2> nodes.log
+```
+
+On the B=1 graph: 3,738 nodes, of which 2,782 are executed (the scheduler skips
+`VIEW`, `RESHAPE`, `PERMUTE` and `TRANSPOSE`), i.e. the count the profile sees.
+
+| family | nodes | MB written | where it comes from |
+|---|---:|---:|---|
+| `ADD` | 695 | 12.4 | bias adds from `lin`, residual adds, mask and position adds |
+| `CONT` | 470 | 10.5 | two depthwise transposes per layer (157 KB each, ~57% of these bytes) plus the attention permutes |
+| `MUL_MAT` | 425 | 8.1 | linear layers and the four small-K attention matmuls |
+| `SCALE` | 240 | 8.0 | 198 of them are the two constants inside `swoosh` |
+| `SUB` | 162 | 4.6 | `swoosh` output, `bias_norm`, `bypass` |
+| `MUL` | 157 | 1.9 | `bypass`, gates |
+| `UNARY` | 156 | 4.3 | `softplus`, `sigmoid`, `sqrt` |
+| `CONCAT` | 117 | 5.3 | the streaming cache window |
+| `CPY` | 115 | 4.1 | one cache write per cache tensor per chunk |
+| `SSM_CONV` | 76 | 0.9 | depthwise convolution on the transposed tensor |
+
+At ~7 µs of dispatch per executed node, 2,449 nodes per chunk are roughly 17 ms
+of a 77 ms chunk. Three batches of graph work removed the bookkeeping nodes
+(4,945 of them in H7); what is left is arithmetic and cache traffic, so the two
+candidate cuts left are small and were not taken:
+
+- **Fold the `swoosh` offset into the preceding bias.** `swoosh(x, off, c)` spends
+  one `SCALE` on `x - off`, but its input is always a linear output whose bias is
+  added anyway, so `-off` can live in that bias. 99 nodes per chunk, about 0.7 ms,
+  i.e. under 1%. It costs a shifted copy of 99 small bias tensors in the model.
+- **Replace the depthwise `transpose + CONT + SSM_CONV` with K tap MACs.** K is 3
+  to 5, so 2K-1 elementwise ops replace a 157 KB copy plus a kernel call: about
+  2% of the chunk, and not bit-exact because the accumulation order changes.
+
+Both are below the run-to-run spread of the four-stream service numbers, so the
+graph is treated as at its floor for this chunk size. The next double-digit
+change has to alter the arithmetic rather than the bookkeeping: a wider chunk
+that amortises the per-node fixed cost over more audio, or a fused
+`scale_bias`/`softplus` on the DSP side so a `swoosh` costs one node instead of
+four.
+
+Two diagnostics came out of the same work and stay: `XASR_DEBUG_LOGITS=1` prints
+the five best joiner candidates at every emitted token (raw logits, so a gap can
+be compared against a bias), and `XASR_DEBUG_FIRST=N` traces the first N frames
+even when the winner is blank, which is how an early-emission theory was ruled
+out for the English `Set` error. Both require the host joiner (`--joiner-host`
+or the CLI default); the device path returns only the argmax.
+
 ## Next experiments
 
 1. **Measure where the remaining tail goes.** In [`run_chunks`](xasr.cpp#L746) time feature and mask uploads, scheduled compute and completion, and encoder projection readback. In [`stream_accept`](xasr.cpp#L1018) time fbank, predictor/joiner, and text finalization. Tag each chunk with its phase (audio arrival or commit), sequence position, and number of DSP submissions. Collect a separate per-op profile using the [benchmark command](BENCHMARK.md#optional-htp-operator-profile). This distinguishes DSP kernel time from host submission and waiting. Compare CPU, HTP waiting, and HTP polling under both idle and representative CPU load.
