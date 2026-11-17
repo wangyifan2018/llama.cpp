@@ -943,6 +943,7 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     {
         paraformer_bench_stage _b("fbank+lfr");
         lfr = paraformer_compute_features(ctx, pcm, n_samples, T_lfr, D_lfr_actual);
+        _lap.mark("feat done");
     }
     if (lfr.empty())
         return "";
@@ -1198,6 +1199,7 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
         // the caller asked for frames or for token records.
         cif_predict(ctx, enc_out.data(), T_lfr, D, acoustic_embeds, N_tokens,
                     (out_fire_frames || out_tokens) ? &fire_frames_vec : nullptr);
+        _lap.mark("cif done");
     }
     if (out_fire_frames)
         *out_fire_frames = fire_frames_vec;
@@ -1342,12 +1344,15 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
         }
     }
 
+    _lap.mark("dec compute done");
+
     // 5. Argmax decoding
     paraformer_bench_stage _b_argmax("argmax");
     ggml_tensor* logits = ggml_graph_get_tensor(gf, "logits");
     const int V = (int)hp.vocab_size;
     std::vector<float> logits_data((size_t)V * N_tokens);
     ggml_backend_tensor_get(logits, logits_data.data(), 0, logits_data.size() * sizeof(float));
+    _lap.mark("logits readback");
 
     // §13: optional diagnostics — how many positions to dump top-K logits at.
     const char* dump_env = std::getenv("PF_DUMP_LOGITS");

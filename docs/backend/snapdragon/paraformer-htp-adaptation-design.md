@@ -825,3 +825,31 @@ Q4_K 的单条变慢正好抵掉第三引擎的排队收益（490/723 对 494/70
 
 **边界**：Q4_K 是从 Q8_0 再量化的（多一次舍入）；没有测 Q5_K/Q6_K；没有做长时间热压测；
 HTP 上 Q4_K 是否走了部分回退未从日志确认（只能从“HTP 324 vs CPU 387”判断仍有 DSP 参与）。
+
+## 25. M15 实测：每请求时间线（2026-11-17，SM6650）
+
+把 feat / CIF / decoder / logits 回读都打上 lap 点后，稳态一条 2.70 s 音频（warmup 后）：
+
+| 阶段 | 累计 | 增量 | 占比 |
+|---|---:|---:|---:|
+| feat（fbank+LFR+CMVN） | 3.09 | 3.09 | 1.0% |
+| enc graph（cache hit）+ sched | 3.34 | 0.25 | 0.1% |
+| encoder compute | 244.83 | 241.5 | **81.2%** |
+| CIF（host conv1d+linear+sigmoid） | 254.22 | 9.4 | 3.2% |
+| decoder compute | 296.95 | 42.4 | **14.3%** |
+| logits 回读（8404 x N f32） | 297.28 | 0.33 | 0.1% |
+| 合计 wall | 297.7 | | |
+
+两个结论：
+
+1. **logits 回读可以排除**：只有 0.33 ms，之前怀疑的 800 KB 跨设备拷贝不是瓶颈，不需要把
+   argmax 搬到 DSP。
+2. 除 encoder 外只剩两块：**decoder 42.4 ms** 和 **CIF 9.4 ms**。decoder 的 16 个 block 在
+   N≈26、T≈45 下本来就要 ~0.87 GMAC 的 FFN，加上 cross-attention，42 ms 与“compute-bound”
+   一致，没有明显浪费。
+3. CIF 的 9.4 ms 是 host 上的 conv1d(512x512,k=3) + linear，约 35 MMAC 走标量路径；把它并进
+   encoder 图（alpha 在 DSP 上算，只回传 T 个 float）理论上能省 8 ms 左右（2.7%），
+   是本轮之后剩下的唯一低风险小项。
+
+至此，单请求 297 ms 里 encoder 占 241 ms，与 §10 的结论一致：**除非换权重（量化/更小模型），
+runtime 层已经没有超过 5% 的杠杆**。
