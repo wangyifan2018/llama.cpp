@@ -105,3 +105,36 @@ PY
 # CAM++ 下载（已验证）与阻塞点（需外网 pip）
 ls -la ~/Library/Caches/qwen3-asr-htp/speaker-models/campplus_cn_common.bin
 ```
+
+## 30. M20：CAM++ 说话人门控（HTP+CPU 混合）
+
+**路线**：ASR 留 HTP，声纹判定放 CPU，二者并行，互不占对方的尾延迟预算。
+
+**导出**（`tools/export_campplus_onnx.py`）：用 funasr 1.4.9 的 `CAMPPlus` 加载
+ModelScope 的 `campplus_cn_common.bin`（0 missing / 0 unexpected），导出 ONNX（27.0 MB，
+输入 `feats (B,T,80)`，动态 T，opset 13）。注：本机 pip 走系统代理会重置连接，
+最终是 curl 从阿里云镜像取 wheel、`--no-index` 本地安装才打通；librosa 需锁 0.10.x
+（1.x 要求 Python ≥3.12）。
+
+**已知偏差**：ONNX 与 PyTorch 的余弦相似度只有 **0.950/0.961**（不是 1e-5 级），说明导出图与
+eager 前向存在数值路径差异。但门控判据是"相对距离"，实测在同一批数据上仍然完全可分（见下表），
+所以先用它验证机制；要上线仍应把 parity 修到 0.999 以上（下一步）。
+
+**门控实测**（`tools/spk_gate_eval.py`，Kaldi 风格 80 维 log-mel，司机=Tingting 16 条，
+乘客=Flo 16 条，留一注册）：
+
+| 指标 | 值 |
+|---|---|
+| 本人余弦 | 均值 0.914，最小 **0.838** |
+| 冒充者余弦 | 均值 0.334，最大 **0.375** |
+| 阈值 0.40–0.80 | FRR **0%**、FAR **0%** |
+| EER 附近阈值 | 0.375（FRR 0% / FAR 0%） |
+
+对比上一轮用 160 维 log-mel 统计做声纹（本人/冒充差距 0.011、噪声下余量 0.002）：
+**预训练 embedding 的余量是 0.46，差了两个数量级**。这就是"要不要用预训练模型"的答案。
+
+**成本**：CPU 上 2.5 s 音频 **118 ms**（21× 实时）。放在 HTP 之外并行跑，不进
+`endpoint_to_final`；若要更快，可只用前 1 s（约 50 ms）或每段降采样。
+
+**设备侧缺口**：板上只有 `libonnxruntime.so`，没有 `onnxruntime_c_api.h` 头文件，
+要在 C++ 服务里跑门控需要补头文件（或用 sherpa-onnx 的封装）。这一步未做。
