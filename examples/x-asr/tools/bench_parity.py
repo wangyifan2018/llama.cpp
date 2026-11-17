@@ -72,6 +72,16 @@ def placement(log):
     return out
 
 
+def _cpu_per_request(cpu, arm):
+    rounds = cpu.get(arm) or []
+    requests = sum(r.get("requests", 0) for r in rounds)
+    if not requests:
+        return "-", "-"
+    total = sum(r.get("cpu_ms", 0.0) for r in rounds)
+    wall = sum(r.get("wall_ms", 0.0) for r in rounds)
+    return "%.1f" % (total / requests), ("%.2f" % (total / wall) if wall else "-")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dir", required=True)
@@ -84,7 +94,10 @@ def main():
     arms = [a["name"] for a in config.get("arms", [])]
     if not arms:
         arms = sorted(f[:-6] for f in os.listdir(root) if f.endswith(".jsonl"))
-    gguf_arms = [a for a in arms if a.startswith("htp") or a.startswith("gguf")]
+    engine_of = {a["name"]: a.get("engine") for a in config.get("arms", [])}
+    gguf_arms = [a for a in arms
+                 if engine_of.get(a) == "gguf-htp" or
+                 (a not in engine_of and (a.startswith("htp") or a.startswith("gguf")))]
     onnx_arms = [a for a in arms if a.startswith("onnx")]
 
     data = {a: load_rows(os.path.join(root, a + ".jsonl")) for a in arms}
@@ -180,6 +193,31 @@ def main():
         "so `RTF = 1 / x`. It describes the arrival pattern, not engine throughput.")
     add("")
 
+    # A pooled percentile hides which request produced the tail. Split by the
+    # audio the request carried: a 20 s recording and a 2.65 s command are not
+    # interchangeable in a scheduling comparison.
+    add("## By request role")
+    add("")
+    add("| Arm | Short (<= 5 s) N | p50 | p95 | p99 | Long (> 5 s) N | p50 | p95 |")
+    add("|---|---:|---:|---:|---:|---:|---:|---:|")
+    for arm in arms:
+        ok = [r for r in data[arm] if "endpoint_to_final_ms" in r]
+        short = [r["endpoint_to_final_ms"] for r in ok if r.get("audio_ms", 0) <= 5000]
+        long_ = [r["endpoint_to_final_ms"] for r in ok if r.get("audio_ms", 0) > 5000]
+        add("| `%s` | %d | %s | %s | %s | %d | %s | %s |" % (
+            arm, len(short),
+            "%.0f" % pct(short, 50) if short else "-",
+            "%.0f" % pct(short, 95) if short else "-",
+            "%.0f" % pct(short, 99) if short else "-",
+            len(long_),
+            "%.0f" % pct(long_, 50) if long_ else "-",
+            "%.0f" % pct(long_, 95) if long_ else "-"))
+    add("")
+    add("The split is by `audio_ms` in the record, so it is the same rule for every "
+        "scenario: the short rows are the cabin commands, the long rows are the "
+        "recordings that keep an engine busy.")
+    add("")
+
     add("## Encoder batch widths")
     add("")
     add("| Arm | Widths seen (dispatches) | Placement |")
@@ -200,6 +238,46 @@ def main():
             place = "not instrumented (sherpa-onnx)" if arm.startswith("onnx") else "n/a"
         add("| `%s` | %s | %s |" % (arm, widths, place))
     add("")
+
+    # Routing and host CPU cost. The route lines exist only under XASR_TIMING,
+    # which every GGUF arm sets, so the counts are per OPEN with a routing
+    # decision, not per request.
+    cpu_path = os.path.join(root, "cpu.json")
+    cpu = json.load(open(cpu_path)) if os.path.exists(cpu_path) else {}
+    routed = {}
+    for arm in arms:
+        counts = {}
+        for mode, device in re.findall(r"xasr-route mode=(\S+) device=(\S+)", logs[arm]):
+            counts[(mode, device)] = counts.get((mode, device), 0) + 1
+        gates = re.findall(r"xasr-gate longest_ms=(\S+) threshold_ms=(\S+) open=(\d)", logs[arm])
+        if counts:
+            routed[arm] = (counts, gates)
+    if routed:
+        add("## Engine placement and host CPU")
+        add("")
+        add("| Arm | OPENs by mode and engine | Gate open | CPU ms / request | CPU / wall |")
+        add("|---|---|---|---:|---:|")
+        for arm in arms:
+            if arm not in routed:
+                add("| `%s` | not logged (single engine or ONNX control) | - | %s | %s |"
+                    % (arm, _cpu_per_request(cpu, arm)[0], _cpu_per_request(cpu, arm)[1]))
+                continue
+            counts, gates = routed[arm]
+            detail = ", ".join("%s&rarr;%s %d" % (m, d, c) for (m, d), c in sorted(counts.items()))
+            if gates:
+                opened = sum(1 for g in gates if g[2] == "1")
+                gate = "%d of %d" % (opened, len(gates))
+            else:
+                gate = "not armed"
+            per_req, fraction = _cpu_per_request(cpu, arm)
+            add("| `%s` | %s | %s | %s | %s |" % (arm, detail, gate, per_req, fraction))
+        add("")
+        add("The gate is one decision per OPEN when `--eta-long-ms` is set: it opens "
+            "only while some engine already holds at least that much unprocessed audio. "
+            "`CPU ms / request` is the server process's own utime plus stime over the "
+            "round, divided by the requests that round recorded; `CPU / wall` is the "
+            "same time as a fraction of the round's wall clock, so 1.00 means one core.")
+        add("")
 
     # Transcript parity. Key is (scenario, round, session); a rep that errors on
     # one arm is skipped rather than counted as a mismatch.

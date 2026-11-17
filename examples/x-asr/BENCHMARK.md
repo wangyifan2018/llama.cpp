@@ -970,6 +970,153 @@ python3 examples/x-asr/tools/bench_adaptive_cpu.py 18765 en-20.wav zh.wav --reps
 Raw JSONL, per-arm logs and route decisions: `/tmp/xasr-router-1/`,
 `/tmp/xasr-router-2/`, `/tmp/xasr-router-3/`.
 
+## Routing on remaining work, 2026-11-17
+
+The least-loaded rule compares queue lengths. A stream that is mid-append has
+already left the queue, so under a burst of finalized VAD segments the rule
+keeps choosing the engine that is already busy. `--route-resident` replaces the
+queue with the audio an engine has accepted and not finished, times its own
+measured ms per ms of audio, so a 20 s recording counts as roughly twenty
+seconds of work rather than as one queue entry.
+
+Resident audio is added when a request is enqueued and debited when it leaves
+the worker for good, so a request parked between encoder chunks still counts.
+`--eta-long-ms N` arms a gate for either router: beneath N ms of unprocessed
+audio anywhere the server falls back to least-loaded. `--cpu-queue N` bounds the
+CPU engine's queue separately, for the paced case only.
+
+Both servers keep four HTP slots and two CPU slots with batch cap 4 unless the
+arm name says otherwise:
+
+```sh
+# default hybrid, the control
+bin/llama-x-asr-server x-asr-zh-en-q8_0.gguf HTP0:0 --port 18765 \
+    --streams 4 --cpu-streams 2 --threads 2 --encoder-batch 4
+# resident router behind a 3 s gate
+... --route-resident --eta-long-ms 3000
+```
+
+Three rounds interleaved across arms, N=3 for `single` and N=12 for each
+four-session scenario, 504 requests, no failure and no missing text:
+
+| Arm | single p50/p95 | aligned4 | stagger4 | mixed4 | burst4 | vadburst |
+|---|---|---|---|---|---|---|
+| `onnx-cpu` | 126.7 / 133.6 | 370.5 / 582.5 | 134.4 / 151.9 | 175.1 / 259.6 | 1016.5 / 1577.4 | 944.3 / 2379.6 |
+| `htp-b4` | 199.9 / 200.0 | 592.2 / 825.3 | 317.2 / 334.5 | 317.3 / 491.0 | 1680.9 / 2427.8 | 1929.7 / 5045.5 |
+| `hybrid` | 196.7 / 198.1 | 344.7 / 415.4 | 253.4 / 276.8 | 260.2 / 402.4 | 856.8 / 1854.4 | 1011.5 / 4298.8 |
+| `hybrid-cpuq` | 199.5 / 201.1 | 371.0 / 527.2 | 252.2 / 274.5 | 252.1 / 406.9 | 1039.0 / 1541.8 | 866.9 / 4315.0 |
+| `hybrid-eta` | 203.8 / 204.2 | 378.5 / 405.9 | 202.5 / 243.1 | 226.9 / 283.9 | 864.9 / 1262.4 | 1012.6 / 4304.8 |
+| `hybrid-resident` | 198.5 / 199.7 | 340.1 / 577.9 | 252.2 / 270.6 | 264.4 / 424.8 | 855.7 / 1525.8 | 1046.6 / 4295.9 |
+| `hybrid-cpu3` | 201.4 / 202.0 | 394.3 / 571.6 | 222.5 / 271.1 | 253.9 / 440.1 | 854.8 / 1854.5 | 1016.9 / 4304.2 |
+| `hybrid-resident-cpu3` | 188.2 / 201.6 | 373.8 / 401.5 | 250.5 / 271.7 | 227.4 / 282.9 | 926.0 / 1514.2 | 1289.5 / 3925.0 |
+
+A pooled percentile mixes the 20 s recording with the 2.65 s commands, so the
+same requests split by the audio they carried (`audio_ms` in the record). Short
+p95, per arm: N=3 on `single`, 6 on `mixed4`, 9 on `vadburst`, 12 on the rest:
+
+| Arm | single | aligned4 | stagger4 | mixed4 | burst4 | vadburst |
+|---|---|---|---|---|---|---|
+| `onnx-cpu` | 134 | 583 | 152 | 269 | 1577 | 1127 |
+| `htp-b4` | 200 | 825 | 335 | 499 | 2428 | 1953 |
+| `hybrid` | 198 | 415 | 277 | 428 | 1854 | 1124 |
+| `hybrid-cpuq` | 201 | 527 | 275 | 417 | 1542 | 1129 |
+| `hybrid-eta` | 204 | 406 | 243 | 257 | 1262 | 1125 |
+| `hybrid-resident` | 200 | 578 | 271 | 426 | 1526 | 1121 |
+| `hybrid-cpu3` | 202 | 572 | 271 | 451 | 1854 | 1129 |
+| `hybrid-resident-cpu3` | 202 | 401 | 272 | 248 | 1514 | 1302 |
+
+`burst4` and `mixed4` separated the arms, so the three candidates ran a second
+pass, six rounds interleaved, N=24 per cell, on those two scenarios plus
+`aligned4` and `vadburst`:
+
+| Arm | aligned4 p50/p95 | mixed4 | burst4 | vadburst | short p50/p95/p99 (N=78) |
+|---|---|---|---|---|---|
+| `hybrid` | 377.9 / 456.0 | 237.4 / 360.7 | 924.0 / 1253.0 | 1015.0 / 4311.8 | 555 / 1230 / 1397 |
+| `hybrid-eta` | 382.5 / 527.4 | 242.0 / 357.9 | 913.9 / 1262.5 | 1015.0 / 4299.8 | 549 / 1254 / 1264 |
+| `hybrid-resident` | 381.3 / 527.4 | 252.9 / 416.6 | 855.7 / 1861.6 | 1076.2 / 4308.2 | 553 / 1260 / 1863 |
+
+Findings:
+
+- The default hybrid already beats HTP-only with no policy change: short p95
+  825 to 415 on aligned four-way, 2428 to 1854 on the burst, 1953 to 1124 on
+  the VAD burst. The CPU engine earns its two slots; the routing question is
+  only about which of the four requests lands where.
+- The VAD burst is already deterministic under the default rule. Three rounds,
+  per-session values within 10 ms (`757 / 765 / 773`, `1122 / 1126 / 1115`,
+  `902 / 901 / 908`). The 20 s APPEND and its COMMIT keep the HTP queue at one
+  or two entries for the whole 650 ms window, so the queue-length rule splits
+  the three commands 1 to 2 against HTP, every time. There is nothing left for
+  a better router to fix in that cell: 1124 against 1121.
+- The gate is exactly selective. It opened 9 of 64 routing decisions in the
+  first pass and 18 of 97 in the second, which is precisely the three vadburst
+  commands per round, and it never opened in `single`, `aligned4`, `stagger4`,
+  `mixed4` or `burst4`. A gated policy therefore costs nothing on paced audio
+  by construction, and that part of the design holds.
+- Neither candidate beats the control outside the noise. Over six rounds the
+  per-cell differences are 5 ms on `vadburst`, 5 ms on `mixed4` p50 and 30 ms on
+  `aligned4` p95, and the ordering changes between the two passes. `hybrid-resident`
+  is worse on `mixed4` p95 (416.6 against 360.7) and `vadburst` p50 (1076 against
+  1015). Keep the default and both routers opt-in.
+- `--cpu-queue 1` cannot bind on this workload and its apparent win is a
+  tie-break shift. A finalized segment is one APPEND followed by one COMMIT, so
+  a CPU session never has more than one request outstanding; the cap only delays
+  enqueues. The 866.9 against 1011.5 p50 comes from the three commands being
+  assigned `s19/s21` instead of `s19/s20`, and the per-engine commit cost is the
+  same in both arms (147 and 143 ms). Rejected.
+- A third CPU slot makes the 20 s recording 9 percent faster and every command
+  slower. `hybrid-resident-cpu3` sends all three commands to CPU, HTP keeps the
+  recording to itself, and the recording's p95 falls 4296 to 3925 while the
+  commands rise 1121 to 1302, because three sessions share two CPU threads. The
+  CPU engine is thread-bound, not slot-bound. Rejected as a default.
+- The `burst4` tail is bimodal, not noisy. The four lanes land at either
+  `550 / 640 / 1070 / 1260` or `550 / 640 / 1250 / 1860`; the second regime is
+  the two HTP lanes running one after the other instead of in one batch, and it
+  costs 620 ms. Rounds in the second regime: 1 of 6 for `hybrid`, 3 of 6 for
+  `hybrid-resident`, 0 of 6 for `hybrid-eta`. Routing only decides which lanes
+  pair up; whether a pair shares a dispatch is the chunk scheduler's admission
+  rule, and that is where the next change belongs.
+- `--eta-router` is no longer the arm that was measured before. The age term
+  used `oldest_active_commit_ms`, which the worker updated only under
+  `--adaptive-cpu`, so it was always zero in every earlier router run. It is now
+  maintained unconditionally, which roughly doubles the weight of the age term.
+  The earlier 1621 to 1163 result therefore does not carry over, and today's
+  `hybrid-eta` is within noise of the default.
+- Host CPU is not the constraint. The server process burns 1462 ms of CPU per
+  request at 0.78 of a core for `hybrid`, 1446 at 0.77 for `hybrid-resident`,
+  and 979 at 0.53 for `htp-b4`; `hybrid-resident-cpu3` reaches 1408 at 0.81 and
+  still loses on command latency.
+
+Where the remaining gap actually is. Same file, same build, one stream, whole
+file appended at once (`bin/llama-x-asr MODEL DEVICE en-20.wav zh-10.wav`):
+
+| Engine | en-20 wall | RTF | zh-10 wall | RTF |
+|---|---|---|---|---|
+| our CPU engine | 3545 ms | 0.177 | 1766 ms | 0.177 |
+| our HTP engine | 3832 ms | 0.192 | 2013 ms | 0.201 |
+| sherpa-onnx INT8 CPU control | 2376 ms | 0.119 | - | - |
+
+The device engine is 8 percent slower than our own CPU engine on the same file,
+and both are about 1.6x slower than the ONNX control on the same CPU. So the
+deficit is not the NPU: it is the graph, the layouts and the per-chunk work in
+this implementation, and the ONNX control is the fair comparison to profile
+against. That is what the next batch works on.
+
+Raw per-request JSONL, per-arm logs, `cpu.json` and `summary.md`:
+`$HOME/Library/Caches/qwen3-asr-htp/xasr-load/2026-11-17-batch2/` (eight arms,
+three rounds, six scenarios) and `.../2026-11-17-batch2b/` (three arms, six
+rounds, four scenarios).
+
+Reproduce:
+
+```sh
+python3 examples/x-asr/tools/bench_load_matrix.py --rounds 3 --interleave \
+    --arms onnx-cpu,htp-b4,hybrid,hybrid-cpuq,hybrid-eta,hybrid-resident,hybrid-cpu3,hybrid-resident-cpu3 \
+    --out /tmp/xasr-batch2
+python3 examples/x-asr/tools/bench_load_matrix.py --rounds 6 --interleave \
+    --scenarios aligned4,mixed4,burst4,vadburst \
+    --arms hybrid,hybrid-eta,hybrid-resident --out /tmp/xasr-batch2b
+```
+
 ## Reproduce on Android
 
 Run these blocks from the repository root in the same Bash session. The [Snapdragon toolchain guide](../../docs/backend/snapdragon/README.md) covers Docker and ADB setup. Set `ANDROID_SERIAL` if several devices are attached.

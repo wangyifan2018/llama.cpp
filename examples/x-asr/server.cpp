@@ -67,6 +67,7 @@ struct request {
     double enqueued_ms = 0;
     engine * eng = nullptr;
     std::vector<float> audio;
+    double audio_ms = 0; // survives the swap below, so the engine can debit it once
     socket_ref connection;
     bool started = false;
     xasr_stream * ready_stream = nullptr;
@@ -89,6 +90,14 @@ struct engine {
     int threads = 1;
     std::atomic<double> oldest_active_commit_ms{0};
     std::atomic<bool> active_work{false};
+    // Audio accepted but not finished, in ms of audio. This is the routing
+    // signal: it says how much work is already committed to this engine, which
+    // a queue length cannot, because a stream in progress leaves its queue empty.
+    std::atomic<double> resident_ms{0};
+    // Engine ms per ms of audio, measured on this device from append steps. It
+    // turns resident_ms into an estimate of remaining wall time.
+    std::atomic<double> cost_ratio{0.85};
+    size_t queue_cap = 256;
     int live = 0;
     std::deque<request> queue;
     std::mutex mutex;
@@ -109,6 +118,13 @@ struct engine {
 
 static double now_ms() {
     return std::chrono::duration<double, std::milli>(xasr_clock::now().time_since_epoch()).count();
+}
+
+// std::atomic<double> has no fetch_add before C++20, and this build targets C++17.
+static void atomic_add(std::atomic<double> & target, double delta) {
+    double current = target.load();
+    while (!target.compare_exchange_weak(current, current + delta)) {
+    }
 }
 
 static std::mutex sessions_mutex;
@@ -199,6 +215,7 @@ static void close_session(uint32_t id) {
 // Bounded queue: a reader that outruns its engine blocks here, which is the
 // backpressure the client sees as a stalled socket.
 static size_t queue_limit = 256;
+static size_t cpu_queue_limit = 0; // 0 keeps queue_limit for the CPU engine
 static bool chunk_scheduler = false;
 static bool adaptive_cpu = false;
 static std::atomic<int> idle_cpus{-1};
@@ -265,11 +282,33 @@ static double oldest_commit(double oldest, const request & req) {
     return oldest;
 }
 
-// Estimated completion order: sessions already running, plus a penalty when the
-// engine's oldest commit is already late. The engine with the smallest score is
-// expected to finish a new session first. Ties go to the earlier engine, which
-// is the device engine, so model compute stays on HTP when both are free.
+// Routing policies, in the order the server picks one at OPEN.
+//
+// least_loaded  the original rule: fewest queued frames. Cheap, but blind to a
+//               stream that is mid-append, because that stream has already left
+//               the queue. Under a finalized-segment burst it therefore keeps
+//               choosing the engine that is already busy.
+// eta           live sessions plus a penalty for an overdue commit.
+// resident      resident audio on the engine, times its measured ms per ms of
+//               audio: an estimate of remaining wall time. This is the only one
+//               of the three that can tell a 20 s segment from a 2.65 s one.
+//
+// eta and resident are opt-in. `--eta-long-ms N` arms a gate that applies them
+// only while some engine already holds at least N ms of unprocessed audio, which
+// is the shape that a burst of finalized VAD segments produces behind a long
+// recording. Below the gate both fall back to least_loaded, so paced audio keeps
+// the rule it was measured with.
 static bool eta_router = false;
+static bool route_resident = false;
+static double route_long_ms = 0;
+
+static double longest_resident(const std::vector<engine *> & engines) {
+    double longest = 0;
+    for (auto * eng : engines) {
+        longest = std::max(longest, eng->resident_ms.load());
+    }
+    return longest;
+}
 
 static engine * reserve_eta(const std::vector<engine *> & engines) {
     engine * best = nullptr;
@@ -293,6 +332,76 @@ static engine * reserve_eta(const std::vector<engine *> & engines) {
         fprintf(stderr, "xasr-route mode=eta device=%s score=%.2f live=%d age_ms=%.1f\n",
                 best ? best->device : "busy", best_score, best ? best->live : 0,
                 best ? best->oldest_active_commit_ms.load() : 0.0);
+    }
+    return best;
+}
+
+static engine * reserve_resident(const std::vector<engine *> & engines) {
+    engine * best = nullptr;
+    double best_score = 0;
+    std::string detail;
+    for (auto * eng : engines) {
+        std::lock_guard<std::mutex> lock(eng->mutex);
+        if (eng->live >= eng->max_sessions) {
+            continue;
+        }
+        const double resident = eng->resident_ms.load();
+        const double score = resident * eng->cost_ratio.load();
+        if (getenv("XASR_TIMING")) {
+            char cell[96];
+            snprintf(cell, sizeof(cell), " %s(res=%.0f cost=%.2f score=%.0f live=%d)",
+                     eng->device, resident, eng->cost_ratio.load(), score, eng->live);
+            detail += cell;
+        }
+        if (!best || score < best_score - 1e-9) {
+            best = eng;
+            best_score = score;
+        }
+    }
+    if (best) {
+        ++best->live;
+    }
+    if (getenv("XASR_TIMING")) {
+        fprintf(stderr, "xasr-route mode=resident device=%s score=%.0f%s\n",
+                best ? best->device : "busy", best_score, detail.c_str());
+    }
+    return best;
+}
+
+// Fallback rule: the engine with the fewest queued frames that still has a slot.
+static engine * reserve_least_loaded(const std::vector<engine *> & engines, const char * mode) {
+    engine * best = nullptr;
+    size_t best_pending = 0;
+    for (auto * eng : engines) {
+        std::lock_guard<std::mutex> lock(eng->mutex);
+        if (eng->live >= eng->max_sessions) {
+            continue;
+        }
+        if (!best || eng->queue.size() < best_pending) {
+            best = eng;
+            best_pending = eng->queue.size();
+        }
+    }
+    if (!best) {
+        if (getenv("XASR_TIMING")) {
+            fprintf(stderr, "xasr-route mode=%s device=busy\n", mode);
+        }
+        return nullptr;
+    }
+    {
+        std::lock_guard<std::mutex> lock(best->mutex);
+        if (best->live >= best->max_sessions) {
+            // Lost the race between the scan and the reservation.
+            if (getenv("XASR_TIMING")) {
+                fprintf(stderr, "xasr-route mode=%s device=busy\n", mode);
+            }
+            return nullptr;
+        }
+        ++best->live;
+    }
+    if (getenv("XASR_TIMING")) {
+        fprintf(stderr, "xasr-route mode=%s device=%s queued=%zu live=%d\n",
+                mode, best->device, best_pending, best->live);
     }
     return best;
 }
@@ -324,12 +433,38 @@ static engine * reserve_adaptive(const std::vector<engine *> & engines) {
     return chosen;
 }
 
+static engine * reserve_route(const std::vector<engine *> & engines) {
+    if (adaptive_cpu) {
+        return reserve_adaptive(engines);
+    }
+    const double longest = longest_resident(engines);
+    const bool gate_armed = route_long_ms > 0;
+    const bool gate_open = !gate_armed || longest >= route_long_ms;
+    if (getenv("XASR_TIMING") && gate_armed) {
+        fprintf(stderr, "xasr-gate longest_ms=%.0f threshold_ms=%.0f open=%d\n",
+                longest, route_long_ms, gate_open ? 1 : 0);
+    }
+    if (gate_open && route_resident) {
+        return reserve_resident(engines);
+    }
+    if (gate_open && eta_router) {
+        return reserve_eta(engines);
+    }
+    return reserve_least_loaded(engines, gate_armed && !gate_open ? "least_loaded_gated" : "least_loaded");
+}
 
 static void push(engine * eng, request && req) {
+    if (req.op == OP_APPEND) {
+        req.audio_ms = (double) req.audio.size() / 16.0;
+    }
+    const double audio_ms = req.audio_ms;
     {
         std::unique_lock<std::mutex> lock(eng->mutex);
-        eng->space.wait(lock, [eng] { return eng->queue.size() < queue_limit || eng->stopping; });
+        eng->space.wait(lock, [eng] { return eng->queue.size() < eng->queue_cap || eng->stopping; });
         eng->queue.push_back(std::move(req));
+        if (audio_ms > 0) {
+            atomic_add(eng->resident_ms, audio_ms);
+        }
     }
     eng->ready.notify_one();
 }
@@ -419,7 +554,10 @@ static void worker_loop(engine * eng) {
                     eng->queue.erase(eng->queue.begin() + (long) commit_at);
                 }
             }
-            if (adaptive_cpu) {
+            // Published on every iteration so both the adaptive gate and the ETA
+            // score see a live number; it used to be maintained only under
+            // --adaptive-cpu, which left the ETA age term permanently zero.
+            {
                 double oldest = 0;
                 for (const auto & req : pending) {
                     oldest = oldest_commit(oldest, req);
@@ -443,6 +581,11 @@ static void worker_loop(engine * eng) {
         }
         for (size_t lane = 0; lane < batch.size(); ++lane) {
             auto & req = batch[lane];
+            // Debited once, when the request leaves the worker for good. A
+            // request parked in `pending` is still unprocessed work.
+            const double lane_audio_ms = req.audio_ms;
+            bool lane_done = true;
+            const auto work_begin = xasr_clock::now();
             xasr_stream * s = nullptr;
             {
                 std::lock_guard<std::mutex> lock(sessions_mutex);
@@ -492,6 +635,7 @@ static void worker_loop(engine * eng) {
                             if (pending.empty()) {
                                 admissions = 0;
                             }
+                            lane_done = false;
                             pending.push_back(std::move(req));
                             break;
                         }
@@ -503,6 +647,7 @@ static void worker_loop(engine * eng) {
                             result = xasr_step(s, text);
                         }
                         if (result == xasr_step_result::pending) {
+                            lane_done = false;
                             pending.push_back(std::move(req));
                             break;
                         }
@@ -536,8 +681,19 @@ static void worker_loop(engine * eng) {
                     respond(req.fd, ST_ERROR, "unknown op");
                     break;
             }
+            if (lane_done && lane_audio_ms > 0) {
+                atomic_add(eng->resident_ms, -lane_audio_ms);
+                // Measured engine cost per ms of audio, weighted by sample size so
+                // a 20 s segment moves it and a 20 ms packet barely does.
+                const double spent = std::chrono::duration<double, std::milli>(xasr_clock::now() - work_begin).count();
+                const double alpha = std::min(1.0, lane_audio_ms / 500.0);
+                const double sample = spent / lane_audio_ms;
+                if (sample > 0 && sample < 100) {
+                    eng->cost_ratio.store((1 - alpha) * eng->cost_ratio.load() + alpha * sample);
+                }
+            }
         }
-        if (adaptive_cpu) {
+        {
             // Publish pending commits between iterations, including before a wait.
             double oldest = 0;
             for (const auto & req : pending) {
@@ -581,53 +737,12 @@ static void reader_thread(int fd, std::vector<engine *> engines) {
             break;
         }
         if (req.op == OP_OPEN) {
-            if (eta_router) {
-                req.eng = reserve_eta(engines);
-                if (!req.eng) {
-                    respond(fd, ST_ERROR, "open: no available engine capacity");
-                } else {
-                    push(req.eng, std::move(req));
-                }
-                continue;
-            }
-            if (adaptive_cpu) {
-                req.eng = reserve_adaptive(engines);
-                if (!req.eng) {
-                    respond(fd, ST_ERROR, "open: no available engine capacity");
-                } else {
-                    push(req.eng, std::move(req));
-                }
-                continue;
-            }
-            // Pin the session to the least loaded engine that still has a slot.
-            engine * best = nullptr;
-            size_t best_pending = 0;
-            for (auto * eng : engines) {
-                std::lock_guard<std::mutex> lock(eng->mutex);
-                if (eng->live >= eng->max_sessions) {
-                    continue;
-                }
-                if (!best || eng->queue.size() < best_pending) {
-                    best = eng;
-                    best_pending = eng->queue.size();
-                }
-            }
-            if (!best) {
+            engine * chosen = reserve_route(engines);
+            if (!chosen) {
                 respond(fd, ST_ERROR, "open: all streams busy");
                 continue;
             }
-            {
-                std::lock_guard<std::mutex> lock(best->mutex);
-                if (best->live < best->max_sessions) {
-                    ++best->live;
-                    req.eng = best;
-                }
-            }
-            if (!req.eng) {
-                respond(fd, ST_ERROR, "open: all streams busy");
-                continue;
-            }
-            push(best, std::move(req));
+            push(chosen, std::move(req));
             continue;
         }
         {
@@ -652,7 +767,7 @@ static void reader_thread(int fd, std::vector<engine *> engines) {
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s MODEL.gguf DEVICE [--hotwords FILE] [--port N] [--streams N] [--cpu-streams N] [--queue N] [--bind ADDR] [--chunk-scheduler] [--encoder-batch 1|2|4] [--adaptive-cpu] [--eta-router]\n", argv[0]);
+        fprintf(stderr, "usage: %s MODEL.gguf DEVICE [--hotwords FILE] [--port N] [--streams N] [--cpu-streams N] [--queue N] [--cpu-queue N] [--bind ADDR] [--chunk-scheduler] [--encoder-batch 1|2|4] [--adaptive-cpu] [--eta-router] [--route-resident] [--eta-long-ms N]\n", argv[0]);
         return 1;
     }
     xasr_context_params params;
@@ -671,6 +786,12 @@ int main(int argc, char ** argv) {
             idle_limit_ms = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--queue") == 0 && i + 1 < argc) {
             queue_limit = (size_t) std::max(1, std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--cpu-queue") == 0 && i + 1 < argc) {
+            cpu_queue_limit = (size_t) std::max(1, std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--eta-long-ms") == 0 && i + 1 < argc) {
+            route_long_ms = std::max(0.0, std::atof(argv[++i]));
+        } else if (std::strcmp(argv[i], "--route-resident") == 0) {
+            route_resident = true;
         } else if (std::strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
             bind_addr = argv[++i];
         } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
@@ -733,6 +854,7 @@ int main(int argc, char ** argv) {
         eng->max_sessions = streams;
         eng->max_batch = local.encoder_batch;
         eng->threads = local.n_threads;
+        eng->queue_cap = (std::strcmp(device, "CPU") == 0 && cpu_queue_limit > 0) ? cpu_queue_limit : queue_limit;
         engines.push_back(std::move(eng));
         return true;
     };
@@ -769,8 +891,14 @@ int main(int argc, char ** argv) {
         return 5;
     }
     for (auto * eng : raw) {
-        fprintf(stderr, "xasr-server: engine %s with %d streams\n", eng->device, eng->max_sessions);
+        fprintf(stderr, "xasr-server: engine %s with %d streams, queue %zu\n",
+                eng->device, eng->max_sessions, eng->queue_cap);
     }
+    fprintf(stderr, "xasr-server: routing %s%s%s gate_ms=%.0f\n",
+            adaptive_cpu ? "adaptive" : route_resident ? "resident" : eta_router ? "eta" : "least_loaded",
+            (route_resident || eta_router) ? " fallback=least_loaded" : "",
+            (route_resident || eta_router) && route_long_ms > 0 ? " gated" : "",
+            route_long_ms);
     fprintf(stderr, "xasr-server: idle timeout %.0f ms, listening on %s:%d\n", idle_limit_ms, bind_addr, port);
     std::thread(janitor_loop, raw).detach();
 #ifdef __linux__

@@ -95,6 +95,15 @@ def arm_specs(args):
             argv += ["--encoder-batch", str(batch)]
         return ("gguf-htp", argv + tail, htp_env, batch)
 
+    # The documented default hybrid: four HTP slots, two CPU slots, batch cap 4.
+    # Scheduling arms are one factor on top of this exact command line.
+    def hybrid(tail, cpu_streams=2):
+        return ("gguf-htp",
+                ["bin/llama-x-asr-server", gguf, "HTP0:0"] + common +
+                ["--streams", "4", "--cpu-streams", str(cpu_streams), "--threads", "2",
+                 "--encoder-batch", "4"] + tail,
+                htp_env, 4)
+
     specs = {
         "onnx-cpu": ("onnx", ["onnx/bin/onnx-server", remote + "/onnx/model",
                               str(args.onnx_threads)] + common + ["--streams", "4"],
@@ -102,12 +111,17 @@ def arm_specs(args):
         "htp-b1": htp(None, extra),
         "htp-b2": htp(2, extra),
         "htp-b4": htp(4, extra),
-        "htp-hybrid": ("gguf-htp", ["bin/llama-x-asr-server", gguf, "HTP0:0"] + common +
-                       ["--streams", "2", "--cpu-streams", "2"] + extra,
-                       htp_env, None),
-        "htp-b4-hybrid": ("gguf-htp", ["bin/llama-x-asr-server", gguf, "HTP0:0"] + common +
-                          ["--streams", "2", "--cpu-streams", "2", "--encoder-batch", "4"] +
-                          extra, htp_env, 4),
+        "hybrid": hybrid([]),
+        # H1: bound what one CPU session may have outstanding.
+        "hybrid-cpuq": hybrid(["--cpu-queue", "1"]),
+        # H2 control: the previous opt-in router, unconditional.
+        "hybrid-eta": hybrid(["--eta-router"]),
+        # H2 candidate: route on remaining audio behind a long-stream gate.
+        "hybrid-resident": hybrid(["--route-resident", "--eta-long-ms", "3000"]),
+        # H3: a third CPU slot, which only a router that can see the long stream
+        # will ever use.
+        "hybrid-cpu3": hybrid([], 3),
+        "hybrid-resident-cpu3": hybrid(["--route-resident", "--eta-long-ms", "3000"], 3),
     }
     return specs
 
@@ -193,6 +207,9 @@ def main():
             sys.exit("missing fixture %s" % path)
 
     dev = Device(args.adb, args.serial, args.remote)
+    # /proc/<pid>/stat reports utime and stime in USER_HZ; ask rather than assume.
+    tck_out = dev.shell("getconf CLK_TCK 2>/dev/null || echo 100", check=False).stdout.strip()
+    clk_tck = int(tck_out) if tck_out.isdigit() and int(tck_out) > 0 else 100
     specs = arm_specs(args)
     arms = [a for a in args.arms.split(",") if a]
     for arm in arms:
@@ -224,6 +241,7 @@ def main():
         "port": args.port,
         "rounds": args.rounds,
         "interleaved": args.interleave,
+        "clk_tck": clk_tck,
         "scenarios": args.scenarios.split(","),
         "model": {"path": args.remote + "/x-asr-zh-en-q8_0.gguf", "sha256": model_hash},
         "fixtures": {name: {"path": path, "sha256": sha256(path)}
@@ -242,31 +260,72 @@ def main():
             os.remove(stale)
 
     handle = None
+    def engine_pid(engine):
+        name = "onnx-server" if engine == "onnx" else "llama-x-asr-server"
+        return (dev.shell("pidof %s" % name, check=False).stdout or "").split()
+
+    def cpu_ticks(engine):
+        """Host CPU ticks burned by the server process, or None.
+
+        Two samples per round, taken outside the measured window, so the probe
+        itself never runs while a scenario is being timed.
+        """
+        pid = engine_pid(engine)
+        if not pid:
+            return None
+        out = dev.shell("awk '{print $14+$15}' /proc/%s/stat" % pid[0], check=False).stdout
+        try:
+            return int(out.split()[0])
+        except (IndexError, ValueError):
+            return None
+
+    def count_lines(path):
+        if not os.path.exists(path):
+            return 0
+        with open(path) as fh:
+            return sum(1 for _ in fh)
+
+    cpu = {}
+
+    def one_round(arm, rnd, warmup):
+        log_name = "/data/local/tmp/xasr-arm-%s-r%d.log" % (arm, rnd)
+        handle, header = start_server(dev, specs[arm], log_name)
+        if warmup:
+            print("\n".join(l for l in header.splitlines()
+                            if "listening" in l or "engine " in l or "routing " in l), flush=True)
+            for _ in range(warmup):
+                run([sys.executable, os.path.join(HERE, "asr_client.py"),
+                     "--port", str(args.port), "--sessions", "1", "--reps", "1",
+                     "--wav", fixtures["zh.wav"], "--paced", "--json"], check=False)
+        jsonl = os.path.join(out, arm + ".jsonl")
+        before = count_lines(jsonl)
+        ticks0 = cpu_ticks(specs[arm][0])
+        wall0 = time.time()
+        measured = run([sys.executable, os.path.join(HERE, "bench_arrival.py"),
+                        "--port", str(args.port), "--label", arm, "--reps", "1",
+                        "--round-base", str(rnd), "--append",
+                        "--short", fixtures["zh.wav"], "--short-en", fixtures["en.wav"],
+                        "--long", fixtures["zh-10.wav"], "--long-en", fixtures["en-20.wav"],
+                        "--scenarios", args.scenarios, "--out", jsonl])
+        wall_ms = (time.time() - wall0) * 1000.0
+        ticks1 = cpu_ticks(specs[arm][0])
+        requests = count_lines(jsonl) - before
+        print(measured.stdout.rstrip(), flush=True)
+        if ticks0 is not None and ticks1 is not None and requests > 0:
+            cpu.setdefault(arm, []).append({
+                "round": rnd,
+                "wall_ms": round(wall_ms, 1),
+                "cpu_ms": round((ticks1 - ticks0) * 1000.0 / clk_tck, 1),
+                "requests": requests,
+            })
+        with open(os.path.join(out, "%s-r%d.log" % (arm, rnd)), "w") as fh:
+            fh.write(dev.shell("cat %s" % log_name, check=False).stdout)
+        return handle
+
     try:
         stop_server(dev, None)
         run([args.adb] + (["-s", args.serial] if args.serial else []) +
             ["forward", "tcp:%d" % args.port, "tcp:%d" % args.port], check=False)
-
-        def one_round(arm, rnd, warmup):
-            log_name = "/data/local/tmp/xasr-arm-%s-r%d.log" % (arm, rnd)
-            handle, header = start_server(dev, specs[arm], log_name)
-            if warmup:
-                print("\n".join(l for l in header.splitlines()
-                                if "listening" in l or "engine " in l or "threads," in l), flush=True)
-                for _ in range(warmup):
-                    run([sys.executable, os.path.join(HERE, "asr_client.py"),
-                         "--port", str(args.port), "--sessions", "1", "--reps", "1",
-                         "--wav", fixtures["zh.wav"], "--paced", "--json"], check=False)
-            measured = run([sys.executable, os.path.join(HERE, "bench_arrival.py"),
-                            "--port", str(args.port), "--label", arm, "--reps", "1",
-                            "--round-base", str(rnd), "--append",
-                            "--short", fixtures["zh.wav"], "--short-en", fixtures["en.wav"],
-                            "--long", fixtures["zh-10.wav"], "--long-en", fixtures["en-20.wav"],
-                            "--scenarios", args.scenarios, "--out", os.path.join(out, arm + ".jsonl")])
-            print(measured.stdout.rstrip(), flush=True)
-            with open(os.path.join(out, "%s-r%d.log" % (arm, rnd)), "w") as fh:
-                fh.write(dev.shell("cat %s" % log_name, check=False).stdout)
-            return handle
 
         # Interleaved: round by round across arms, so device drift hits every arm.
         if args.interleave:
@@ -296,6 +355,8 @@ def main():
 
     with open(os.path.join(out, "config.json"), "w") as fh:
         json.dump(config, fh, indent=2)
+    with open(os.path.join(out, "cpu.json"), "w") as fh:
+        json.dump(cpu, fh, indent=2)
 
     print("\nrun directory:", out)
     if not args.no_parity:

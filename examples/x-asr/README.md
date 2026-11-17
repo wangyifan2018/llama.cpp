@@ -128,6 +128,17 @@ one COMMIT at its endpoint. The server returns only final text.
   latest 200 ms sample. Unavailable CPU telemetry disables CPU admission in
   this mode. Existing streams stay on their assigned engine. See the
   [routing smoke test](BENCHMARK.md#adaptive-cpu-admission) for reproduction.
+- `--route-resident` is a second opt-in router. It scores an engine by the
+  audio it has accepted but not finished, times its own measured ms per ms of
+  audio, instead of by queue length, so a stream that is mid-append still
+  counts as load. `--eta-long-ms N` arms a gate for either router: below N ms
+  of unprocessed audio anywhere the server falls back to the least-loaded
+  rule, so paced audio keeps the behaviour it was measured with. The resident
+  audio is debited when a request leaves the worker, and the ms-per-ms ratio
+  is an EWMA over append steps weighted by their audio length.
+- `--cpu-queue N` bounds the CPU engine's queue separately from `--queue`.
+  It cannot bind on finalized VAD segments, where one APPEND is followed by one
+  COMMIT, so it is only of interest for paced streams on the CPU engine.
 - A client that disconnects without CLOSE is reaped by the idle timeout.
 - Degenerate input: an all-zero segment drives the encoder normalisation to zero
   variance and the logits to NaN. The decoder now clamps an out of range argmax
