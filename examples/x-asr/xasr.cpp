@@ -120,6 +120,10 @@ struct xasr_slot {
     ggml_backend_sched_t sched = nullptr;
     std::vector<uint8_t> meta;
     std::vector<ggml_tensor *> caches;
+    // Streaming-cache writes whose value is a strided view of a tensor already in
+    // the graph. The tail copy reads it directly, so the value is never
+    // materialised into its own contiguous buffer first. See cache_fold().
+    std::vector<std::pair<ggml_tensor *, std::string>> folded_caches;
     std::vector<ggml_tensor *> masks;
     std::vector<std::pair<ggml_tensor *, std::vector<float>>> constants;
     ggml_tensor * feats = nullptr;
@@ -517,6 +521,44 @@ ggml_tensor * last_cols(ggml_context * g, ggml_tensor * x, int n) {
     return ggml_cont(g, ggml_view_3d(g, x, x->ne[0], n, x->ne[2], x->nb[1], x->nb[2], (size_t)(x->ne[1] - n) * x->nb[1]));
 }
 
+// Same window, left strided. Only for the cache write path: the destination is a
+// ggml_cpy, whose kernels handle a strided source, so materialising the window
+// first would copy the same bytes twice.
+ggml_tensor * last_cols_view(ggml_context * g, ggml_tensor * x, int n) {
+    return ggml_view_3d(g, x, x->ne[0], n, x->ne[2], x->nb[1], x->nb[2], (size_t)(x->ne[1] - n) * x->nb[1]);
+}
+
+// Streaming caches are written by copying the last rows of a wider buffer into a
+// smaller one. Building that window with last_cols() materialises it (one CONT),
+// then ggml_cpy moves it again; folding the two into one ggml_cpy whose source is
+// the strided view removes one copy and one graph node per cache.
+// XASR_CACHE_FOLD=0 restores the two-step path.
+bool cache_fold() {
+    static const bool on = [] {
+        const char * s = std::getenv("XASR_CACHE_FOLD");
+        return !s || std::atoi(s) != 0;
+    }();
+    return on;
+}
+
+// Record a cache write for the tail of build_chunk_graph. The name matches the
+// input tensor the copy lands in, so add_cache() can pair them in build order.
+void queue_cache(xasr_context * c, ggml_tensor * src, const std::string & name) {
+    c->building->folded_caches.emplace_back(src, name);
+}
+
+// Copy the last n frames of src into streaming cache `name`.
+void out_tensor(ggml_cgraph * gf, ggml_tensor * t, const std::string & name);
+
+void cache_write(xasr_context * c, ggml_context * g, ggml_cgraph * gf, ggml_tensor * src, int n,
+                 const std::string & name) {
+    if (cache_fold()) {
+        queue_cache(c, last_cols_view(g, src, n), name);
+    } else {
+        out_tensor(gf, last_cols(g, src, n), "o_" + name);
+    }
+}
+
 ggml_tensor * rows(ggml_context * g, ggml_tensor * x, int r0, int n) {
     return ggml_cont(g, ggml_view_3d(g, x, n, x->ne[1], x->ne[2], x->nb[1], x->nb[2], (size_t)r0 * ggml_element_size(x)));
 }
@@ -616,7 +658,7 @@ ggml_tensor * zipformer_layer(xasr_context * c, ggml_context * g, ggml_cgraph * 
     ggml_tensor * ck = ggml_new_tensor_3d(g, GGML_TYPE_F32, H * qd, left, batch);
     in_tensor(ck, lname("ck", li));
     ggml_tensor * kfull = ggml_concat(g, ck, k, 1); // (H*qd, Tk)
-    out_tensor(gf, last_cols(g, kfull, left), lname("o_ck", li));
+    cache_write(c, g, gf, kfull, left, lname("ck", li));
     ggml_tensor * Q = ggml_cont(g, ggml_permute(g, q, 0, 2, 1, 3));                                     // (qd, seq, H)
     ggml_tensor * Kh = ggml_cont(g, ggml_permute(g, ggml_reshape_4d(g, kfull, qd, H, Tk, batch), 0, 2, 1, 3)); // (qd, Tk, H)
     ggml_tensor * sc = ggml_mul_mat(g, Kh, Q);                                                          // (Tk, seq, H)
@@ -642,7 +684,7 @@ ggml_tensor * zipformer_layer(xasr_context * c, ggml_context * g, ggml_cgraph * 
         ggml_tensor * cn = ggml_new_tensor_3d(g, GGML_TYPE_F32, hid, left, batch);
         in_tensor(cn, lname("cn", li));
         ggml_tensor * xp = ggml_concat(g, cn, xx, 1); // (hid, Tk)
-        out_tensor(gf, last_cols(g, xp, left), lname("o_cn", li));
+        cache_write(c, g, gf, xp, left, lname("cn", li));
         ggml_tensor * W0 = ggml_view_3d(g, W, Tk, seq, batch, W->nb[1], W->nb[3], 0);
         ggml_tensor * o = ggml_mul_mat(g, ggml_cont(g, ggml_transpose(g, xp)), W0); // (hid, seq)
         x = ggml_add(g, x, lin(g, ggml_mul(g, o, y), L.na_out_w, L.na_out_b));
@@ -654,7 +696,7 @@ ggml_tensor * zipformer_layer(xasr_context * c, ggml_context * g, ggml_cgraph * 
         ggml_tensor * cv = ggml_new_tensor_3d(g, GGML_TYPE_F32, H * vd, left, batch);
         in_tensor(cv, lname(cname, li));
         ggml_tensor * vf = ggml_concat(g, cv, v, 1); // (H*vd, Tk)
-        out_tensor(gf, last_cols(g, vf, left), lname((std::string("o_") + cname).c_str(), li));
+        cache_write(c, g, gf, vf, left, lname(cname, li));
         ggml_tensor * Vt = ggml_cont(g, ggml_permute(g, ggml_reshape_4d(g, vf, vd, H, Tk, batch), 1, 2, 0, 3)); // (Tk, vd, H)
         ggml_tensor * o = ggml_mul_mat(g, Vt, W);                                                        // (vd, seq, H)
         o = ggml_cont(g, ggml_permute(g, o, 0, 2, 1, 3));                                               // (vd, H, seq)
@@ -667,7 +709,7 @@ ggml_tensor * zipformer_layer(xasr_context * c, ggml_context * g, ggml_cgraph * 
         ggml_tensor * cc = ggml_new_tensor_3d(g, GGML_TYPE_F32, d, pad, batch);
         in_tensor(cc, lname(cname, li));
         ggml_tensor * xc = ggml_concat(g, cc, xg, 1); // (d, pad+seq)
-        out_tensor(gf, last_cols(g, xc, pad), lname((std::string("o_") + cname).c_str(), li));
+        cache_write(c, g, gf, xc, pad, lname(cname, li));
         ggml_tensor * causal = ggml_add(g, dwconv_valid(g, xc, C.causal_w), C.causal_b);
         ggml_tensor * chunk = dwconv_valid(g, ggml_pad_ext(g, xg, 0, 0, pad, pad, 0, 0, 0, 0), C.chunk_w);
         chunk = ggml_add(g, chunk, C.chunk_b);
@@ -726,9 +768,12 @@ ggml_cgraph * build_chunk_graph(xasr_context * c, xasr_slot & slot) {
     ggml_tensor * ecache = ggml_new_tensor_4d(g, GGML_TYPE_F32, Fp, 3, Ch, batch);
     in_tensor(ecache, "emb_cache");
     ggml_tensor * xcat = ggml_concat(g, ecache, x, 1); // (F', chunk+6, 128)
-    out_tensor(gf,
-               ggml_cont(g, ggml_view_4d(g, xcat, Fp, 3, Ch, batch, xcat->nb[1], xcat->nb[2], xcat->nb[3], (size_t)G.chunk * xcat->nb[1])),
-               "o_emb_cache");
+    ggml_tensor * ewin = ggml_view_4d(g, xcat, Fp, 3, Ch, batch, xcat->nb[1], xcat->nb[2], xcat->nb[3], (size_t)G.chunk * xcat->nb[1]);
+    if (cache_fold()) {
+        queue_cache(c, ewin, "emb_cache");
+    } else {
+        out_tensor(gf, ggml_cont(g, ewin), "o_emb_cache");
+    }
     ggml_tensor * y = ggml_conv_2d_dw_direct(g, m.cnx_dw_w, xcat, 1, 1, 3, 0, 1, 1); // (F', chunk, 128)
     y = ggml_add(g, y, cbias(m.cnx_dw_b));
     y = ggml_cont(g, ggml_permute(g, y, 1, 2, 0, 3)); // (128, F', chunk)
@@ -784,9 +829,22 @@ ggml_cgraph * build_chunk_graph(xasr_context * c, xasr_slot & slot) {
     out_tensor(gf, lin(g, full, m.enc_proj_w, m.enc_proj_b), "enc_out");
     auto add_cache = [&](const std::string & name) {
         auto * input = ggml_graph_get_tensor(gf, name.c_str());
-        auto * output = ggml_graph_get_tensor(gf, ("o_" + name).c_str());
         ggml_set_output(input);
         c->building->caches.push_back(input);
+        // Folded writes point straight at the strided window, so the tail copy is
+        // the only one that moves these bytes.
+        ggml_tensor * output = nullptr;
+        if (cache_fold()) {
+            for (auto & folded : c->building->folded_caches) {
+                if (folded.second == name) {
+                    output = folded.first;
+                    break;
+                }
+            }
+        }
+        if (!output) {
+            output = ggml_graph_get_tensor(gf, ("o_" + name).c_str());
+        }
         // All reads of the old cache are in the graph before this write.
         ggml_build_forward_expand(gf, ggml_cpy(g, output, input));
     };

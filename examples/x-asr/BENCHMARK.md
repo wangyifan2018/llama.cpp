@@ -1119,6 +1119,68 @@ python3 examples/x-asr/tools/bench_load_matrix.py --rounds 6 --interleave \
     --arms hybrid,hybrid-eta,hybrid-resident --out /tmp/xasr-batch2b
 ```
 
+## Per-chunk budget and folded cache writes, 2026-11-17
+
+Profiling the split first. `bin/llama-x-asr MODEL HTP0:0 en-20.wav` with
+`XASR_TIMING=1` and `GGML_HEXAGON_PROFILE=1`, HTP0, batch 1, 43 chunks, 2,551
+operators per chunk in two DSP batches (2,048 + 503):
+
+| Group | ms/chunk | share | per call |
+|---|---:|---:|---:|
+| `MUL_MAT+ADD` (q8_0 projection) | 25.6 | 30.8% | 84.6 µs, 92.9 GMAC/s |
+| `MUL_MAT` (small-K attention) | 10.5 | 12.6% | 104.3 µs, 25.6 GMAC/s |
+| `CONT` | 7.5 | 9.0% | 585 calls, 8.1 µs fixed |
+| `CONV_2D_DW` (ConvNeXt 7x7) | 5.6 | 6.7% | 1 call, 5.58 ms |
+| `CPY` (streaming caches) | 5.4 | 6.5% | 115 calls, 46 µs fixed |
+| `ADD`+`SCALE`+`SUB`+`MUL` | 8.8 | 10.6% | ~2,000 calls, 6.6–8.7 µs fixed |
+| `IM2COL` (subsampling) | 3.8 | 4.5% | 3 calls, 1.26 ms |
+| rest of the graph | 8.4 | 10.1% | |
+| fbank, greedy, readback | 5.4 | 6.3% | outside `compute_ms` |
+
+The per-operator fit `usec = fixed + slope * elements` is flat in size for every
+elementwise operator: a `CONT` over 96 elements costs 9 µs, one over 65,536 costs
+13 µs. So each of the ~2,000 small operators per chunk is ~7.5 µs of dispatch,
+about 15 ms per chunk, 18 percent of it. This, not the NPU, is why the HTP engine
+trails the ONNX control on the same CPU: ONNX pays 8.5 µs per kernel and we pay
+7.5 µs per operator on the DSP plus a coarser split.
+
+The cache write was the one place paying twice. Each of the 115 streaming caches
+was built with `ggml_cont(last_cols(...))` and then copied into the cache, so the
+same bytes moved twice and cost two graph nodes.
+
+| Arm | graph nodes | DSP op ms (43 chunks) | `compute_ms` | `en-20` wall | RTF |
+|---|---:|---:|---:|---:|---:|
+| two-step (`XASR_CACHE_FOLD=0`) | 2,897 | 3,540 | 3,581.8 | 3,810.8 | 0.1905 |
+| folded (default) | 2,782 | 3,175 | 3,210.9 | 3,440.8 | 0.1720 |
+
+Six interleaved rounds, N=6 for `single` and N=24 per four-session scenario,
+144 requests, 0 errors, 0 missing text, all six GGUF fixtures byte-identical:
+
+| Scenario | folded p50 / p95 | two-step p50 / p95 |
+|---|---|---|
+| single | 173.9 / 177.7 | 198.2 / 200.1 |
+| aligned4 | 356.9 / 381.9 | 356.5 / 588.3 |
+| stagger4 | 206.5 / 233.2 | 253.1 / 272.2 |
+| mixed4 | 251.3 / 392.4 | 256.3 / 460.5 |
+| burst4 | 813.8 / 1134.9 | 838.3 / 1253.5 |
+| vadburst | 1049.5 / 4283.0 | 1005.6 / 4283.9 |
+
+The one adverse cell is `vadburst` p50 (+4.4 percent) with an unchanged p95; in
+that scenario the 20 s recording holds the HTP queue for the whole arrival
+window, so the sign of a small move there is not stable between passes. Pooled
+short commands: p50 359 against 392, p95 1135 against 1246.
+
+Reproduce:
+
+```sh
+python3 examples/x-asr/tools/bench_profile.py --wav en-20.wav --mode ops --env XASR_CACHE_FOLD=0
+python3 examples/x-asr/tools/bench_load_matrix.py --rounds 6 --interleave \
+    --arms hybrid,hybrid-nofold --out /tmp/xasr-batch3b
+```
+
+Raw JSONL, per-arm logs, `summary.md`, both operator profiles and the three-arm
+run against the ONNX control: `$HOME/Library/Caches/qwen3-asr-htp/xasr-load/2026-11-17-batch3/`.
+
 ## Reproduce on Android
 
 Run these blocks from the repository root in the same Bash session. The [Snapdragon toolchain guide](../../docs/backend/snapdragon/README.md) covers Docker and ADB setup. Set `ANDROID_SERIAL` if several devices are attached.

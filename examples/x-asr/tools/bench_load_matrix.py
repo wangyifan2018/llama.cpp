@@ -97,12 +97,12 @@ def arm_specs(args):
 
     # The documented default hybrid: four HTP slots, two CPU slots, batch cap 4.
     # Scheduling arms are one factor on top of this exact command line.
-    def hybrid(tail, cpu_streams=2):
+    def hybrid(tail, cpu_streams=2, env_extra=""):
         return ("gguf-htp",
                 ["bin/llama-x-asr-server", gguf, "HTP0:0"] + common +
                 ["--streams", "4", "--cpu-streams", str(cpu_streams), "--threads", "2",
                  "--encoder-batch", "4"] + tail,
-                htp_env, 4)
+                htp_env + env_extra, 4)
 
     specs = {
         "onnx-cpu": ("onnx", ["onnx/bin/onnx-server", remote + "/onnx/model",
@@ -112,6 +112,9 @@ def arm_specs(args):
         "htp-b2": htp(2, extra),
         "htp-b4": htp(4, extra),
         "hybrid": hybrid([]),
+        # Batch 3: the same binary with the two-step cache write restored, so the
+        # fold can be measured on one arrival sequence instead of across builds.
+        "hybrid-nofold": hybrid([], 2, " XASR_CACHE_FOLD=0"),
         # H1: bound what one CPU session may have outstanding.
         "hybrid-cpuq": hybrid(["--cpu-queue", "1"]),
         # H2 control: the previous opt-in router, unconditional.

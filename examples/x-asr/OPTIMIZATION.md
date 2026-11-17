@@ -490,6 +490,105 @@ the third engine would have to beat a 1.0 s saturated tail to matter.
 Recorded so the next attempt starts from the kernel cache and the op coverage
 question instead of rediscovering them.
 
+### H7. Fold the streaming-cache write into one copy (kept, now the default)
+
+**Where the 83 ms per chunk goes.** `XASR_TIMING=1` and
+`GGML_HEXAGON_PROFILE=1` on `en-20.wav`, HTP0, batch 1, 43 chunks, 2,551
+operators per chunk in two DSP batches (2,048 + 503). Operator time is the DSP
+body only; it sums to 3,540 ms against 3,579 ms of `compute_ms`, so the split
+below carries the batch boundaries and the host submit as a small residual:
+
+| Group | ms/chunk | share |
+|---|---:|---:|
+| `MUL_MAT+ADD` (q8_0 projection, 92.9 GMAC/s) | 25.6 | 30.8% |
+| `MUL_MAT` (small-K attention, 25.6 GMAC/s) | 10.5 | 12.6% |
+| `CONT` (layout, 585 calls) | 7.5 | 9.0% |
+| `CONV_2D_DW` (ConvNeXt 7x7, 1 call, 5.58 ms) | 5.6 | 6.7% |
+| `CPY` (115 cache writes, 46 µs each) | 5.4 | 6.5% |
+| `ADD` / `SCALE` / `SUB` / `MUL` (2,000 calls) | 8.8 | 10.6% |
+| `IM2COL` (3 subsampling convs) | 3.8 | 4.5% |
+| `SOFTPLUS`, `SSM_CONV`, `SOFT_MAX`, `CONCAT`, `PAD`, rest | 8.4 | 10.1% |
+| outside the graph (fbank, greedy, readback) | 5.4 | 6.3% |
+
+The per-call floor is the point. Fitting `usec = a + b * elements` per operator
+over all 110k records gives `a` between 6.3 and 8.7 µs for every elementwise
+operator, and the fit is flat in size: a `CONT` over 96 elements costs 9 µs and
+one over 65,536 elements costs 13 µs. Two thousand small operators per chunk at
+~7.5 µs is 15 ms, 18 percent of the chunk, spent on dispatch rather than
+arithmetic. `CPY` is the exception at 46 µs; the extra 38 µs sit in the DMA
+hand-off, not in the bytes (`b` is 0.14 ns/element, 28 GB/s).
+
+**Bottleneck.** Every streaming cache was written twice. `last_cols()` builds
+the window with `ggml_cont`, materialising 8–131 KB into its own graph tensor,
+and the tail of `build_chunk_graph` then copies that tensor into the cache with
+`ggml_cpy`. 115 caches per chunk: `emb_cache` plus 19 layers x 6.
+
+**Change.** `cache_write()` records the strided window directly and
+`add_cache()` copies from it, so the cache write is one `ggml_cpy` whose source
+is a `ggml_view_3d`. The downstream copy already handles a strided source
+(`HTP_COPY_KERNEL_RESHAPE`), the value never leaves the graph, and the graph
+loses 115 nodes. `XASR_CACHE_FOLD=0` restores the two-step path for the A/B.
+
+**Reproduce.**
+
+```sh
+# Single stream, both arms, same binary and same device.
+adb shell -T "cd /data/local/tmp/llama.cpp && \
+  export LD_LIBRARY_PATH=\$PWD/lib ADSP_LIBRARY_PATH=\$PWD/lib \
+  GGML_HEXAGON_DEVICES=HTP0:0 GGML_HEXAGON_OPBATCH=2048 GGML_HEXAGON_OPPOLL=1 XASR_TIMING=1 && \
+  XASR_CACHE_FOLD=0 bin/llama-x-asr x-asr-zh-en-q8_0.gguf HTP0:0 en-20.wav && \
+  XASR_CACHE_FOLD=1 bin/llama-x-asr x-asr-zh-en-q8_0.gguf HTP0:0 en-20.wav"
+
+# Stage and operator budget for either arm.
+python3 examples/x-asr/tools/bench_profile.py --wav en-20.wav --mode ops --env XASR_CACHE_FOLD=0
+
+# Six interleaved rounds, both arms, the six arrival scenarios.
+python3 examples/x-asr/tools/bench_load_matrix.py --rounds 6 --interleave \
+  --arms hybrid,hybrid-nofold --out /tmp/xasr-batch3b
+```
+
+**Result.** Operator count 110,373 to 105,428 over the run, exactly the 4,945
+caches removed; `CONT` drops 25,155 to 20,210 calls and 324 to 221 ms. DSP
+operator time 3,540 to 3,175 ms. Single stream on `en-20.wav`, adjacent runs,
+only the environment differs: `compute_ms` 3,581.8 to 3,210.9 (−10.4 percent),
+wall 3,810.8 to 3,440.8 ms, RTF 0.1905 to 0.1720. `zh-10.wav` 1,911.9 to
+1,714.1 ms of compute.
+
+Six interleaved rounds on the phone, N=6 for `single` and N=24 per four-session
+scenario, 0 errors, 0 missing text:
+
+| Scenario | fold p50 / p95 | two-step p50 / p95 |
+|---|---|---|
+| single | 173.9 / 177.7 | 198.2 / 200.1 |
+| aligned4 | 356.9 / 381.9 | 356.5 / 588.3 |
+| stagger4 | 206.5 / 233.2 | 253.1 / 272.2 |
+| mixed4 | 251.3 / 392.4 | 256.3 / 460.5 |
+| burst4 | 813.8 / 1134.9 | 838.3 / 1253.5 |
+| vadburst | 1049.5 / 4283.0 | 1005.6 / 4283.9 |
+
+Pooled over the 108 short commands: p50 359 against 392, p95 1135 against 1246.
+Transcripts are byte-identical on all four fixtures, on the repeated and
+interleaved requests, and on the CPU backend, where the graph also drops from
+2,897 to 2,782 nodes. Cancel, surviving-stream parity and slot reuse pass.
+
+**What it does not cover.** The one adverse cell is `vadburst` p50, 1049.5
+against 1005.6, and its p95 is identical. In that scenario the 20 s recording
+holds the HTP queue for the whole arrival window, so a faster encoder changes
+when the three commands reach the head of the queue rather than how long they
+wait; the sign of a 4 percent move there is not stable across passes. Two things
+stay untouched: the other 2,436 operators per chunk still pay ~7.5 µs each, and
+`CONV_2D_DW` at 5.58 ms plus `IM2COL` at 3.8 ms remain the two largest single
+non-matmul items. The 46 µs `CPY` floor also remains for the writes that do not
+fold, and it is the next target for the same reason: 38 µs of it is hand-off
+overhead rather than bandwidth.
+
+One caveat on reading the operator table: `ADD`, `SCALE` and `MUL_MAT+ADD` also
+got 20 to 25 percent cheaper per call after this change while their operand
+count and bytes did not move. Removing 4,945 intermediate tensors lowers L2
+pressure for everything that follows, so a single profile pass can attribute a
+global cache effect to individual operators. Use the pooled service numbers for
+the decision and the operator table only for ranking.
+
 ## Next experiments
 
 1. **Measure where the remaining tail goes.** In [`run_chunks`](xasr.cpp#L746) time feature and mask uploads, scheduled compute and completion, and encoder projection readback. In [`stream_accept`](xasr.cpp#L1018) time fbank, predictor/joiner, and text finalization. Tag each chunk with its phase (audio arrival or commit), sequence position, and number of DSP submissions. Collect a separate per-op profile using the [benchmark command](BENCHMARK.md#optional-htp-operator-profile). This distinguishes DSP kernel time from host submission and waiting. Compare CPU, HTP waiting, and HTP polling under both idle and representative CPU load.
