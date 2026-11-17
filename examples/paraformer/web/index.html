@@ -69,6 +69,7 @@
         <dt>服务端排队</dt><dd id="mQueue">—</dd>
         <dt>服务端推理</dt><dd id="mInfer">—</dd>
         <dt>服务端语言</dt><dd id="mLang">—</dd>
+        <dt>说话人相似度</dt><dd id="mSpk">—</dd>
         <dt>分段数</dt><dd id="mSegs">0</dd>
         <dt>历史 p50 / p95</dt><dd id="mPct">—</dd>
         <dt>近 8 段</dt><dd id="mSpark" style="font-family:ui-monospace,monospace">—</dd>
@@ -160,6 +161,10 @@
             $('mE2E').textContent = e2e + ' ms';
             segments += 1;
             $('mSegs').textContent = segments;
+            if (m.speaker_score !== undefined) {
+              $('mSpk').textContent = m.speaker_score.toFixed(3) + (m.speaker_ok ? ' 司机' : ' 非司机');
+              $('mSpk').style.color = m.speaker_ok ? '#67e8a0' : '#ff9a9a';
+            }
             if (e2e) {
               history.push(e2e);
               const sorted = history.slice().sort((a, b) => a - b);
@@ -173,6 +178,11 @@
             break;
           }
           case 'x.pf.metrics':
+            if (m.speaker_score !== undefined) {
+              const ok = m.speaker_ok;
+              $('mSpk').textContent = m.speaker_score.toFixed(3) + (ok ? ' 司机' : ' 非司机');
+              $('mSpk').style.color = ok ? '#67e8a0' : '#ff9a9a';
+            }
             $('mQueue').textContent = Math.round(m.queue_ms) + ' ms';
             $('mInfer').textContent = Math.round(m.infer_ms) + ' ms';
             break;

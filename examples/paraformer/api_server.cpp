@@ -17,6 +17,10 @@
 #include "httplib.h"
 #include "json.hpp"
 
+#ifdef XASR_SPEAKER
+#include "c-api.h"
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -26,6 +30,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <future>
 #include <memory>
@@ -435,6 +440,155 @@ static json segments_json(const std::vector<WordSpan>& words, bool zh, double ga
     return segs;
 }
 
+// ---- speaker gate (optional) ----
+//
+// The CAM++ embedding runs on the CPU while the ASR runs on HTP, so a commit
+// costs max(asr, embedding) rather than their sum. The voiceprint is enrolled at
+// startup from a directory of the driver's utterances; every segment is scored
+// against its centroid and reported as speaker_score / speaker_ok.
+
+static std::string g_speaker_model;
+static std::string g_enroll_dir;
+static float g_speaker_threshold = 0.55f;
+static bool g_speaker_enabled = false;
+
+#ifdef XASR_SPEAKER
+static const SherpaOnnxSpeakerEmbeddingExtractor* g_extractor = nullptr;
+static std::vector<float> g_voiceprint;
+static std::mutex g_extractor_mutex;
+
+static bool spk_read_wav(const std::string& path, std::vector<float>& out) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) {
+        return false;
+    }
+    std::fseek(f, 0, SEEK_END);
+    long n = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    std::vector<char> bytes((size_t) std::max(0L, n));
+    const bool ok = std::fread(bytes.data(), 1, bytes.size(), f) == bytes.size();
+    std::fclose(f);
+    if (!ok) {
+        return false;
+    }
+    std::string err;
+    return parse_wav(std::string(bytes.data(), bytes.size()), out, err);
+}
+
+static std::vector<float> spk_embed(const std::vector<float>& samples) {
+    std::lock_guard<std::mutex> lock(g_extractor_mutex);
+    if (!g_extractor) {
+        return {};
+    }
+    const SherpaOnnxOnlineStream* s = SherpaOnnxSpeakerEmbeddingExtractorCreateStream(g_extractor);
+    SherpaOnnxOnlineStreamAcceptWaveform(s, 16000, samples.data(), (int32_t) samples.size());
+    SherpaOnnxOnlineStreamInputFinished(s);
+    std::vector<float> emb;
+    if (SherpaOnnxSpeakerEmbeddingExtractorIsReady(g_extractor, s)) {
+        const float* v = SherpaOnnxSpeakerEmbeddingExtractorComputeEmbedding(g_extractor, s);
+        if (v) {
+            const int32_t dim = SherpaOnnxSpeakerEmbeddingExtractorDim(g_extractor);
+            emb.assign(v, v + dim);
+            SherpaOnnxSpeakerEmbeddingExtractorDestroyEmbedding(v);
+        }
+    }
+    SherpaOnnxDestroyOnlineStream(s);
+    return emb;
+}
+
+static float spk_cosine(const std::vector<float>& a, const std::vector<float>& b) {
+    if (a.size() != b.size() || a.empty()) {
+        return 0.0f;
+    }
+    double dot = 0, na = 0, nb = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        dot += (double) a[i] * b[i];
+        na += (double) a[i] * a[i];
+        nb += (double) b[i] * b[i];
+    }
+    return (float) (dot / (std::sqrt(na * nb) + 1e-9));
+}
+
+static bool spk_init() {
+    if (g_speaker_model.empty()) {
+        return false;
+    }
+    SherpaOnnxSpeakerEmbeddingExtractorConfig cfg;
+    std::memset(&cfg, 0, sizeof(cfg));
+    cfg.model = g_speaker_model.c_str();
+    cfg.num_threads = 1;
+    cfg.debug = 0;
+    cfg.provider = "cpu";
+    g_extractor = SherpaOnnxCreateSpeakerEmbeddingExtractor(&cfg);
+    if (!g_extractor) {
+        std::fprintf(stderr, "pf-api: cannot load speaker model %s\n", g_speaker_model.c_str());
+        return false;
+    }
+    const int32_t dim = SherpaOnnxSpeakerEmbeddingExtractorDim(g_extractor);
+    std::fprintf(stderr, "pf-api: speaker model %s, dim=%d\n", g_speaker_model.c_str(), dim);
+    if (g_enroll_dir.empty()) {
+        std::fprintf(stderr, "pf-api: no --enroll-dir, speaker gate disabled\n");
+        return false;
+    }
+    std::vector<std::string> files;
+    for (const auto& entry : std::filesystem::directory_iterator(g_enroll_dir)) {
+        const std::string p = entry.path().string();
+        if (p.size() > 4 && p.compare(p.size() - 4, 4, ".wav") == 0) {
+            files.push_back(p);
+        }
+    }
+    std::sort(files.begin(), files.end());
+    std::vector<float> acc((size_t) dim, 0.0f);
+    int used = 0;
+    double self_cos = 0;
+    std::vector<std::vector<float>> embs;
+    for (const auto& p : files) {
+        std::vector<float> samples;
+        if (!spk_read_wav(p, samples) || samples.empty()) {
+            continue;
+        }
+        std::vector<float> e = spk_embed(samples);
+        if (e.size() != (size_t) dim) {
+            continue;
+        }
+        double nrm = 0;
+        for (float v : e) nrm += (double) v * v;
+        nrm = std::sqrt(nrm) + 1e-9;
+        for (size_t i = 0; i < e.size(); ++i) acc[i] += (float) (e[i] / nrm);
+        embs.push_back(e);
+        ++used;
+    }
+    if (used == 0) {
+        std::fprintf(stderr, "pf-api: no usable enrollment wavs in %s\n", g_enroll_dir.c_str());
+        return false;
+    }
+    double nrm = 0;
+    for (float v : acc) nrm += (double) v * v;
+    nrm = std::sqrt(nrm) + 1e-9;
+    for (float& v : acc) v = (float) (v / nrm);
+    g_voiceprint = acc;
+    for (const auto& e : embs) self_cos += spk_cosine(e, g_voiceprint);
+    std::fprintf(stderr, "pf-api: speaker gate on, enrolled %d clips, mean self-cosine %.3f, threshold %.2f\n", used,
+                 self_cos / used, g_speaker_threshold);
+    g_speaker_enabled = true;
+    return true;
+}
+
+static float spk_score(const std::vector<float>& samples) {
+    if (!g_speaker_enabled) {
+        return -1.0f;
+    }
+    return spk_cosine(spk_embed(samples), g_voiceprint);
+}
+#else
+static bool spk_init() {
+    return false;
+}
+static float spk_score(const std::vector<float>&) {
+    return -1.0f;
+}
+#endif
+
 // ---- base64 ----
 
 static bool base64_decode(const std::string& in, std::string& out) {
@@ -633,8 +787,15 @@ static void ws_handle_text(const std::shared_ptr<WsSession>& s, const std::strin
         }
         ws_send_event(*s, "input_audio_buffer.committed", {{"item_id", s->item_id}, {"previous_item_id", nullptr}});
         const std::string item = s->item_id;
-        const bool ok = submit(std::move(snapshot), 1, [s, gen, item](int status, std::string text, double queue_ms,
-                                                                     double infer_ms, TokensPtr) {
+        std::shared_ptr<std::future<float>> score_future;
+        if (g_speaker_enabled) {
+            std::vector<float> score_samples = snapshot;
+            score_future = std::make_shared<std::future<float>>(
+                std::async(std::launch::async, [score_samples] { return spk_score(score_samples); }));
+        }
+        const bool ok = submit(std::move(snapshot), 1, [s, gen, item, score_future](int status, std::string text,
+                                                                                     double queue_ms, double infer_ms,
+                                                                                     TokensPtr) {
             if (gen != s->gen) {
                 return; // cleared or superseded
             }
@@ -646,6 +807,11 @@ static void ws_handle_text(const std::shared_ptr<WsSession>& s, const std::strin
                          {"content_index", 0},
                          {"transcript", text},
                          {"usage", {{"type", "duration"}, {"seconds", (double) 0}}}};
+            if (score_future) {
+                const float sc = score_future->get();
+                body["speaker_score"] = sc;
+                body["speaker_ok"] = sc >= g_speaker_threshold;
+            }
             ws_send_event(*s, "conversation.item.input_audio_transcription.completed", body);
             json meta = {{"item_id", item}, {"queue_ms", queue_ms}, {"infer_ms", infer_ms}};
             ws_send_event(*s, "x.pf.metrics", meta);
@@ -722,7 +888,13 @@ static void handle_transcription(const httplib::Request& req, httplib::Response&
     const std::string punct = req.form.has_field("punctuate") ? req.form.get_field("punctuate") : "false";
     const bool want_punct = punct == "true" || punct == "1";
     const bool want_tokens = fmt == "verbose_json" || fmt == "srt" || want_punct;
+    std::future<float> score_future;
+    if (g_speaker_enabled) {
+        std::vector<float> score_samples = samples; // the ASR task takes ownership
+        score_future = std::async(std::launch::async, [score_samples] { return spk_score(score_samples); });
+    }
     const SyncReply r = transcribe_sync(samples, want_tokens);
+    const float speaker_score = score_future.valid() ? score_future.get() : -1.0f;
     res.set_header("X-Queue-Ms", std::to_string((int) std::lround(r.queue_ms)));
     res.set_header("X-Infer-Ms", std::to_string((int) std::lround(r.infer_ms)));
     if (r.status != 200) {
@@ -735,6 +907,12 @@ static void handle_transcription(const httplib::Request& req, httplib::Response&
         words.empty() ? (any_multibyte(r.text) ? std::string("zh") : std::string("en")) : utterance_language(words);
     const std::string text = want_punct && !words.empty() ? punctuate_words(words, zh, g_punct_gap_ms) : r.text;
     res.set_header("X-Language", detected);
+    if (speaker_score >= 0.0f) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.3f", speaker_score);
+        res.set_header("X-Speaker-Score", buf);
+        res.set_header("X-Speaker-Ok", speaker_score >= g_speaker_threshold ? "1" : "0");
+    }
     if (fmt == "text") {
         res.set_content(text, "text/plain; charset=utf-8");
         return;
@@ -751,6 +929,10 @@ static void handle_transcription(const httplib::Request& req, httplib::Response&
                   {"text", text},
                   {"words", jw},
                   {"segments", segments_json(words, zh, g_seg_gap_ms, text)}};
+        if (speaker_score >= 0.0f) {
+            j["speaker_score"] = speaker_score;
+            j["speaker_ok"] = speaker_score >= g_speaker_threshold;
+        }
         res.set_content(j.dump(2), "application/json");
         return;
     }
@@ -800,7 +982,7 @@ int main(int argc, char** argv) {
                      "[--bind ADDR] [--queue N] [--timeout-ms N] [--model-id ID] [--warmup WAV] "
                      "[--partial-ms N] [--partial-interval-ms N] [--partial-max-s N] [--no-partials] "
                      "[--seg-gap-ms N] [--punct-gap-ms N] "
-                     "[--web-dir DIR]\n",
+                     "[--web-dir DIR] [--speaker-model FILE] [--enroll-dir DIR] [--speaker-threshold F]\n",
                      argv[0]);
         return 1;
     }
@@ -843,6 +1025,12 @@ int main(int argc, char** argv) {
             g_partials = false;
         } else if (std::strcmp(argv[i], "--partial-max-s") == 0 && i + 1 < argc) {
             g_partial_max_s = std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--speaker-model") == 0 && i + 1 < argc) {
+            g_speaker_model = argv[++i];
+        } else if (std::strcmp(argv[i], "--enroll-dir") == 0 && i + 1 < argc) {
+            g_enroll_dir = argv[++i];
+        } else if (std::strcmp(argv[i], "--speaker-threshold") == 0 && i + 1 < argc) {
+            g_speaker_threshold = (float) std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--seg-gap-ms") == 0 && i + 1 < argc) {
             g_seg_gap_ms = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--punct-gap-ms") == 0 && i + 1 < argc) {
@@ -906,9 +1094,12 @@ int main(int argc, char** argv) {
     srv.set_write_timeout(120, 0);
     srv.set_payload_max_length(64u * 1024u * 1024u);
 
+    spk_init();
+
     srv.Get("/health", [](const httplib::Request&, httplib::Response& res) {
-        res.set_content(json{{"status", "ok"}, {"engines", g_engines.size()}, {"queue", g_queue.size()}}.dump(),
-                        "application/json");
+        json j = {{"status", "ok"}, {"engines", g_engines.size()}, {"queue", g_queue.size()},
+                  {"speaker_gate", g_speaker_enabled}};
+        res.set_content(j.dump(), "application/json");
     });
 
     srv.Get("/v1/models", [](const httplib::Request&, httplib::Response& res) {

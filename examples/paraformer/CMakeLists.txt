@@ -12,11 +12,24 @@ target_include_directories(llama-paraformer-server SYSTEM PRIVATE ${PROJECT_SOUR
 target_link_libraries(llama-paraformer-server PRIVATE ggml Threads::Threads ${CMAKE_DL_LIBS})
 install(TARGETS llama-paraformer-server RUNTIME)
 
+# Optional speaker gate: links sherpa-onnx (which wraps onnxruntime) so the API
+# can score the enrolled driver's voiceprint. Off by default so a plain build has
+# no sherpa dependency; the Android build enables it with the prebuilt libs.
+option(XASR_SPEAKER "Build the API with the sherpa-onnx speaker gate" OFF)
+set(XASR_SHERPA_INCLUDE_DIR "" CACHE PATH "sherpa-onnx include dir (c-api.h)")
+set(XASR_SHERPA_LIB_DIR "" CACHE PATH "sherpa-onnx lib dir")
+
 add_executable(llama-paraformer-api api_server.cpp paraformer.cpp core/gguf_loader.cpp core/kaldi_fbank.cpp)
 target_compile_features(llama-paraformer-api PRIVATE cxx_std_17)
 target_include_directories(llama-paraformer-api PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(llama-paraformer-api SYSTEM PRIVATE ${PROJECT_SOURCE_DIR}/vendor ${PROJECT_SOURCE_DIR}/vendor/cpp-httplib ${PROJECT_SOURCE_DIR}/vendor/nlohmann)
 target_link_libraries(llama-paraformer-api PRIVATE ggml cpp-httplib vendor::nlohmann Threads::Threads ${CMAKE_DL_LIBS})
+if(XASR_SPEAKER)
+    target_compile_definitions(llama-paraformer-api PRIVATE XASR_SPEAKER=1)
+    target_include_directories(llama-paraformer-api PRIVATE ${XASR_SHERPA_INCLUDE_DIR})
+    target_link_directories(llama-paraformer-api PRIVATE ${XASR_SHERPA_LIB_DIR})
+    target_link_libraries(llama-paraformer-api PRIVATE sherpa-onnx-c-api onnxruntime)
+endif()
 install(TARGETS llama-paraformer-api RUNTIME)
 
 # Offline re-quantization helper (bench tooling, not installed).

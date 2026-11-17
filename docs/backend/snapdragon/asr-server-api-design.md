@@ -332,3 +332,39 @@ sha256 `2623a2953f6ff3d2…`）可从 ModelScope 的 `pengzhendong/silero-vad` �
 
 下一批实现：REST/commit 路径的裁剪与分段（>18 s 才切），以及 WS 的 `vad: true` 连续流模式
 （append 持续喂、服务端检测到端点就发一个 completed，不需要客户端 commit）。
+
+## 34. M24：说话人门控接进服务（HTP ASR + CPU 声纹并行）
+
+**实现**（`api_server.cpp`，编译期开关 `-DXASR_SPEAKER=ON`）：
+
+- `--speaker-model onnx/spk_od.onnx`：CAM++ ONNX（带 sherpa metadata）；`--enroll-dir DIR`：
+  司机注册音频（16 kHz WAV，启动时算质心声纹，打印平均自相似度）；`--speaker-threshold`（默认 0.55）。
+- 每次 commit：ASR 走引擎池（HTP），声纹用 `std::async` 在 CPU 上并发算，**两者取最大值**而不是相加；
+- 返回值：REST 加 `X-Speaker-Score` / `X-Speaker-Ok` 头与 `verbose_json` 的
+  `speaker_score` / `speaker_ok`；WS 的 `...completed` 事件带同样两个字段；
+- `/health` 增加 `speaker_gate: true/false`。
+
+**真机实测（SM6650，HTP+CPU 两引擎）**：
+
+| 项 | 值 |
+|---|---|
+| 注册 | 16 条 Tingting 命令，平均自相似度 **0.904** |
+| 司机（Tingting） | score **0.921**，`ok=true`，infer 317–344 ms |
+| 乘客（Flo） | score **0.363**，`ok=false`，infer 316 ms |
+| 门控开销 | 与未开时（305–330 ms）在噪声内 —— embedding 约 110 ms，被 ASR 的 320 ms 完全覆盖 |
+| WS 事件 | `completed: score=0.921 ok=True` |
+
+**构建**：Android 构建需要把 sherpa 头/库挂进容器：
+
+```sh
+docker run --rm -v "$PWD:/workspace" -v /tmp/sherpa:/sherpa:ro ... \
+  bash -c 'cmake -S /workspace -B /workspace/build-android-xasr -DXASR_SPEAKER=ON \
+      -DXASR_SHERPA_INCLUDE_DIR=/sherpa/inc -DXASR_SHERPA_LIB_DIR=/sherpa/lib && \
+      cmake --build /workspace/build-android-xasr --target llama-paraformer-api -j 6'
+```
+
+运行时 `LD_LIBRARY_PATH` 要同时含 `lib` 与 `onnx/bin`（后者有 `libsherpa-onnx-c-api.so`、
+`libonnxruntime.so`）。宿主构建默认 `XASR_SPEAKER=OFF`，不引入 sherpa 依赖。
+
+**边界**：阈值 0.55 来自 TTS 的 0.363/0.921 两个点，真实乘客分布未知；注册与使用必须同麦同增益
+（按行程注册）；`speaker_ok` 目前只上报，**没有拦截请求**——是否拦截由客户端/语义层决定。
