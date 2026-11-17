@@ -720,8 +720,7 @@ CPU threads. An idle first OPEN used HTP. The following OPEN used CPU with
 had free slots. Both requests completed, and the CPU short Mandarin
 transcript matched its B=1 reference. With the process confined to one core,
 four parked HTP streams filled the HTP slots. The next OPEN returned busy
-with only one idle core. These are decision tests. They do not establish
-an end-to-end P95 gain over the default hybrid router.
+with only one idle core. See the burst comparison below for end-to-end P95.
 
 Reproduce from the repository root after deploying the updated server
 using [BUILD.md](BUILD.md). From an ADB shell in the package directory
@@ -755,6 +754,48 @@ excluded. Remove the forwarding rule after testing with
 
 Raw test output, route logs, source hash and device hashes are archived in
 `$HOME/Library/Caches/qwen3-asr-htp/xasr-multistream/adaptive-cpu.MqIT7W`.
+
+### Finalized-segment burst comparison
+
+`bench_adaptive_cpu.py` sends a 20 s English segment at t=0 and three
+2.65 s Mandarin segments at t=550/600/650 ms. The client sends each segment
+in one APPEND and immediately requests COMMIT. It measures from the request
+arrival at the client to receipt of the final transcript, including OPEN and
+TCP. This exercises delivery of complete VAD segments and creates HTP
+pressure at admission. It does not represent paced audio or on-car noise.
+
+Use the server launch above with `--threads 2` and export
+`GGML_HEXAGON_OPBATCH=2048`. Keep `--streams 4 --encoder-batch 4` for every
+arm. Restart the service for each arm. For default hybrid, retain
+`--cpu-streams 2` and remove `--adaptive-cpu`. For HTP-only, remove both.
+Run a one-repetition warmup for each start before collecting eight measured
+repetitions. Use the `en-20.wav` and `zh.wav` fixtures from the Android
+reproduction below. The run order on SM6650 was default hybrid, adaptive,
+adaptive, default hybrid, then HTP-only.
+
+```sh
+python3 examples/x-asr/tools/bench_adaptive_cpu.py 18776 en-20.wav zh.wav --reps 1 > warmup.jsonl
+python3 examples/x-asr/tools/bench_adaptive_cpu.py 18776 en-20.wav zh.wav --reps 8 > arm.jsonl
+```
+
+| SM6650 arm | Short segments | Short P50 (ms) | Short P95 (ms) | Short P99 (ms) | First short P95 (ms) |
+|---|---:|---:|---:|---:|---:|
+| HTP-only | 24 | 1977 | 2054 | 2055 | 2010 |
+| Default hybrid | 48 | 965 | 1174 | 1176 | 781 |
+| Adaptive CPU | 48 | 1585 | 1686 | 1757 | 551 |
+
+Every measured adaptive burst sent only the first short segment to CPU.
+Its OPEN arrived with roughly 500 ms of HTP commit age and 4 to 6 idle
+cores. The next two short segments both went to HTP because the CPU worker
+already had work. In the default hybrid arm, two short segments per measured
+burst used CPU, up to its two-session capacity. Transcripts matched across
+all arms at each arrival offset. Adaptive admission improved the first short
+segment's P95 over default hybrid and increased the pooled short P95 by
+512 ms. Keep the adaptive policy opt-in for this workload.
+
+The raw client JSONL, per-arm server logs, device hashes, fixture WAVs,
+and summary are in
+`$HOME/Library/Caches/qwen3-asr-htp/xasr-multistream/adaptive-ab.P9xmgB`.
 
 ## Reproduce on Android
 
