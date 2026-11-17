@@ -781,3 +781,47 @@ id 比较（词表里有重复字符串）。没有 R 行时输出与改前逐�
 - 真正想再降 P95，应换 Q4_K（123 MB/引擎）再做三引擎，内存回到 ~600 MB；该实验因本机无外网
   仍未做（§19.3）。
 - 4 引擎（1+3 CPU）本批没测，预计 CPU 争抢会吃掉收益。
+
+## 24. M14 实测：Q4_K 量化（2026-11-17，离线再量化）
+
+**通路**：huggingface 不可达，ModelScope 可达但没有 `cstr/paraformer-zh-GGUF`（只有官方
+PyTorch 权重 880 MB；仓库转换器只输出 F16，做不出 Q4_K）。于是新增
+`examples/paraformer/tools/requant.cpp`：用 ggml 自己的 `ggml_quantize_chunk` 把现有 Q8_0
+GGUF 离线再量化，未量化的张量**保持原类型原字节**（1-D 的 cmvn/norm 是 F32，入口投影 560 宽
+不是 256 的倍数，留 F16）。
+
+```sh
+cmake --build build-x-asr --target llama-paraformer-requant -j
+./build-x-asr/bin/llama-paraformer-requant paraformer-zh-q8_0.gguf paraformer-zh-q4_k.gguf Q4_K
+# requant: 958 tensors, 283 quantized q4_K, 675 kept F16, 226.3 MB -> 122.6 MB
+```
+
+**质量（32 条，宿主 CPU）**：逐条只有 4 条不同，两条更好（`a->the`、`too->two`）、两条更差
+（`dome->dme`、`massaician->massasian`）；聚合 **command 59.4% vs 56.2%**、en WER 11.45% vs
+12.21%、zh CER 都是 0.60%。属于量化噪声，不是系统性退化。
+
+**延迟与内存（设备）**：
+
+| 权重 | 引擎 | p50 | p95 | 进程峰值 RSS |
+|---|---|---:|---:|---:|
+| Q8_0 | HTP | **277** | **370** | 252 MB |
+| Q4_K | HTP | 324 | 443 | **146 MB** |
+| Q8_0 | CPU | 334 | 468 | — |
+| Q4_K | CPU | 387 | 509 | — |
+
+**结论：Q4_K 在这颗 DSP 上是“省内存、费时间”。** HTP 上慢 17%（277 -> 324），CPU 上慢 16%，
+但内存降 42%。Q8_0 走的是 hvx-tiled int8 原生路径，Q4_K 没有同等的 int4 快路，收益只剩体积。
+
+**与三引擎组合**（4 路齐发，N=32）：
+
+| 权重 | 引擎数 | p50 | p95 | RSS |
+|---|---:|---:|---:|---:|
+| Q8_0 | 2 | 494 | 705 | ~500 MB |
+| Q8_0 | 3 | **447** | **626** | 933 MB |
+| Q4_K | 3 | 490 | 723 | 615 MB |
+
+Q4_K 的单条变慢正好抵掉第三引擎的排队收益（490/723 对 494/705），所以**默认仍是 Q8_0 双引擎**；
+只有在内存/热受限、必须多引擎时才用 Q4_K + 3 引擎（同等尾延迟下多 115 MB 缓冲）。
+
+**边界**：Q4_K 是从 Q8_0 再量化的（多一次舍入）；没有测 Q5_K/Q6_K；没有做长时间热压测；
+HTP 上 Q4_K 是否走了部分回退未从日志确认（只能从“HTP 324 vs CPU 387”判断仍有 DSP 参与）。

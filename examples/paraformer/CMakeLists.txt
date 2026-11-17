@@ -11,3 +11,8 @@ target_include_directories(llama-paraformer-server PRIVATE ${CMAKE_CURRENT_SOURC
 target_include_directories(llama-paraformer-server SYSTEM PRIVATE ${PROJECT_SOURCE_DIR}/vendor)
 target_link_libraries(llama-paraformer-server PRIVATE ggml Threads::Threads ${CMAKE_DL_LIBS})
 install(TARGETS llama-paraformer-server RUNTIME)
+
+# Offline re-quantization helper (bench tooling, not installed).
+add_executable(llama-paraformer-requant tools/requant.cpp)
+target_compile_features(llama-paraformer-requant PRIVATE cxx_std_17)
+target_link_libraries(llama-paraformer-requant PRIVATE ggml)
