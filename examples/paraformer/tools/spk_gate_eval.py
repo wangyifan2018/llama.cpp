@@ -64,10 +64,25 @@ def main():
 
     import onnxruntime as ort
     sess = ort.InferenceSession(args.onnx, providers=["CPUExecutionProvider"])
+    frames = sess.get_inputs()[0].shape[1]
+    if not isinstance(frames, int):
+        raise SystemExit("the ONNX graph must have a fixed frame dimension (see export_campplus_onnx.py)")
+    print("onnx graph input: %s (fixed T=%d, %.1f s)" % (sess.get_inputs()[0].shape, frames, frames / 100.0))
 
     def embed(path):
-        feats = fbank80(path).astype(np.float32)[None, :, :]
-        return sess.run(None, {"feats": feats})[0].ravel()
+        # Chunk into fixed-length windows, pad the tail with the chunk mean,
+        # then average the per-chunk embeddings.
+        feats = fbank80(path).astype(np.float32)
+        chunks = []
+        for i in range(0, max(1, feats.shape[0]), frames):
+            c = feats[i:i + frames]
+            if c.shape[0] < frames:
+                pad = np.repeat(c.mean(axis=0, keepdims=True), frames - c.shape[0], axis=0)
+                c = np.concatenate([c, pad], axis=0)
+            chunks.append(c[None, :, :])
+        embs = [sess.run(None, {"feats": c})[0].ravel() for c in chunks]
+        embs = [e / (np.linalg.norm(e) + 1e-9) for e in embs]
+        return np.mean(embs, axis=0)
 
     drv = sorted(glob.glob(os.path.join(args.driver, "*zh*.wav")))
     pax = sorted(glob.glob(os.path.join(args.passenger, "*zh*.wav")))
