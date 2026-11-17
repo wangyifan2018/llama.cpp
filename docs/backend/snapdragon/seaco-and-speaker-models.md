@@ -171,3 +171,36 @@ eager 前向存在数值路径差异。但门控判据是"相对距离"，实测
 
 结论不变：**余量 0.25 比手写统计声纹的 0.011 大一个数量级以上**，门控机制成立；数值上现在可信。
 
+
+## 32. M22：设备端说话人门控打通（不需要 onnxruntime 头文件）
+
+**卡点的解决办法**：设备上有 `libsherpa-onnx-c-api.so` 与 `libonnxruntime.so`，而 sherpa 自带
+`SherpaOnnxSpeakerEmbeddingExtractor`，它内部完成 fbank 与 onnxruntime 调用。只要给 ONNX 图补上
+sherpa 要求的 metadata，就能在设备上直接跑我们的 CAM++，**完全不需要 `onnxruntime_c_api.h`**。
+
+metadata 的两个坑（`tools/add_campplus_metadata.py`）：
+
+1. sherpa 把 **`framework`** 当作 model type 校验（写成 "torch" 会报 `Unsupported model_type: torch`），
+   必须写成受支持的家族（`3d-speaker` / `wespeaker` / `nemo`）；
+2. 必须提供 **`output_dim`**（否则 `Create()` 直接 abort：`'output_dim' does not exist`）。
+
+可用组合：`framework=3d-speaker, model_type=3d-speaker, sample_rate=16000, feature_dim=80,
+normalize_samples=1, output_dim=192`。
+
+**设备实测**（SM6650，sherpa 提取器 + onnxruntime，CPU）：
+
+| 项 | 值 |
+|---|---|
+| 单段耗时（2.3 s 音频） | **107–123 ms** |
+| 维度 | 192 |
+| 本人余弦 | 均值 0.890，最小 **0.747** |
+| 冒充者余弦 | 均值 0.373，最大 **0.445** |
+| 安全阈值带 | **0.45–0.74**（FRR 0% / FAR 0%） |
+| 分离余量 | **0.302** |
+
+与宿主 Python 路径（余量 0.25）相比，设备端用 sherpa 自带的 fbank（含归一化）余量略大，两者都
+远好于手写统计声纹的 0.011。**门控的"能跑"与"能分"现在都在真机上成立了**，剩下的只是接进服务。
+
+**成本定位**：107–123 ms 在 CPU 上，与 HTP 上的 ASR（约 300 ms）并行时**不占尾延迟**；
+下一批把它作为 `--speaker-gate`（启动时用 `--enroll-dir` 注册司机声纹，commit 时与 ASR 并发计算，
+响应里返回 `speaker_score`）。
