@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 #include <string>
 #include <vector>
 #include "core/ggml_cpu_backend.h"
@@ -205,6 +206,7 @@ struct paraformer_context {
         float gain = 0.0f;                      // boost for entering this node
     };
     std::vector<CtxNode> ctx_trie;
+    mutable std::unordered_map<std::string, int> vocab_index; // built lazily for phrase tokenisation
     int ctx_phrases = 0;
     bool ctx_loaded = false;
     int hotword_count = 0;
@@ -339,35 +341,68 @@ static std::vector<int> pf_tokenize_phrase(const paraformer_context* ctx, const 
         }
         return ids;
     }
-    // Longest match, at most 12 UTF-8 bytes (a 4-character Chinese phrase).
-    for (size_t i = 0; i < text.size();) {
-        int best = -1;
-        size_t best_len = 0;
-        const size_t max_len = std::min<size_t>(12, text.size() - i);
-        for (size_t len = max_len; len >= 1; --len) {
-            // The piece must end on a UTF-8 boundary: the byte after it, when
-            // present, must not be a continuation byte.
-            if (i + len < text.size() && ((unsigned char) text[i + len] & 0xC0) == 0x80) {
+    // The GGUF carries no merge table (only tokenizer.tokens), so a true BPE
+    // encode is impossible. Encode the way this vocab is built instead: cover
+    // the text with vocab pieces where every non-final piece ends in "@@" and
+    // the last one does not, preferring fewer pieces and then longer ones.
+    if (ctx->vocab_index.empty()) {
+        for (size_t k = 0; k < ctx->vocab.size(); ++k) {
+            ctx->vocab_index.emplace(ctx->vocab[k], (int) k);
+        }
+    }
+    // Objective: fewest pieces, then the longest piece. Exact for CJK (single
+    // characters). For Latin words this cannot reproduce the model's merge
+    // order (the GGUF has no merge table), so it is best-effort and the explicit
+    // "a+b+c" form exists for cases that must match exactly. Measured: a
+    // rank-minimising objective produced f@@|oo@@|tw@@|el|l for "footwell" and
+    // corrupted the transcript to "footwwall".
+    const size_t n = text.size();
+    std::vector<int> cost(n + 1, INT32_MAX);
+    std::vector<int> next(n + 1, -1);
+    std::vector<int> tok_at(n + 1, -1);
+    cost[n] = 0;
+    for (size_t i = n; i-- > 0;) {
+        const size_t max_len = std::min<size_t>(24, n - i);
+        for (size_t len = 1; len <= max_len; ++len) {
+            const size_t j = i + len;
+            if (j < n && ((unsigned char) text[j] & 0xC0) == 0x80) {
+                continue; // do not cut inside a UTF-8 sequence
+            }
+            if (cost[j] == INT32_MAX) {
                 continue;
             }
-            const std::string piece = text.substr(i, len);
-            for (size_t k = 0; k < ctx->vocab.size(); ++k) {
-                if (ctx->vocab[k] == piece) {
-                    best = (int) k;
-                    best_len = len;
-                    break;
+            // Mid-word spans prefer the "@@" continuation form (that is how the
+            // model emits English pieces); the final span and every CJK span use
+            // the plain token, because Chinese characters carry no "@@".
+            const char* forms[2] = { nullptr, nullptr };
+            std::string piece_cont, piece_plain = text.substr(i, len);
+            if (j < n) {
+                piece_cont = piece_plain + "@@";
+                forms[0] = piece_cont.c_str();
+                forms[1] = piece_plain.c_str();
+            } else {
+                forms[0] = piece_plain.c_str();
+            }
+            for (int f = 0; f < 2 && forms[f]; ++f) {
+                const auto it = ctx->vocab_index.find(forms[f]);
+                if (it == ctx->vocab_index.end()) {
+                    continue;
+                }
+                const int cand = cost[j] + 1;
+                if (cand < cost[i] || (cand == cost[i] && len > (size_t) (next[i] - (int) i))) {
+                    cost[i] = cand;
+                    next[i] = (int) j;
+                    tok_at[i] = it->second;
                 }
             }
-            if (best >= 0) {
-                break;
-            }
         }
-        if (best < 0) {
-            fprintf(stderr, "paraformer: cannot tokenise '%s'\n", text.substr(i).c_str());
-            return {};
-        }
-        ids.push_back(best);
-        i += best_len;
+    }
+    if (cost[0] == INT32_MAX) {
+        fprintf(stderr, "paraformer: cannot tokenise '%s'\n", text.c_str());
+        return {};
+    }
+    for (size_t i = 0; i < n; i = (size_t) next[i]) {
+        ids.push_back(tok_at[i]);
     }
     return ids;
 }
@@ -408,6 +443,13 @@ static void paraformer_load_context(paraformer_context* ctx) {
         const std::vector<int> ids = pf_tokenize_phrase(ctx, std::string(body));
         if (ids.empty()) {
             continue;
+        }
+        if (std::getenv("PF_DUMP_PHRASES")) {
+            std::string seq;
+            for (int id : ids) {
+                seq += ctx->vocab[(size_t) id] + "|";
+            }
+            fprintf(stderr, "pf-phrase: %s -> %s\n", body, seq.c_str());
         }
         int node = 0;
         for (int id : ids) {
