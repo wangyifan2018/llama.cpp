@@ -76,6 +76,7 @@ static size_t g_queue_limit = 64;
 static double g_timeout_ms = 30000;
 static std::string g_model_id = "paraformer-zh";
 static std::atomic<uint64_t> g_requests{0};
+static std::atomic<int> g_inflight{0}; // tasks a worker is currently running
 static std::atomic<uint64_t> g_rejected{0};
 static std::atomic<uint64_t> g_failed{0};
 static std::atomic<uint64_t> g_event_seq{0};
@@ -223,6 +224,7 @@ static void worker_loop(Engine* eng) {
             continue;
         }
         const double t0 = now_ms();
+        g_inflight.fetch_add(1);
         TokensPtr tokens;
         std::string text;
         if (task->want_tokens) {
@@ -239,6 +241,7 @@ static void worker_loop(Engine* eng) {
             }
         }
         const double infer_ms = now_ms() - t0;
+        g_inflight.fetch_sub(1);
         if (!tokens && text.empty()) {
             g_failed.fetch_add(1);
             task->done(500, "inference failed", queue_ms, infer_ms, nullptr);
@@ -460,6 +463,8 @@ static std::string g_vad_model;
 static float g_vad_split_s = 18.0f;   // only split commits longer than this
 static float g_vad_piece_s = 15.0f;    // and never make a piece longer than this
 static float g_silence_rms = 0.004f;   // below this, "no speech" means empty text
+static float g_speaker_max_s = 2.0f;    // only the first N seconds are embedded
+static std::atomic<uint64_t> g_speaker_deferred{0};
 static float g_vad_threshold = 0.5f;
 static float g_vad_min_silence = 0.15f;
 static float g_vad_min_speech = 0.20f;
@@ -587,9 +592,17 @@ static bool spk_init() {
     return true;
 }
 
+// The gate is best effort: it is skipped when another request is already queued,
+// so it cannot steal CPU from an ASR that is waiting. It also only embeds the
+// first g_speaker_max_s seconds, which bounds the cost for long commits.
 static float spk_score(const std::vector<float>& samples) {
     if (!g_speaker_enabled) {
         return -1.0f;
+    }
+    const size_t max_samples = (size_t) (g_speaker_max_s * 16000.0f);
+    if (samples.size() > max_samples) {
+        std::vector<float> head(samples.begin(), samples.begin() + (long) max_samples);
+        return spk_cosine(spk_embed(head), g_voiceprint);
     }
     return spk_cosine(spk_embed(samples), g_voiceprint);
 }
@@ -661,6 +674,11 @@ static std::vector<std::pair<int, int>> vad_spans(const std::vector<float>&) {
     return {};
 }
 #endif
+
+// True when running the embedding now would compete with a waiting request.
+static bool spk_would_contend() {
+    return g_speaker_enabled && (g_queue.size() > 0 || g_inflight.load() > 0);
+}
 
 // Pieces to transcribe for one committed segment. Normal cabin commits (already
 // cut at the client's VAD) stay a single piece; only over-long audio is split, so
@@ -1043,9 +1061,12 @@ static void handle_transcription(const httplib::Request& req, httplib::Response&
     const bool want_punct = punct == "true" || punct == "1";
     const bool want_tokens = fmt == "verbose_json" || fmt == "srt" || want_punct;
     std::future<float> score_future;
-    if (g_speaker_enabled) {
+    const bool gate_now = g_speaker_enabled && !spk_would_contend();
+    if (gate_now) {
         std::vector<float> score_samples = samples; // the ASR task takes ownership
         score_future = std::async(std::launch::async, [score_samples] { return spk_score(score_samples); });
+    } else if (g_speaker_enabled) {
+        g_speaker_deferred.fetch_add(1);
     }
     size_t vad_pieces = 0;
     if (is_silent_commit(samples)) {
@@ -1059,6 +1080,7 @@ static void handle_transcription(const httplib::Request& req, httplib::Response&
     const std::vector<std::pair<size_t, size_t>> pieces = plan_pieces(samples, &vad_pieces);
     std::string joined;
     TokensPtr last_tokens;
+    double final_queue_ms = 0.0, final_infer_ms = 0.0;
     if (pieces.size() == 1) {
         const SyncReply one = transcribe_sync(samples, want_tokens);
         if (one.status != 200) {
@@ -1067,8 +1089,8 @@ static void handle_transcription(const httplib::Request& req, httplib::Response&
         }
         joined = one.text;
         last_tokens = one.tokens;
-        res.set_header("X-Queue-Ms", std::to_string((int) std::lround(one.queue_ms)));
-        res.set_header("X-Infer-Ms", std::to_string((int) std::lround(one.infer_ms)));
+        final_queue_ms = one.queue_ms;
+        final_infer_ms = one.infer_ms;
     } else {
         double infer_ms = 0;
         for (const auto& pc : pieces) {
@@ -1081,14 +1103,14 @@ static void handle_transcription(const httplib::Request& req, httplib::Response&
             append_text(joined, one.text);
             infer_ms += one.infer_ms;
         }
-        res.set_header("X-Queue-Ms", "0");
-        res.set_header("X-Infer-Ms", std::to_string((int) std::lround(infer_ms)));
+        final_queue_ms = 0.0;
+        final_infer_ms = infer_ms;
     }
+    res.set_header("X-Queue-Ms", std::to_string((int) std::lround(final_queue_ms)));
+    res.set_header("X-Infer-Ms", std::to_string((int) std::lround(final_infer_ms)));
     res.set_header("X-Vad-Pieces", std::to_string(pieces.size()));
     const float speaker_score = score_future.valid() ? score_future.get() : -1.0f;
     const SyncReply r = [&] { SyncReply x; x.status = 200; x.text = joined; x.tokens = last_tokens; return x; }();
-    res.set_header("X-Queue-Ms", std::to_string((int) std::lround(r.queue_ms)));
-    res.set_header("X-Infer-Ms", std::to_string((int) std::lround(r.infer_ms)));
     if (r.status != 200) {
         reply_error(res, r.status, r.text, r.status == 429 ? "rate_limit_error" : "server_error");
         return;
@@ -1104,6 +1126,8 @@ static void handle_transcription(const httplib::Request& req, httplib::Response&
         std::snprintf(buf, sizeof(buf), "%.3f", speaker_score);
         res.set_header("X-Speaker-Score", buf);
         res.set_header("X-Speaker-Ok", speaker_score >= g_speaker_threshold ? "1" : "0");
+    } else if (g_speaker_enabled) {
+        res.set_header("X-Speaker-Deferred", "1");
     }
     if (fmt == "text") {
         res.set_content(text, "text/plain; charset=utf-8");
@@ -1244,6 +1268,8 @@ int main(int argc, char** argv) {
             g_vad_piece_s = (float) std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--silence-rms") == 0 && i + 1 < argc) {
             g_silence_rms = (float) std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--speaker-max-s") == 0 && i + 1 < argc) {
+            g_speaker_max_s = (float) std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--vad-threshold") == 0 && i + 1 < argc) {
             g_vad_threshold = (float) std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--vad-min-silence") == 0 && i + 1 < argc) {
@@ -1344,6 +1370,7 @@ int main(int argc, char** argv) {
                   {"failed", g_failed.load()},
                   {"partials", g_partials_run.load()},
                   {"partials_skipped", g_partials_skipped.load()},
+                  {"speaker_deferred", g_speaker_deferred.load()},
                   {"queue", g_queue.size()},
                   {"engines", g_engines.size()}};
         res.set_content(j.dump(), "application/json");
