@@ -60,6 +60,19 @@ struct paraformer_bench_stage {
     }
 };
 
+// Cumulative lap timer: prints time since origin, to expose graph-build and
+// sched-alloc blind spots that the stage wrappers do not cover.
+struct paraformer_bench_lap {
+    std::chrono::steady_clock::time_point origin;
+    paraformer_bench_lap() : origin(std::chrono::steady_clock::now()) {}
+    void mark(const char* name) const {
+        if (!paraformer_bench_enabled())
+            return;
+        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - origin).count();
+        std::fprintf(stderr, "  paraformer_lap:     %-22s %.2f ms\n", name, ms);
+    }
+};
+
 // ===========================================================================
 // Model definition
 // ===========================================================================
@@ -629,6 +642,7 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
                                               std::vector<int>* out_fire_frames = nullptr) {
     const auto& hp = ctx->model.hp;
     const int D = (int)hp.d_model;
+    paraformer_bench_lap _lap;
 
     // 1. Feature extraction
     int T_lfr = 0, D_lfr_actual = 0;
@@ -739,6 +753,7 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
             ctx0 = nullptr; // don't free — owned by cache
         }
     }
+    _lap.mark("enc graph built");
 
     // Allocate and run encoder
     if (!paraformer_ensure_sched(ctx)) {
@@ -751,6 +766,7 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
         ggml_free(ctx0);
         return "";
     }
+    _lap.mark("enc sched alloc");
     {
         ggml_tensor* inp = ggml_graph_get_tensor(gf, "features");
         const size_t inp_bytes = ggml_nbytes(inp);
@@ -808,6 +824,7 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     }
     if (ctx->verbosity >= 2)
         fprintf(stderr, "paraformer: encoder done\n");
+    _lap.mark("enc compute done");
 
     // Extract encoder output
     ggml_tensor* enc_result = ggml_graph_get_tensor(gf, "encoder_output");
@@ -926,6 +943,7 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     cur = mm_bias(ctx0, ctx->model.dec_output_w, cur, ctx->model.dec_output_b); // (vocab, N)
     ggml_set_name(cur, "logits");
     ggml_build_forward_expand(gf, cur);
+    _lap.mark("dec graph built");
 
     // Allocate and run decoder
     ggml_backend_sched_reset(ctx->sched);
@@ -934,6 +952,7 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
         ggml_free(ctx0);
         return "";
     }
+    _lap.mark("dec sched alloc");
 
     // Set decoder inputs: acoustic_embeds from CIF is row-major (N, D).
     // ggml tensor ne=(D, N) stores element (d,n) at flat index n*D+d, which
@@ -1117,6 +1136,14 @@ void paraformer_free(paraformer_context* ctx) {
     if (ctx->backend_cpu)
         ggml_backend_free(ctx->backend_cpu);
     delete ctx;
+}
+
+void paraformer_warmup(paraformer_context* ctx, const float* samples, int n_samples) {
+    if (!ctx || !samples || n_samples <= 0)
+        return;
+    // Discard the text; the point is the one-time HTP session creation and the
+    // encoder/decoder graph registration on the device.
+    (void) paraformer_transcribe_impl(ctx, samples, n_samples);
 }
 
 char* paraformer_transcribe(paraformer_context* ctx, const float* samples, int n_samples) {

@@ -197,3 +197,39 @@ A 档已经满足“runtime 根据语音长度自行 padding”和“计算图�
 - 原始命令分低的主因确认是**评测器按逗号切子句**而 Paraformer 不输出标点，不是声学错误。
   少数真实错误：`seat_en01` 的 `two→too`、`light_en01` 的 `Set→said`、`hvac_en04` 的 `rear vents→reevent`。
 - 结论：中文声学明显优于 x-asr，英文仍不达标；先补标点后处理再把英文作为重点，不要仅凭原始命令分否定该模型。
+
+## 9. M1 实测：首包建图开销与 warmup（2026-11-17，SM6650 HTP）
+
+**问题**：M0 里 HTP 首条 1278 ms、稳态 290 ms，p99 被首条拉爆。先定位这 ~1 s 的来源再动手。
+
+**方法**：给 runtime 加累计 lap 计时（`CRISPASR_PARAFORMER_BENCH=1`，`paraformer_lap:` 行），
+把一次推理拆成 graph build / sched alloc / compute 三段，对照有无 warmup、以及长短 shape 切换。
+
+**结论（N=32 夹具 + 多次单条复测）**：
+
+| 阶段 | 首条（无 warmup） | warmup 后的真实请求 |
+|---|---:|---:|
+| enc graph build | 159 ms | 18 ms |
+| enc sched alloc（HTP 首次分配 + 注册图） | **733 ms** | 20 ms |
+| enc compute | 134 ms | 129 ms |
+| dec graph build + sched alloc | **221 ms** | 1 ms |
+| dec compute | 29 ms | 28 ms |
+| **wall（整条）** | **1130 ms** | **185 ms** |
+
+- 首条 ~1 s 的大头是 **sched alloc**（HTP 首次给图分配 buffer 并下发到 DSP），不是 CPU 建图：
+  encoder 733 ms + decoder 221 ms。加 `paraformer_warmup()` 在计时路径外跑一次完整推理后，
+  这些降到 20/1 ms，首条 wall 1130→185 ms。
+- **跨 shape 不会重付**：warmup 用 1.4 s 音频、后续跑 3.5 s，sched alloc 仍是 22 ms；
+  差异只落在 compute（129→312 ms，随 LFR 帧数线性）。所以 **sched alloc 是进程级一次性**，
+  warmup 用任意代表性长度即可，不需要 pytest 式地为每个长度档各预热一次。
+- **长度分桶的假设被否**： encoder compute 随帧数线性是真实 DSP 算力，pad 到统一长度只会让短句变慢；
+  且 HTP 图按 uid 缓存、同 shape 已复用。M0 规划的“长度分档常驻图”不解决首包，本批不做。
+- 32 条全量交错对拍：有/无 warmup **转写 32/32 逐条完全一致**；
+  p50 291→291 ms（稳态不变），p95 389→381 ms，**p99/max 1278→390 ms**。
+  warmup 自身耗时 1260 ms，发生在计时路径外（服务启动阶段）。
+
+**实现**：`examples/paraformer/` 新增 `paraformer_warmup(ctx, samples, n)` 与 CLI `--warmup FILE`（默认关闭，
+避免改变既有基准口径）。服务化后应在 accept 之前对一段代表性音频调用一次。
+
+**下一批**：① 首包剩下的 185 ms 里 enc compute 129 ms 是主项，按 operator profile 拆 ConvNeXt/attention；
+② 标点后处理 + 英文 `said/too/reevent` 专项；③ overlap/stitch 与长语音；④ 常驻服务化后测真实并发 P95。

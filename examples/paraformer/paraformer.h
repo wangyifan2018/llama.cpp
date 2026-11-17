@@ -39,6 +39,12 @@ void paraformer_free(paraformer_context* ctx);
 // Transcribe audio (16 kHz mono PCM). Returns a malloc'd string; caller frees.
 char* paraformer_transcribe(paraformer_context* ctx, const float* samples, int n_samples);
 
+// Warm up the runtime outside the measured path: creates the HTP session and
+// registers the encoder/decoder graphs once, so the first real request does not
+// pay the one-time DSP graph-dispatch cost (~1 s on SM6650). Samples should be
+// representative of the expected audio length. Safe to call more than once.
+void paraformer_warmup(paraformer_context* ctx, const float* samples, int n_samples);
+
 // Variant that returns per-character CIF timestamps (centiseconds from audio start).
 // Each emitted character maps to the encoder frame where CIF fired.
 struct paraformer_result {

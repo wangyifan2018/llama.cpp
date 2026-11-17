@@ -19,7 +19,7 @@ installed as `bin/llama-paraformer`.
 ## Run
 
 ```sh
-llama-paraformer MODEL.gguf WAV... [--device HTP0:0] [--threads 2] [--timestamps]
+llama-paraformer MODEL.gguf WAV... [--device HTP0:0] [--threads 2] [--warmup FILE] [--timestamps]
 ```
 
 Input is 16 kHz mono PCM WAV. Output is TSV compatible with
@@ -44,8 +44,15 @@ printed by the CLI).
   not an acoustic error.
 - x-asr reference on the same fixture (on-arm): command 75.0%, CER 7.23%.
 - Device SM6650, 32 clips, warm-run excluded: CPU p50/p95 357/496 ms, HTP
-  290/380 ms; HTP first call pays graph construction (1278 ms) and must be
-  warmed before measuring p99. Transcripts are identical between CPU and HTP.
+  290/380 ms; transcripts are identical between CPU and HTP.
+- **Warmup (M1)**: the HTP first call pays ~1 s in `ggml_backend_sched_alloc_graph`
+  (encoder 733 ms + decoder 221 ms; first DSP buffer allocation + graph dispatch).
+  `--warmup FILE` runs one full inference off the measured path and cuts the first
+  real request from 1130 ms to 185 ms; p99/max over 32 clips 1278→390 ms, p50
+  unchanged (291 ms), transcripts 32/32 identical. sched alloc is process-wide
+  (a 1.4 s warmup also covers a 3.5 s request), so a single representative clip
+  is enough. Length bucketing was tested and rejected: the remaining cost is
+  compute linear in LFR frames, which padding cannot reduce.
 - Paraformer fixes `Set the driver temperature...` in one clip, but still emits
   `said` in two English seat/light clips; English remains the open risk.
 

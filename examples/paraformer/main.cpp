@@ -21,10 +21,35 @@
 
 using pf_clock = std::chrono::steady_clock;
 
+static bool read_wav(const char * path, std::vector<float> & samples) {
+    ma_decoder decoder;
+    const auto config = ma_decoder_config_init(ma_format_f32, 1, 16000);
+    if (ma_decoder_init_file(path, &config, &decoder) != MA_SUCCESS) {
+        fprintf(stderr, "paraformer: cannot decode %s\n", path);
+        return false;
+    }
+    const std::unique_ptr<ma_decoder, decltype(&ma_decoder_uninit)> audio(&decoder, ma_decoder_uninit);
+    samples.clear();
+    samples.reserve(16000 * 30);
+    for (;;) {
+        float block[4096];
+        ma_uint64 count = 0;
+        const auto res = ma_decoder_read_pcm_frames(audio.get(), block, 4096, &count);
+        if (res != MA_SUCCESS && res != MA_AT_END) {
+            fprintf(stderr, "paraformer: read error on %s\n", path);
+            return false;
+        }
+        samples.insert(samples.end(), block, block + count);
+        if (res == MA_AT_END || count == 0)
+            break;
+    }
+    return !samples.empty();
+}
+
 int main(int argc, char ** argv) {
     if (argc < 3) {
         fprintf(stderr,
-                "usage: %s MODEL.gguf WAV... [--device NAME] [--threads N] [--timestamps] [--quiet]\n",
+                "usage: %s MODEL.gguf WAV... [--device NAME] [--threads N] [--warmup FILE] [--timestamps] [--quiet]\n",
                 argv[0]);
         return 1;
     }
@@ -33,6 +58,7 @@ int main(int argc, char ** argv) {
     params.use_gpu = false;
     params.flash_attn = false;
     bool timestamps = false;
+    const char * warmup_file = nullptr;
     std::vector<const char *> waves;
     for (int i = 2; i < argc; ++i) {
         if (std::strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
@@ -40,6 +66,8 @@ int main(int argc, char ** argv) {
             setenv("CRISPASR_PARAFORMER_GPU", "1", 1);
         } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
             params.n_threads = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) {
+            warmup_file = argv[++i];
         } else if (std::strcmp(argv[i], "--timestamps") == 0) {
             timestamps = true;
         } else if (std::strcmp(argv[i], "--quiet") == 0) {
@@ -63,32 +91,22 @@ int main(int argc, char ** argv) {
         std::chrono::duration<double, std::milli>(pf_clock::now() - init_begin).count();
     fprintf(stderr, "paraformer: init %.1f ms\n", init_ms);
 
-    for (const char * wave : waves) {
-        ma_decoder decoder;
-        const auto config = ma_decoder_config_init(ma_format_f32, 1, 16000);
-        if (ma_decoder_init_file(wave, &config, &decoder) != MA_SUCCESS) {
-            fprintf(stderr, "paraformer: cannot decode %s\n", wave);
+    if (warmup_file) {
+        std::vector<float> warm;
+        if (!read_wav(warmup_file, warm)) {
             return 3;
         }
-        const std::unique_ptr<ma_decoder, decltype(&ma_decoder_uninit)> audio(&decoder, ma_decoder_uninit);
+        const auto wbegin = pf_clock::now();
+        paraformer_warmup(model.get(), warm.data(), (int) warm.size());
+        const double wms =
+            std::chrono::duration<double, std::milli>(pf_clock::now() - wbegin).count();
+        fprintf(stderr, "paraformer: warmup %.1f ms\n", wms);
+    }
+
+    for (const char * wave : waves) {
         std::vector<float> samples;
-        samples.reserve(16000 * 30);
-        for (;;) {
-            float block[4096];
-            ma_uint64 count = 0;
-            const auto res = ma_decoder_read_pcm_frames(audio.get(), block, 4096, &count);
-            if (res != MA_SUCCESS && res != MA_AT_END) {
-                fprintf(stderr, "paraformer: read error on %s\n", wave);
-                return 4;
-            }
-            samples.insert(samples.end(), block, block + count);
-            if (res == MA_AT_END || count == 0) {
-                break;
-            }
-        }
-        if (samples.empty()) {
-            fprintf(stderr, "paraformer: empty audio %s\n", wave);
-            return 5;
+        if (!read_wav(wave, samples)) {
+            return 3;
         }
 
         const auto begin = pf_clock::now();
