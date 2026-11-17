@@ -125,6 +125,19 @@ cannot back both backends (ggml binds ops to the weight's physical buffer and HT
 needs tiled repack), so each engine keeps its own buffer — what is shared is the
 disk read + GGUF parse. See design doc §12.
 
+### Weight variants
+
+`tools/requant.cpp` rebuilds the published Q8_0 file with ggml's own quantizer
+and keeps every non-quantized tensor in its original type:
+
+```sh
+build-x-asr/bin/llama-paraformer-requant paraformer-zh-q8_0.gguf out-q4_k.gguf Q4_K
+```
+
+Q4_K halves resident memory (252 to 146 MB) and is 17 percent slower on both HTP
+and CPU, with transcripts inside quantization noise, so Q8_0 stays the default.
+Q5_K/Q6_K use the same tool. See design doc section 24.
+
 ## Profiling
 
 Capture a per-op HTP profile (one warmup + one measured utterance) and
