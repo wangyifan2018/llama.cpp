@@ -1052,11 +1052,13 @@ Findings:
   commands per round, and it never opened in `single`, `aligned4`, `stagger4`,
   `mixed4` or `burst4`. A gated policy therefore costs nothing on paced audio
   by construction, and that part of the design holds.
-- Neither candidate beats the control outside the noise. Over six rounds the
-  per-cell differences are 5 ms on `vadburst`, 5 ms on `mixed4` p50 and 30 ms on
-  `aligned4` p95, and the ordering changes between the two passes. `hybrid-resident`
-  is worse on `mixed4` p95 (416.6 against 360.7) and `vadburst` p50 (1076 against
-  1015). Keep the default and both routers opt-in.
+- Neither candidate beats the control, and the ordering flips between the two
+  passes. In the three-round pass `aligned4` p95 was 415 for the control, 406
+  for `hybrid-eta` and 578 for `hybrid-resident`; over six rounds it is 456,
+  527 and 527. The candidates therefore lose 71 ms on that cell with more
+  samples, and `hybrid-resident` is worse on `mixed4` p95 (416.6 against 360.7)
+  and `vadburst` p50 (1076 against 1015). Keep the default and both routers
+  opt-in.
 - `--cpu-queue 1` cannot bind on this workload and its apparent win is a
   tie-break shift. A finalized segment is one APPEND followed by one COMMIT, so
   a CPU session never has more than one request outstanding; the cap only delays
