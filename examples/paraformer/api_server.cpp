@@ -782,7 +782,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "usage: %s MODEL.gguf [--device HTP0:0] [--port N] [--engines N] [--threads N] "
                      "[--bind ADDR] [--queue N] [--timeout-ms N] [--model-id ID] [--warmup WAV] "
-                     "[--partial-ms N] [--partial-interval-ms N] [--no-partials] [--seg-gap-ms N] [--punct-gap-ms N]\n",
+                     "[--partial-ms N] [--partial-interval-ms N] [--no-partials] [--seg-gap-ms N] [--punct-gap-ms N] "
+                     "[--web-dir DIR]\n",
                      argv[0]);
         return 1;
     }
@@ -790,6 +791,7 @@ int main(int argc, char** argv) {
     const char* device = "CPU";
     const char* bind_addr = "0.0.0.0";
     const char* warmup = nullptr;
+    const char* web_dir = "web";
     int port = 8080;
     int n_engines = 2;
     int threads = 2;
@@ -814,6 +816,8 @@ int main(int argc, char** argv) {
             g_model_id = argv[++i];
         } else if (std::strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) {
             warmup = argv[++i];
+        } else if (std::strcmp(argv[i], "--web-dir") == 0 && i + 1 < argc) {
+            web_dir = argv[++i];
         } else if (std::strcmp(argv[i], "--partial-ms") == 0 && i + 1 < argc) {
             g_partial_min_ms = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--partial-interval-ms") == 0 && i + 1 < argc) {
@@ -910,6 +914,15 @@ int main(int argc, char** argv) {
 
     srv.Post("/v1/audio/transcriptions", handle_transcription);
     srv.Post("/asr/segment", handle_segment);
+
+    // Test console: static page at /, served from --web-dir when present.
+    if (!srv.set_mount_point("/", web_dir)) {
+        std::fprintf(stderr, "pf-api: web dir '%s' not found, / serves a short hint\n", web_dir);
+        srv.Get("/", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content("pf-api: no web dir mounted. Use --web-dir examples/paraformer/web\n",
+                            "text/plain; charset=utf-8");
+        });
+    }
     srv.WebSocket("/v1/realtime", [](const httplib::Request&, httplib::ws::WebSocket& ws) { ws_serve(ws); });
 
     srv.set_exception_handler([](const httplib::Request&, httplib::Response& res, std::exception_ptr ep) {
