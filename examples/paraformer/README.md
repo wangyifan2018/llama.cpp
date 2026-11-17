@@ -61,19 +61,31 @@ printed by the CLI).
 `llama-paraformer-server` is a whole-utterance ASR daemon. Framing matches the
 x-asr client (`<III` request header, `<II` reply header); `RECOGNIZE` (op 0)
 carries one float32 16 kHz segment and the reply is `FINAL` (status 1) with the
-UTF-8 transcript. Inference is serialized over one shared context, so warm up
-before accepting traffic:
+UTF-8 transcript. The GGUF is read once and shared; each engine materializes its
+own weights, so contexts are independent and run in parallel with no global lock.
+Warm up every engine before accepting traffic:
 
 ```sh
 python3 tools/bench_pf_service.py --wavs WAV --emit-warmup warmup.f32
-llama-paraformer-server MODEL.gguf HTP0:0 --port 8876 --warmup warmup.f32 --threads 2
+# default: 2 engines (HTP + CPU), shared weights, 2 workers
+llama-paraformer-server MODEL.gguf HTP0:0 --port 8876 --warmup warmup.f32 --threads 2 --engines 2
 python3 tools/bench_pf_service.py --port 8876 --wavs WAV1,WAV2,WAV3,WAV4 --lanes 1,2,4 --reps 8
 ```
 
-SM6650: single lane p95 295 ms; four simultaneous lanes p95 1126 ms (single
-worker serializes), but four lanes staggered 300 ms p95 317 ms. See design doc
-§11. To lower the simultaneous-arrival tail requires multi-context weight
-sharing plus HTP/CPU routing — not done yet.
+`--engines 1` gives the old single-context serial behavior (baseline).
+SM6650, shared weights load 154 ms, warmup HTP 1386 ms / CPU 872 ms (before accept):
+
+| config | 1 lane p50/p95 | 2 lanes p50/p95 | 4 lanes p50/p95 |
+|---|---:|---:|---:|
+| 1 engine (HTP, baseline) | 285 / 296 | 439 / 577 | 707 / 1126 |
+| 2 engines (HTP+CPU, shared weights) | 337 / 370 | 329 / **373** | 516 / **740** |
+| 2 engines + 4 lanes stagger 300 ms | — | — | 310 / **349** |
+
+2-lane p95 drops 577 → 373 ms (−35%) and 4-lane 1126 → 740 ms (−34%); transcripts
+are byte-identical across engines (distinct=1 per clip). A single weight buffer
+cannot back both backends (ggml binds ops to the weight's physical buffer and HTP
+needs tiled repack), so each engine keeps its own buffer — what is shared is the
+disk read + GGUF parse. See design doc §12.
 
 ## Profiling
 

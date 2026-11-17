@@ -165,6 +165,21 @@ struct paraformer_context {
     int cached_enc_T_lfr = 0;
 };
 
+// Shared, read-only weight set loaded once from GGUF. A canonical copy lives
+// in a CPU host buffer; each inference context clones it into its own backend
+// buffer (host for CPU, tiled device buffer for HTP). This avoids re-reading
+// the GGUF per context while keeping every context's tensors independent.
+struct paraformer_weights {
+    // One file read, reused by every context. Each context materializes its own
+    // backend buffer from these bytes. A single GGUF-weight buffer cannot back
+    // both HTP and CPU schedulers (ggml binds ops to the weight's physical
+    // buffer; HTP also needs tiled repack), so per-context buffers are required
+    // — what is shared is the load (disk I/O + GGUF parse), not the buffer.
+    std::vector<char> gguf_bytes;
+    std::string model_path;
+    std::vector<std::string> vocab;
+};
+
 // ===========================================================================
 // Helpers
 // ===========================================================================
@@ -1041,6 +1056,113 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
 
 paraformer_context_params paraformer_context_default_params() {
     return {4, 0, true, true};
+}
+
+// ---------------------------------------------------------------------------
+// Shared-weight API: load the GGUF once, then create independent contexts.
+// ---------------------------------------------------------------------------
+
+paraformer_weights* paraformer_weights_load(const char* path, int verbosity) {
+    if (!path || !path[0])
+        return nullptr;
+
+    auto* w = new paraformer_weights();
+    w->model_path = path;
+    if (!core_gguf::read_file(path, w->gguf_bytes)) {
+        fprintf(stderr, "paraformer: shared read failed for '%s'\n", path);
+        delete w;
+        return nullptr;
+    }
+
+    if (gguf_context* gctx = core_gguf::open_metadata(path)) {
+        int idx = gguf_find_key(gctx, "tokenizer.tokens");
+        if (idx >= 0) {
+            int n = gguf_get_arr_n(gctx, idx);
+            w->vocab.resize(n);
+            for (int i = 0; i < n; i++)
+                w->vocab[i] = gguf_get_arr_str(gctx, idx, i);
+        }
+        core_gguf::free_metadata(gctx);
+    }
+
+    if (verbosity >= 1)
+        fprintf(stderr, "paraformer: shared weights loaded (%zu bytes, vocab %zu)\n", w->gguf_bytes.size(),
+                w->vocab.size());
+    return w;
+}
+
+void paraformer_weights_free(paraformer_weights* w) {
+    delete w;
+}
+
+static void paraformer_select_backend(paraformer_context* ctx, paraformer_context_params params, bool respect_env) {
+    // Shared contexts must pick their backend purely from params.use_gpu, so
+    // that an HTP context and a CPU context can coexist in one process (the
+    // CRISPASR_PARAFORMER_GPU env is process-global and would force both).
+    if (!respect_env) {
+        ctx->backend = ctx->backend_cpu;
+        if (params.use_gpu) {
+            ggml_backend_t gpu = crispasr_init_gpu_backend();
+            if (gpu)
+                ctx->backend = gpu;
+        }
+        return;
+    }
+    const char* gpu_env = std::getenv("CRISPASR_PARAFORMER_GPU");
+    const bool force_gpu = gpu_env && std::atoi(gpu_env) != 0;
+    const bool force_cpu = gpu_env && std::atoi(gpu_env) == 0;
+    ctx->backend = ctx->backend_cpu;
+    if (!force_cpu && (force_gpu || params.use_gpu)) {
+        ggml_backend_t gpu = crispasr_init_gpu_backend();
+        if (gpu) {
+            bool is_metal = false;
+#if defined(GGML_USE_METAL)
+            is_metal = core_cpu_backend::is_metal(gpu);
+#endif
+            if (!is_metal || force_gpu) {
+                ctx->backend = gpu;
+            } else {
+                ggml_backend_free(gpu);
+            }
+        }
+    }
+}
+
+paraformer_context* paraformer_init_shared(paraformer_weights* w, paraformer_context_params params) {
+    if (!w)
+        return nullptr;
+    auto* ctx = new paraformer_context();
+    ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
+    ctx->flash_attn = params.flash_attn;
+    ctx->verbosity = params.verbosity;
+
+    ctx->backend_cpu = core_cpu_backend::init();
+    if (!ctx->backend_cpu) {
+        fprintf(stderr, "paraformer: shared ctx failed to init CPU backend\n");
+        delete ctx;
+        return nullptr;
+    }
+    core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    paraformer_select_backend(ctx, params, /*respect_env=*/false);
+
+    ctx->model_path = w->model_path;
+    // Materialize this context's weights from the single in-memory GGUF byte
+    // buffer into its own backend (HTP tiled device buffer, or host for CPU).
+    if (!core_gguf::load_weights_bytes(w->gguf_bytes, ctx->backend, "paraformer", ctx->wl)) {
+        fprintf(stderr, "paraformer: shared ctx failed to materialize weights\n");
+        if (ctx->backend && ctx->backend != ctx->backend_cpu)
+            ggml_backend_free(ctx->backend);
+        ggml_backend_free(ctx->backend_cpu);
+        delete ctx;
+        return nullptr;
+    }
+
+    if (!paraformer_load_model(ctx)) {
+        paraformer_free(ctx);
+        return nullptr;
+    }
+    ctx->vocab = w->vocab; // cheap: ~8404 short strings copied once at init
+    return ctx;
 }
 
 paraformer_context* paraformer_init_from_file(const char* path, paraformer_context_params params) {

@@ -1,24 +1,26 @@
-// Minimal whole-utterance ASR server around the Paraformer engine.
+// Whole-utterance ASR server around the Paraformer engine.
 //
-// Paraformer is non-autoregressive: one VAD segment in, one final transcript
-// out. There is no append/commit streaming state, so the wire protocol is a
-// single request/response over a length-prefixed little-endian frame:
-//
+// Wire protocol (x-asr compatible framing):
 //   request : u32 op, u32 reserved, u32 bytes, payload (float32 mono 16 kHz)
 //   response: u32 status, u32 bytes, payload
-//
 //   op:     0 RECOGNIZE (payload = one whole utterance)
-//   status: 1 FINAL (payload = UTF-8 transcript), 2 ERROR (payload = message)
+//   status: 1 FINAL (UTF-8 transcript), 2 ERROR (message)
 //
-// The x-asr client's framing (struct "<III" header + "<II" reply) is reused so
-// the same socket helpers work. One context is shared by all connections and
-// inference is serialized under a mutex: paraformer_context holds mutable
-// scheduler and encoder-graph-cache state, so it is not safe to transcribe
-// concurrently. Start with --warmup so the one-time HTP graph registration
-// (~1 s on SM6650) is paid before the listener accepts traffic.
+// Weight sharing + parallel inference:
+//   The GGUF is read once into a canonical host-buffer weight set. Each engine
+//   clones it into its own backend buffer (HTP tiled device buffer for engine 0,
+//   CPU host buffer for engine 1). Engines are independent contexts with their
+//   own scheduler/graph cache, so they run in parallel without a global lock.
+//   Requests are dispatched to a shared queue; one worker per engine pulls a
+//   request, transcribes on its context, and fulfils the caller's promise.
+//
+//   --engines 2 (default): HTP + CPU, two workers.
+//   --engines 1: single context on --device (baseline, comparable to M3).
+//
+// A device has one HTP session (v73 forces ndev=1), so two HTP engines cannot
+// run concurrently; the second engine is always CPU.
 
 #include "paraformer.h"
-
 #include "ggml-backend.h"
 
 #include <arpa/inet.h>
@@ -29,14 +31,18 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using pf_clock = std::chrono::steady_clock;
@@ -44,8 +50,25 @@ using pf_clock = std::chrono::steady_clock;
 enum { OP_RECOGNIZE = 0 };
 enum { ST_FINAL = 1, ST_ERROR = 2 };
 
-static std::mutex g_infer_mutex;
-static paraformer_context * g_ctx = nullptr;
+struct Engine {
+    paraformer_context* ctx = nullptr;
+    int id = 0;
+    const char* name = "";
+    std::thread worker;
+    std::atomic<uint64_t> requests{0};
+    std::atomic<double> total_ms{0};
+};
+
+struct Task {
+    std::vector<float> samples;
+    std::promise<std::string> result;
+};
+
+static std::queue<std::unique_ptr<Task>> g_queue;
+static std::mutex g_queue_mutex;
+static std::condition_variable g_queue_cv;
+static bool g_stop = false;
+static std::vector<Engine*> g_engines;
 static std::atomic<uint64_t> g_requests{0};
 static std::atomic<double> g_total_ms{0};
 
@@ -53,8 +76,8 @@ static double now_ms() {
     return std::chrono::duration<double, std::milli>(pf_clock::now().time_since_epoch()).count();
 }
 
-static bool read_exact(int fd, void * data, size_t bytes) {
-    auto * p = static_cast<uint8_t *>(data);
+static bool read_exact(int fd, void* data, size_t bytes) {
+    auto* p = static_cast<uint8_t*>(data);
     while (bytes > 0) {
         const ssize_t n = recv(fd, p, bytes, 0);
         if (n <= 0)
@@ -65,8 +88,8 @@ static bool read_exact(int fd, void * data, size_t bytes) {
     return true;
 }
 
-static bool write_exact(int fd, const void * data, size_t bytes) {
-    auto * p = static_cast<const uint8_t *>(data);
+static bool write_exact(int fd, const void* data, size_t bytes) {
+    auto* p = static_cast<const uint8_t*>(data);
     while (bytes > 0) {
         const ssize_t n = send(fd, p, bytes, MSG_NOSIGNAL);
         if (n <= 0)
@@ -77,15 +100,14 @@ static bool write_exact(int fd, const void * data, size_t bytes) {
     return true;
 }
 
-static bool respond(int fd, uint32_t status, const std::string & payload) {
+static bool respond(int fd, uint32_t status, const std::string& payload) {
     uint32_t head[2] = {status, (uint32_t) payload.size()};
     return write_exact(fd, head, sizeof(head)) &&
            (payload.empty() || write_exact(fd, payload.data(), payload.size()));
 }
 
-static bool read_wav_bytes(const std::string & path, std::vector<float> & samples) {
-    // Accept raw float32 files for warmup to avoid a miniaudio dependency here.
-    FILE * f = std::fopen(path.c_str(), "rb");
+static bool read_wav_bytes(const std::string& path, std::vector<float>& samples) {
+    FILE* f = std::fopen(path.c_str(), "rb");
     if (!f)
         return false;
     if (std::fseek(f, 0, SEEK_END) != 0) {
@@ -108,19 +130,48 @@ static bool read_wav_bytes(const std::string & path, std::vector<float> & sample
     return true;
 }
 
+static void worker_loop(Engine* eng) {
+    for (;;) {
+        std::unique_ptr<Task> task;
+        {
+            std::unique_lock<std::mutex> lock(g_queue_mutex);
+            g_queue_cv.wait(lock, [] { return !g_queue.empty() || g_stop; });
+            if (g_queue.empty()) {
+                if (g_stop)
+                    return;
+                continue;
+            }
+            task = std::move(g_queue.front());
+            g_queue.pop();
+        }
+        const double t0 = now_ms();
+        std::string text;
+        std::unique_ptr<char, decltype(&std::free)> out(
+            paraformer_transcribe(eng->ctx, task->samples.data(), (int) task->samples.size()), &std::free);
+        if (out)
+            text = out.get();
+        const double dt = now_ms() - t0;
+        eng->requests.fetch_add(1);
+        double cur = eng->total_ms.load();
+        while (!eng->total_ms.compare_exchange_weak(cur, cur + dt)) {}
+        g_requests.fetch_add(1);
+        cur = g_total_ms.load();
+        while (!g_total_ms.compare_exchange_weak(cur, cur + dt)) {}
+        task->result.set_value(std::move(text));
+    }
+}
+
 static void handle_connection(int fd) {
     for (;;) {
         uint32_t head[3];
         if (!read_exact(fd, head, sizeof(head)))
             break;
         uint32_t op = head[0], bytes = head[2];
-        if (bytes > 64u * 1024u * 1024u) { // 64 MB guard (~33 min audio)
+        if (bytes > 64u * 1024u * 1024u) {
             respond(fd, ST_ERROR, "payload too large");
             break;
         }
-        std::vector<float> samples;
         if (op != OP_RECOGNIZE) {
-            // Drain any payload so the framing stays aligned, then reject.
             if (bytes) {
                 std::vector<uint8_t> sink(bytes);
                 if (!read_exact(fd, sink.data(), bytes))
@@ -129,28 +180,24 @@ static void handle_connection(int fd) {
             respond(fd, ST_ERROR, "unknown op");
             continue;
         }
-        samples.resize(bytes / sizeof(float));
-        if (bytes && !read_exact(fd, samples.data(), bytes)) {
+        std::vector<float> samples(bytes / sizeof(float));
+        if (bytes && !read_exact(fd, samples.data(), bytes))
             break;
-        }
         if (samples.empty()) {
             respond(fd, ST_ERROR, "empty audio");
             continue;
         }
 
-        std::string text;
-        const double t0 = now_ms();
+        auto task = std::unique_ptr<Task>(new Task());
+        task->samples = std::move(samples);
+        auto result = task->result.get_future();
         {
-            std::lock_guard<std::mutex> lock(g_infer_mutex);
-            std::unique_ptr<char, decltype(&std::free)> out(
-                paraformer_transcribe(g_ctx, samples.data(), (int) samples.size()), &std::free);
-            if (out)
-                text = out.get();
+            std::lock_guard<std::mutex> lock(g_queue_mutex);
+            g_queue.push(std::move(task));
         }
-        const double dt = now_ms() - t0;
-        g_requests.fetch_add(1);
-        double cur = g_total_ms.load();
-        while (!g_total_ms.compare_exchange_weak(cur, cur + dt)) {}
+        g_queue_cv.notify_one();
+
+        std::string text = result.get(); // wait for the worker that picked it up
         if (text.empty()) {
             respond(fd, ST_ERROR, "inference failed");
             continue;
@@ -161,18 +208,21 @@ static void handle_connection(int fd) {
     close(fd);
 }
 
-int main(int argc, char ** argv) {
+int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: %s MODEL.gguf [DEVICE] [--port N] [--warmup F32] [--threads N] [--bind ADDR]\n",
+        std::fprintf(stderr,
+                     "usage: %s MODEL.gguf [DEVICE] [--port N] [--warmup F32] [--threads N] "
+                     "[--engines 1|2] [--bind ADDR]\n",
                      argv[0]);
         return 1;
     }
-    const char * model = argv[1];
-    const char * device = "CPU";
+    const char* model = argv[1];
+    const char* device = "CPU";
     int port = 8766;
-    const char * bind_addr = "0.0.0.0";
-    const char * warmup = nullptr;
+    const char* bind_addr = "0.0.0.0";
+    const char* warmup = nullptr;
     int threads = 2;
+    int n_engines = 2;
     bool device_set = false;
     for (int i = 2; i < argc; ++i) {
         if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -183,37 +233,73 @@ int main(int argc, char ** argv) {
             warmup = argv[++i];
         } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
             threads = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--engines") == 0 && i + 1 < argc) {
+            n_engines = std::atoi(argv[++i]);
         } else if (argv[i][0] != '-' && !device_set) {
             device = argv[i];
             device_set = true;
         }
     }
+    if (n_engines < 1)
+        n_engines = 1;
+    if (n_engines > 2)
+        n_engines = 2;
+
+    // The HTP backend is selected via a device env read by crispasr_init_gpu_backend.
     if (device_set && std::strcmp(device, "CPU") != 0) {
         setenv("PARAFORMER_DEVICE", device, 1);
-        setenv("CRISPASR_PARAFORMER_GPU", "1", 1);
     }
 
     ggml_backend_load_all();
+
+    std::vector<float> warm;
+    if (warmup && !read_wav_bytes(warmup, warm)) {
+        std::fprintf(stderr, "pf-server: cannot read warmup f32 %s\n", warmup);
+        return 3;
+    }
+
+    // Load the GGUF once into a canonical host-buffer weight set.
+    const double load0 = now_ms();
+    paraformer_weights* weights = paraformer_weights_load(model, 0);
+    if (!weights) {
+        std::fprintf(stderr, "pf-server: cannot load weights from %s\n", model);
+        return 2;
+    }
+    std::fprintf(stderr, "pf-server: shared weights load %.1f ms\n", now_ms() - load0);
+
     paraformer_context_params params = paraformer_context_default_params();
     params.use_gpu = false;
     params.flash_attn = false;
     params.n_threads = threads;
     params.verbosity = 0;
-    g_ctx = paraformer_init_from_file(model, params);
-    if (!g_ctx) {
-        std::fprintf(stderr, "pf-server: cannot load %s\n", model);
-        return 2;
-    }
 
-    if (warmup) {
-        std::vector<float> warm;
-        if (!read_wav_bytes(warmup, warm)) {
-            std::fprintf(stderr, "pf-server: cannot read warmup f32 %s\n", warmup);
-            return 3;
-        }
+    // Engine 0: requested device (HTP when a device is given).
+    // Engine 1: CPU, from the same canonical weights.
+    struct EngineSpec {
+        bool use_gpu;
+        const char* name;
+    };
+    std::vector<EngineSpec> specs;
+    specs.push_back({device_set && std::strcmp(device, "CPU") != 0, device});
+    if (n_engines >= 2)
+        specs.push_back({false, "CPU"});
+
+    for (size_t i = 0; i < specs.size(); ++i) {
+        auto* eng = new Engine();
+        eng->id = (int) i;
+        eng->name = specs[i].name;
+        auto p = params;
+        p.use_gpu = specs[i].use_gpu;
         const double t0 = now_ms();
-        paraformer_warmup(g_ctx, warm.data(), (int) warm.size());
-        std::fprintf(stderr, "pf-server: warmup %.1f ms\n", now_ms() - t0);
+        eng->ctx = paraformer_init_shared(weights, p);
+        if (!eng->ctx) {
+            std::fprintf(stderr, "pf-server: engine %zu (%s) init failed\n", i, specs[i].name);
+            return 2;
+        }
+        if (!warm.empty())
+            paraformer_warmup(eng->ctx, warm.data(), (int) warm.size());
+        std::fprintf(stderr, "pf-server: engine %d (%s) ready in %.1f ms\n", eng->id, eng->name, now_ms() - t0);
+        g_engines.push_back(eng);
     }
 
     const int listener = socket(AF_INET, SOCK_STREAM, 0);
@@ -227,12 +313,15 @@ int main(int argc, char ** argv) {
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t) port);
     addr.sin_addr.s_addr = inet_addr(bind_addr);
-    if (bind(listener, (sockaddr *) &addr, sizeof(addr)) < 0) {
+    if (bind(listener, (sockaddr*) &addr, sizeof(addr)) < 0) {
         std::perror("bind");
         return 5;
     }
     listen(listener, 64);
-    std::fprintf(stderr, "pf-server: listening on %s:%d (device=%s, threads=%d)\n", bind_addr, port, device, threads);
+    std::fprintf(stderr, "pf-server: listening on %s:%d (%zu engines)\n", bind_addr, port, g_engines.size());
+
+    for (Engine* eng : g_engines)
+        eng->worker = std::thread(worker_loop, eng);
 
     for (;;) {
         int fd = accept(listener, nullptr, nullptr);

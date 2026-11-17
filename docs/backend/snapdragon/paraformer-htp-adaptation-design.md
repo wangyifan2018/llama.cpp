@@ -302,3 +302,68 @@ payload=UTF-8 文本)`，帧头仍用 `u32 op,u32 reserved,u32 bytes` / `u32 sta
 让多 context 复用同一份只读权重 tensor，各自持有 sched/图缓存/激活），再按 x-asr 的 2+2 思路做
 HTP/CPU 双引擎路由；那会重新引入内存压力（x-asr 已测得 CPU 3/4 线程被内存卡死）。在此之前，
 先用错峰整形 + 识别质量（标点/英文）作为投入方向。
+
+## 12. M4 实测：共享权重 + HTP/CPU 双引擎并发（2026-11-17，SM6650）
+
+### 12.1 权重共享的可行边界（先查约束再动手）
+
+"一份权重 buffer 同时被 HTP 和 CPU 原生执行"在本版本 ggml **不可行**，这是三个硬约束叠加的结果：
+
+1. **buffer-affinity**：`ggml-backend.cpp:1368-1397` 中 scheduler 按权重张量的物理 buffer 决定 op 的执行后端；
+   权重在 HTP device buft 就跑 HTP，在 host buft 就跑 CPU（除非开 `op_offload`）。
+2. **HTP 只认自己的 buft**：`ggml-hexagon.cpp:3181-3187` 中 `supports_buft` 只接受 HTP 的
+   `buffer_type`/`host_buffer_type`，不认 CPU host buft，所以 host 权重无法直接喂给 HTP 算。
+3. **单 HTP session**：v73 强制 `ndev=1`（"forcing ndev to 1 for SoCs archs lower than v75"），
+   一个 device 只有一个 session，session 内 `graph_compute` 无锁，两个 HTP engine 并发不安全。
+
+实测验证（单条 3.5 s 音频，`win_zh03.wav`，各跑 warmup 后稳态）：
+
+| 权重布局 | 稳态 wall | warmup | 结论 |
+|---|---:|---:|---|
+| HTP device buffer（基线，tiled repack） | **389 ms** | 1295 ms | 最快，HTP 原生 |
+| CPU host buffer + `PF_OP_OFFLOAD=1` | 527 ms | 672 ms | offload 没有加速 MUL_MAT，反而 +35% |
+| CPU host buffer，无 offload | 515 ms | 678 ms | op 落到 CPU |
+
+`op_offload` 对 Paraformer 的 GEMM 无效（权重跨设备读 + 失去 tiled repack）。
+
+### 12.2 落地的方案：共享"加载"，不共享"buffer"
+
+- 一次 `read_file` 把 GGUF 读进内存（226 MB），一次 `gguf_init_from_buffer` 解析 —— 由 `paraformer_weights`
+  持有，供所有 context 复用。
+- 每个 engine 用 `load_weights_bytes(同一份 bytes, 自己的 backend)` 各自 materialize 一份权重 buffer：
+  HTP engine 得到 tiled device buffer，CPU engine 得到 host buffer。ggml 的 `gguf_init_from_buffer`
+  自建大小正确的 ggml_context，避免了手工估算 pool 大小的坑（`ggml_dup_tensor` 路线因 pool 不足多次 abort）。
+- 物理 buffer 两份是 HTP repack 的硬约束；单 HTP session 决定了第二引擎只能是 CPU。
+  内存代价：bytes 226 MB + HTP buffer 226 MB + CPU buffer 226 MB，设备 RSS 约 1.5 GB（可用 7 GB）。
+- 接口：`paraformer_weights_load/free` + `paraformer_init_shared`；后端由 `params.use_gpu` 决定
+  （不看进程级 `CRISPASR_PARAFORMER_GPU` env），因此 HTP 与 CPU context 可在同一进程共存。
+
+### 12.3 server 改造：请求级双 worker
+
+去掉 M3 的全局 `g_infer_mutex`。改为共享请求队列 + 每 engine 一个 worker 线程：reader 线程把每条
+RECOGNIZE 作为独立任务入队并等 `std::future`；两个 worker（各绑定一个 context）竞争取任务并行推理。
+`--engines 1|2`（默认 2）：engine 0 走 `--device`（HTP），engine 1 固定 CPU；两者都在 accept 前 warmup。
+
+### 12.4 真机结果（SM6650，每条音频 2.0–2.7 s，0 错误）
+
+| 配置 | 单路 p50/p95 | 2 路 p50/p95 | 4 路 p50/p95 |
+|---|---:|---:|---:|
+| 单引擎 HTP（= M3 基线） | 285 / 296 | 439 / **577** | 707 / 1126 |
+| 双引擎 HTP+CPU（共享权重） | 337 / 370 | 329 / **373** | 516 / **740** |
+| 双引擎 + 4 路错峰 300 ms | — | — | 310 / **349** |
+
+- **2 路 p95 577 → 373 ms（−35%）**：两请求分落 HTP/CPU 两个 worker 真并行，不再线性累加；
+  p50 也从 439 降到 329（部分请求命中更快的 HTP 引擎而非全部排队）。
+- **4 路 p95 1126 → 740 ms（−34%）**：每个引擎各处理约 2 条，仍受每引擎内串行限制，
+  故是 ~2× 单路而非 4×。要进一步压需第三个引擎（设备无第二 HTP session，只能再加 CPU 槽，
+  但 x-asr 已测得 CPU 多线程被内存卡死）。
+- 单路双引擎 p50 337 略高于单引擎 HTP 285：请求随机落到较慢的 CPU 引擎（357 ms）所致，
+  这是用单路轻微换尾延迟的取舍。
+- 转写：4 条 wav × 70 个响应 distinct=1，跨 HTP/CPU 引擎无串扰；错峰 300 ms 仍有效（349 ms）。
+
+### 12.5 结论与遗留
+
+- "降要求，先做两路"达成：2 路 P95 降低 35%，且未引入重复读盘（GGUF 只读一次，shared load 154 ms）。
+- 未做的"物理单份权重 buffer 共享"有明确机制障碍（§12.1），复活条件：HTP 后端支持从 host buft
+  直接执行权重算子（等价于去掉 tiled repack 依赖）或设备提供第二个 HTP session。
+- 剩余方向：第三引擎的可行性（受 CPU 内存限制）、英文识别质量、`Set`→`said` 专项。

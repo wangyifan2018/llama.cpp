@@ -23,6 +23,7 @@ extern "C" {
 #endif
 
 struct paraformer_context;
+struct paraformer_weights;
 
 struct paraformer_context_params {
     int n_threads;
@@ -32,6 +33,19 @@ struct paraformer_context_params {
 };
 
 paraformer_context_params paraformer_context_default_params();
+
+// Load a GGUF file once into a canonical host-buffer weight set (weights +
+// vocabulary + model path). Multiple inference contexts can be created from it
+// without re-reading the file. The canonical weights stay read-only.
+paraformer_weights* paraformer_weights_load(const char* path, int verbosity);
+void paraformer_weights_free(paraformer_weights* w);
+
+// Create an inference context backed by a shared weight set. Weights are
+// cloned into the context's own backend buffer (host for CPU, tiled device
+// buffer for HTP), so contexts are independent and safe to run in parallel.
+// params.use_gpu selects HTP vs CPU (subject to the same env gates as
+// paraformer_init_from_file).
+paraformer_context* paraformer_init_shared(paraformer_weights* w, paraformer_context_params params);
 
 paraformer_context* paraformer_init_from_file(const char* path, paraformer_context_params params);
 void paraformer_free(paraformer_context* ctx);
