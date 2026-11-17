@@ -265,6 +265,38 @@ static double oldest_commit(double oldest, const request & req) {
     return oldest;
 }
 
+// Estimated completion order: sessions already running, plus a penalty when the
+// engine's oldest commit is already late. The engine with the smallest score is
+// expected to finish a new session first. Ties go to the earlier engine, which
+// is the device engine, so model compute stays on HTP when both are free.
+static bool eta_router = false;
+
+static engine * reserve_eta(const std::vector<engine *> & engines) {
+    engine * best = nullptr;
+    double best_score = 0;
+    for (auto * eng : engines) {
+        std::lock_guard<std::mutex> lock(eng->mutex);
+        if (eng->live >= eng->max_sessions) {
+            continue;
+        }
+        const double age = eng->oldest_active_commit_ms.load();
+        const double score = (double) eng->live + age / 300.0;
+        if (!best || score < best_score - 1e-9) {
+            best = eng;
+            best_score = score;
+        }
+    }
+    if (best) {
+        ++best->live; // reserve the slot; the worker creates the stream
+    }
+    if (getenv("XASR_TIMING")) {
+        fprintf(stderr, "xasr-route mode=eta device=%s score=%.2f live=%d age_ms=%.1f\n",
+                best ? best->device : "busy", best_score, best ? best->live : 0,
+                best ? best->oldest_active_commit_ms.load() : 0.0);
+    }
+    return best;
+}
+
 static engine * reserve_adaptive(const std::vector<engine *> & engines) {
     auto * htp = engines[0];
     auto * cpu = engines[1];
@@ -549,6 +581,15 @@ static void reader_thread(int fd, std::vector<engine *> engines) {
             break;
         }
         if (req.op == OP_OPEN) {
+            if (eta_router) {
+                req.eng = reserve_eta(engines);
+                if (!req.eng) {
+                    respond(fd, ST_ERROR, "open: no available engine capacity");
+                } else {
+                    push(req.eng, std::move(req));
+                }
+                continue;
+            }
             if (adaptive_cpu) {
                 req.eng = reserve_adaptive(engines);
                 if (!req.eng) {
@@ -611,7 +652,7 @@ static void reader_thread(int fd, std::vector<engine *> engines) {
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s MODEL.gguf DEVICE [--hotwords FILE] [--port N] [--streams N] [--cpu-streams N] [--queue N] [--bind ADDR] [--chunk-scheduler] [--encoder-batch 1|2|4] [--adaptive-cpu]\n", argv[0]);
+        fprintf(stderr, "usage: %s MODEL.gguf DEVICE [--hotwords FILE] [--port N] [--streams N] [--cpu-streams N] [--queue N] [--bind ADDR] [--chunk-scheduler] [--encoder-batch 1|2|4] [--adaptive-cpu] [--eta-router]\n", argv[0]);
         return 1;
     }
     xasr_context_params params;
@@ -642,6 +683,8 @@ int main(int argc, char ** argv) {
             params.encoder_batch = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--adaptive-cpu") == 0) {
             adaptive_cpu = true;
+        } else if (std::strcmp(argv[i], "--eta-router") == 0) {
+            eta_router = true;
         } else if (std::strcmp(argv[i], "--chunk-scheduler") == 0) {
             chunk_scheduler = true;
         } else if (std::strcmp(argv[i], "--hotwords") == 0) {

@@ -867,6 +867,63 @@ bash examples/x-asr/tools/bench_arrival_matrix.sh
 Raw per-request JSONL, per-arm server logs and width counts:
 `/tmp/xasr-arrival-1/`.
 
+## Routing under bulk VAD arrival
+
+`--eta-router` replaces the least-loaded rule at OPEN with an estimated
+completion order. Each engine scores `live_sessions + oldest_commit_age_ms /
+300`; the smallest score wins, ties go to the device engine so model compute
+stays on HTP, and the winner's slot is reserved before the request is queued.
+Client sends one finalized 20 s English segment at t=0 and three 2.65 s Mandarin
+segments at 550/600/650 ms (`tools/bench_adaptive_cpu.py`), which is the VAD
+delivery pattern that made the old adaptive gate lose.
+
+Batch cap 4, four HTP slots, two CPU slots, two CPU threads. Two passes with the
+arms alternating, six repetitions each, same session and binary:
+
+| Pass | Arm | short P50 | short P95 | short P99 |
+|---|---|---:|---:|---:|
+| 1 | default hybrid | 965 | 1621 | 1684 |
+| 1 | eta router | 975 | 1159 | 1170 |
+| 2 | default hybrid | 971 | 1621 | 1685 |
+| 2 | eta router | 965 | 1168 | 1178 |
+
+The router cuts short-segment P95 by 28 percent (1621 to 1163) with an unchanged
+median, and the two passes agree to 1 percent. The gain comes from sending the
+late short segments to the engine whose oldest commit is not already late,
+instead of balancing queue length.
+
+Paced traffic does not benefit: two rounds each, N=8 per cell.
+
+| Scenario | default hybrid p50/p95 | eta router p50/p95 |
+|---|---|---|
+| single | 191.4 / 197.6 | 188.5 / 192.5 |
+| aligned4 | 377.1 / 402.2 | 342.6 / 421.0 |
+| stagger4 | 250.6 / 267.5 | 185.7 / 247.0 |
+| mixed4 | 215.4 / 315.6 | 244.9 / 354.2 |
+
+Staggered starts improve by 26 percent at the median, aligned four-way and mixed
+lengths get 12 to 19 percent worse at P95. The router therefore stays opt-in:
+it is the right policy for a burst of finalized VAD segments behind a long
+recording, not for paced audio. Gating it on a long in-flight stream is the next
+experiment, not a default change.
+
+Earlier adaptive admission measured 1580/1678 short P50/P95 in the same session
+as these arms, so the ETA rule is the better of the two opt-in policies for this
+workload.
+
+Reproduce:
+
+```sh
+# server on the phone
+bin/llama-x-asr-server x-asr-zh-en-q8_0.gguf HTP0:0 --port 18765 \
+    --encoder-batch 4 --streams 4 --cpu-streams 2 --eta-router
+# host
+python3 examples/x-asr/tools/bench_adaptive_cpu.py 18765 en-20.wav zh.wav --reps 8
+```
+
+Raw JSONL, per-arm logs and route decisions: `/tmp/xasr-router-1/`,
+`/tmp/xasr-router-2/`, `/tmp/xasr-router-3/`.
+
 ## Reproduce on Android
 
 Run these blocks from the repository root in the same Bash session. The [Snapdragon toolchain guide](../../docs/backend/snapdragon/README.md) covers Docker and ADB setup. Set `ANDROID_SERIAL` if several devices are attached.
