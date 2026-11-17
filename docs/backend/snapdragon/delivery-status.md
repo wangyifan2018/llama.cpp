@@ -106,6 +106,9 @@ python3 examples/paraformer/tools/ws_client.py --url ws://127.0.0.1:8899/v1/real
   门控与 VAD 开关、示例、集成要点）。
 - **门控默认状态**：二进制以 `-DXASR_SPEAKER=ON` 构建时具备能力，但**运行时默认关闭**，
   必须同时给 `--speaker-model` 与 `--enroll-dir` 才启用；`/health` 的 `speaker_gate` 为真实状态。
+- **两者同开时的争用（实测）**：关闭门控/VAD 时 4 路真实时 p95 = 700 ms；门控+VAD 都开时
+  p95 = **907 ms**（声纹 110 ms/段 × 4 路抢 CPU 核）。单请求无差异（282–344 ms）。
+  生产建议：门控只在有 CPU 余量时启用，或后续改成"先出文本、再补 speaker 事件"。
 
 ## 5. 关键脚本
 
