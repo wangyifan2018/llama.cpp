@@ -703,6 +703,59 @@ run archive holds raw JSONL, placement logs, binary, model and input hashes,
 source digest, build log, and the initial background-process sample under
 `$HOME/Library/Caches/qwen3-asr-htp/xasr-multistream/service-real-batch.SaUcxi`.
 
+## Adaptive CPU admission
+
+`--adaptive-cpu` gates CPU overflow at OPEN. It reads per-core deltas from
+`/proc/stat` for CPUs in the process affinity mask, sampled every 200 ms.
+An affinity-eligible core is counted when at least 80% of its interval was
+idle. CPU needs a free slot, at least `--threads` such cores, an empty
+queue, and an idle worker. The HTP pressure signal is the age of its oldest
+queued or active commit. HTP remains the default below 80 ms when a slot
+is available. If HTP is full and CPU is unavailable, OPEN returns busy.
+Existing streams retain their original engine and recurrent state.
+
+The SM6650 smoke used batch cap 4, four HTP slots, two CPU slots, and two
+CPU threads. An idle first OPEN used HTP. The following OPEN used CPU with
+6 idle cores and a 513.7 ms HTP commit still outstanding, even though HTP
+had free slots. Both requests completed, and the CPU short Mandarin
+transcript matched its B=1 reference. With the process confined to one core,
+four parked HTP streams filled the HTP slots. The next OPEN returned busy
+with only one idle core. These are decision tests. They do not establish
+an end-to-end P95 gain over the default hybrid router.
+
+Reproduce from the repository root after deploying the updated server
+using [BUILD.md](BUILD.md). From an ADB shell in the package directory
+on the phone, start the normal-affinity server:
+
+```sh
+export LD_LIBRARY_PATH="$PWD/lib" ADSP_LIBRARY_PATH="$PWD/lib"
+export GGML_HEXAGON_DEVICES=HTP0:0 GGML_HEXAGON_OPPOLL=1 XASR_TIMING=1
+bin/llama-x-asr-server x-asr-zh-en-q8_0.gguf HTP0:0 --bind 127.0.0.1 \
+    --port 18776 --streams 4 --cpu-streams 2 --encoder-batch 4 --adaptive-cpu \
+    > adaptive-backlog.log 2>&1
+```
+
+In a separate host shell, set the path to your deployed package for the
+log argument. The test sends its WAVs from the host.
+
+```sh
+export ANDROID_SERIAL=ADNQ6R5823007930
+adb forward tcp:18776 tcp:18776
+python3 examples/x-asr/tools/test_adaptive_cpu.py 18776 en-20.wav zh.wav \
+    backlog adb /data/local/tmp/llama-x-asr/adaptive-backlog.log
+```
+
+For the no-headroom case, restart the same server with `taskset 1`
+before `bin/llama-x-asr-server`, redirect to
+`adaptive-no-headroom.log`, and run the test with mode `no-headroom`
+and the corresponding log path. Android's mask syntax is hexadecimal
+without the `0x` prefix. Use a permitted single-core mask if core 0 is
+excluded. Remove the forwarding rule after testing with
+`adb forward --remove tcp:18776`.
+
+Raw test output, route logs, source hash and device hashes are archived in
+`$HOME/Library/Caches/qwen3-asr-htp/xasr-multistream/adaptive-cpu.MqIT7W`.
+
 ## Reproduce on Android
 
 Run these blocks from the repository root in the same Bash session. The [Snapdragon toolchain guide](../../docs/backend/snapdragon/README.md) covers Docker and ADB setup. Set `ANDROID_SERIAL` if several devices are attached.

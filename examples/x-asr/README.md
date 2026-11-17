@@ -120,6 +120,14 @@ one COMMIT at its endpoint. The server returns only final text.
   gathers each stream's state before encoding, returns the cache to that
   stream afterward, and runs its joiner with its own token history. An optional
   CPU engine uses width 1.
+- `--adaptive-cpu` is an opt-in Android/Linux admission policy for a primary
+  HTP engine and `--cpu-streams N`. It prefers HTP and can admit a new stream
+  to CPU when HTP commit work has been outstanding for 80 ms or HTP has no
+  free slot. CPU must have a slot, an empty worker backlog, and at least
+  `--threads` affinity-eligible cores that were at least 80% idle over the
+  latest 200 ms sample. Unavailable CPU telemetry disables CPU admission in
+  this mode. Existing streams stay on their assigned engine. See the
+  [routing smoke test](BENCHMARK.md#adaptive-cpu-admission) for reproduction.
 - A client that disconnects without CLOSE is reaped by the idle timeout.
 - Degenerate input: an all-zero segment drives the encoder normalisation to zero
   variance and the logits to NaN. The decoder now clamps an out of range argmax

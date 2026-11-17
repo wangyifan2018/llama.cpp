@@ -29,6 +29,9 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sched.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -83,6 +86,9 @@ struct engine {
     const char * device = "";
     int max_sessions = 0;
     int max_batch = 1;
+    int threads = 1;
+    std::atomic<double> oldest_active_commit_ms{0};
+    std::atomic<bool> active_work{false};
     int live = 0;
     std::deque<request> queue;
     std::mutex mutex;
@@ -194,6 +200,98 @@ static void close_session(uint32_t id) {
 // backpressure the client sees as a stalled socket.
 static size_t queue_limit = 256;
 static bool chunk_scheduler = false;
+static bool adaptive_cpu = false;
+static std::atomic<int> idle_cpus{-1};
+
+#ifdef __linux__
+struct cpu_ticks {
+    uint64_t total;
+    uint64_t idle;
+};
+
+static std::map<int, cpu_ticks> read_cpu_ticks() {
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+        return {};
+    }
+    FILE * file = fopen("/proc/stat", "r");
+    if (!file) {
+        return {};
+    }
+    std::map<int, cpu_ticks> ticks;
+    char line[256];
+    while (fgets(line, sizeof(line), file) && std::strncmp(line, "cpu", 3) == 0) {
+        int core;
+        unsigned long long user, nice, system, idle, iowait, irq, softirq, steal;
+        if (sscanf(line, "cpu%d %llu %llu %llu %llu %llu %llu %llu %llu",
+                   &core, &user, &nice, &system, &idle, &iowait, &irq, &softirq, &steal) != 9 ||
+            core < 0 || core >= CPU_SETSIZE || !CPU_ISSET(core, &allowed)) {
+            continue;
+        }
+        ticks.emplace(core, cpu_ticks{user + nice + system + idle + iowait + irq + softirq + steal, idle});
+    }
+    fclose(file);
+    return ticks;
+}
+
+[[noreturn]] static void sample_cpu_headroom() {
+    auto previous = read_cpu_ticks();
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        auto current = read_cpu_ticks();
+        int idle = 0;
+        int sampled = 0;
+        for (const auto & [core, ticks] : current) {
+            const auto old = previous.find(core);
+            if (old == previous.end() || ticks.total <= old->second.total || ticks.idle < old->second.idle) {
+                continue;
+            }
+            ++sampled;
+            if (double(ticks.idle - old->second.idle) / double(ticks.total - old->second.total) >= 0.8) {
+                ++idle;
+            }
+        }
+        idle_cpus.store(sampled ? idle : -1);
+        previous = std::move(current);
+    }
+}
+#endif
+
+static double oldest_commit(double oldest, const request & req) {
+    if (req.op == OP_COMMIT && (oldest == 0 || req.enqueued_ms < oldest)) {
+        return req.enqueued_ms;
+    }
+    return oldest;
+}
+
+static engine * reserve_adaptive(const std::vector<engine *> & engines) {
+    auto * htp = engines[0];
+    auto * cpu = engines[1];
+    std::scoped_lock locked(htp->mutex, cpu->mutex);
+    double oldest = htp->oldest_active_commit_ms.load();
+    for (const auto & req : htp->queue) {
+        oldest = oldest_commit(oldest, req);
+    }
+    const double age_ms = oldest == 0 ? 0 : now_ms() - oldest;
+    const int idle = idle_cpus.load();
+    const bool htp_room = htp->live < htp->max_sessions;
+    const bool cpu_room = cpu->live < cpu->max_sessions;
+    const bool cpu_draining = cpu->active_work.load() || !cpu->queue.empty();
+    auto * chosen = htp_room ? htp : nullptr;
+    if (cpu_room && !cpu_draining && idle >= cpu->threads && (!htp_room || age_ms >= 80.0)) {
+        chosen = cpu;
+    }
+    if (chosen) {
+        ++chosen->live;
+    }
+    if (getenv("XASR_TIMING")) {
+        fprintf(stderr, "xasr-route device=%s idle_cpus=%d htp_commit_age_ms=%.1f htp_room=%d\n",
+                chosen ? chosen->device : "busy", idle, age_ms, htp_room);
+    }
+    return chosen;
+}
+
 
 static void push(engine * eng, request && req) {
     {
@@ -288,6 +386,17 @@ static void worker_loop(engine * eng) {
                     batch.push_back(std::move(eng->queue[commit_at]));
                     eng->queue.erase(eng->queue.begin() + (long) commit_at);
                 }
+            }
+            if (adaptive_cpu) {
+                double oldest = 0;
+                for (const auto & req : pending) {
+                    oldest = oldest_commit(oldest, req);
+                }
+                for (const auto & req : batch) {
+                    oldest = oldest_commit(oldest, req);
+                }
+                eng->oldest_active_commit_ms.store(oldest);
+                eng->active_work.store(!pending.empty() || !batch.empty());
             }
         }
         eng->space.notify_all();
@@ -396,6 +505,15 @@ static void worker_loop(engine * eng) {
                     break;
             }
         }
+        if (adaptive_cpu) {
+            // Publish pending commits between iterations, including before a wait.
+            double oldest = 0;
+            for (const auto & req : pending) {
+                oldest = oldest_commit(oldest, req);
+            }
+            eng->oldest_active_commit_ms.store(oldest);
+            eng->active_work.store(!pending.empty());
+        }
     }
 }
 
@@ -431,6 +549,15 @@ static void reader_thread(int fd, std::vector<engine *> engines) {
             break;
         }
         if (req.op == OP_OPEN) {
+            if (adaptive_cpu) {
+                req.eng = reserve_adaptive(engines);
+                if (!req.eng) {
+                    respond(fd, ST_ERROR, "open: no available engine capacity");
+                } else {
+                    push(req.eng, std::move(req));
+                }
+                continue;
+            }
             // Pin the session to the least loaded engine that still has a slot.
             engine * best = nullptr;
             size_t best_pending = 0;
@@ -484,7 +611,7 @@ static void reader_thread(int fd, std::vector<engine *> engines) {
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s MODEL.gguf DEVICE [--port N] [--streams N] [--cpu-streams N] [--queue N] [--bind ADDR] [--chunk-scheduler] [--encoder-batch 1|2|4]\n", argv[0]);
+        fprintf(stderr, "usage: %s MODEL.gguf DEVICE [--port N] [--streams N] [--cpu-streams N] [--queue N] [--bind ADDR] [--chunk-scheduler] [--encoder-batch 1|2|4] [--adaptive-cpu]\n", argv[0]);
         return 1;
     }
     xasr_context_params params;
@@ -513,11 +640,24 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             params.encoder_batch = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--adaptive-cpu") == 0) {
+            adaptive_cpu = true;
         } else if (std::strcmp(argv[i], "--chunk-scheduler") == 0) {
             chunk_scheduler = true;
         } else if (std::strcmp(argv[i], "--joiner-host") == 0) {
             params.joiner_on_device = false;
         }
+    }
+    if (adaptive_cpu) {
+#ifdef __linux__
+        if (std::strncmp(params.device, "HTP", 3) != 0 || cpu_streams <= 0 || params.n_streams <= 0) {
+            fprintf(stderr, "xasr-server: --adaptive-cpu requires HTP and positive --cpu-streams\n");
+            return 1;
+        }
+#else
+        fprintf(stderr, "xasr-server: --adaptive-cpu requires Linux CPU statistics\n");
+        return 1;
+#endif
     }
     chunk_scheduler = chunk_scheduler || params.encoder_batch > 1;
     ggml_backend_load_all();
@@ -543,6 +683,7 @@ int main(int argc, char ** argv) {
         eng->device = device;
         eng->max_sessions = streams;
         eng->max_batch = local.encoder_batch;
+        eng->threads = local.n_threads;
         engines.push_back(std::move(eng));
         return true;
     };
@@ -583,6 +724,11 @@ int main(int argc, char ** argv) {
     }
     fprintf(stderr, "xasr-server: idle timeout %.0f ms, listening on %s:%d\n", idle_limit_ms, bind_addr, port);
     std::thread(janitor_loop, raw).detach();
+#ifdef __linux__
+    if (adaptive_cpu) {
+        std::thread(sample_cpu_headroom).detach();
+    }
+#endif
     for (;;) {
         const int fd = accept(listener, nullptr, nullptr);
         if (fd < 0) {
