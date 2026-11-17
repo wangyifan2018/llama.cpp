@@ -856,16 +856,62 @@ one interval early in this run, which biases every arm the same way by under
 20 ms; the client is fixed for later runs and these numbers are otherwise
 comparable.
 
-Reproduce:
+Reproduce with one command. The driver starts one server per arm and round on
+the phone, waits for its own `listening` line, forwards the port, replays the six
+scenarios, records one JSON record per request, stops the server, and then writes
+`summary.md` with the percentiles, the encoder batch widths, the placement and
+the transcript parity:
 
 ```sh
-export ADB=$ANDROID_SDK/platform-tools/adb ANDROID_SERIAL=ADNQ6R5823007930
-export XASR_REPS=3 XASR_OUT=/tmp/xasr-arrival-1
-bash examples/x-asr/tools/bench_arrival_matrix.sh
+python3 examples/x-asr/tools/bench_load_matrix.py --rounds 3 --interleave \
+    --arms onnx-cpu,htp-b1,htp-b2,htp-b4 --out /tmp/xasr-batch1
 ```
 
-Raw per-request JSONL, per-arm server logs and width counts:
-`/tmp/xasr-arrival-1/`.
+`--interleave` runs round by round across arms instead of arm by arm, so slow
+device drift hits every arm. The run directory holds `config.json` (git
+revision, device, input hashes, binary hashes, per-arm command line and
+environment), one `<arm>.jsonl` per arm, one `<arm>.log` per arm, and
+`summary.md`. `tools/bench_parity.py --dir <run>` regenerates only the summary
+from an existing run. `--htp-args` appends one experiment's flags to every HTP
+arm, which is how the scheduling arms below were built.
+
+## Same-arrival replay, 2026-11-17
+
+Replay of the matrix above on the current build with the one-command driver, so
+that every arm also carries its transcripts. Three rounds, interleaved across
+arms, N=3 for `single` and N=12 for the four-session scenarios, no failed
+request in 252. Batch cap 4, four HTP slots, ONNX two threads.
+
+| Arm | single p50/p95 | aligned4 p50/p95 | stagger4 p50/p95 | mixed4 p50/p95 | burst4 p50/p95 | vadburst p50/p95 |
+|---|---|---|---|---|---|---|
+| `onnx-cpu` | 120.5 / 133.1 | 399.1 / 561.0 | 134.8 / 155.2 | 162.2 / 246.5 | 976.8 / 1509.8 | 941.1 / 2392.5 |
+| `htp-b1` | 194.4 / 198.5 | 576.0 / 963.6 | 283.9 / 382.2 | 273.9 / 428.6 | 1701.6 / 2441.8 | 1506.9 / 3785.8 |
+| `htp-b2` | 192.0 / 197.1 | 645.3 / 907.8 | 312.5 / 358.0 | 306.7 / 505.5 | 1535.6 / 2449.6 | 1600.4 / 5054.7 |
+| `htp-b4` | 196.9 / 200.2 | 599.2 / 827.2 | 317.9 / 350.0 | 318.2 / 474.4 | 1513.4 / 2439.6 | 1928.4 / 5045.4 |
+
+`vadburst` is the sixth scenario: one 20 s English recording delivered whole at
+t=0 plus three 2.65 s Mandarin commands at 550/600/650 ms, each in a single
+APPEND followed by COMMIT. It is the finalized-VAD-segment shape, and it is the
+case where batching costs the most.
+
+- The GGUF arms agree on all 63 requests per arm, so the batched graphs are
+  still numerically identical on this workload (146 width-2 dispatches for
+  `htp-b2`; 83 width-2 and 29 width-4 for `htp-b4`).
+- ONNX and GGUF differ on 60 of 63, in two classes. 54 requests are the dropped
+  leading 请 on the Mandarin fixtures. 6 requests are the 20 s English clip,
+  where the ONNX detokeniser emits `navigate ... station. When ...` in lower
+  case with periods and reads `Sarah. Set` for GGUF's `Sarah, said`. Report the
+  two classes apart; neither is a latency result.
+- Batching still moves the tail the wrong way on a burst. `vadburst` p95 rises
+  from 3785.8 at B=1 to 5054.7 at B=2 and 5045.4 at B=4, because a wide graph
+  waits for lanes that a serial schedule would already be running, and the 20 s
+  lane keeps the width full. This is the failure mode the ETA router exists to
+  avoid, and the reason batching stays opt-in.
+- Aligned four-way is the one case where batching helps: p95 963.6 to 907.8 at
+  B=2 and 827.2 at B=4.
+
+Raw per-request JSONL, per-arm logs, configuration and summary:
+`$HOME/Library/Caches/qwen3-asr-htp/xasr-load/2026-11-17-batch1/`.
 
 ## Routing under bulk VAD arrival
 

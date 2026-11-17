@@ -8,6 +8,7 @@ long one keeps sending audio.
 
 import argparse
 import json
+import os
 import socket
 import struct
 import sys
@@ -63,7 +64,13 @@ class Client:
             pass
 
 
-def run_session(args, samples, start, results, index, n_sessions):
+def run_session(args, samples, start, results, index, label):
+    # A finalized VAD segment arrives whole: wait for its offset, then OPEN so the
+    # engine sees the request at arrival, not before it.
+    if args.segment:
+        wait = start - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
     if args.paced:
         wait = start - time.monotonic() - 0.05
         if wait > 0:
@@ -75,24 +82,30 @@ def run_session(args, samples, start, results, index, n_sessions):
         client.close()
         return
     session = struct.unpack("<I", body)[0]
-    endpoint_ms = 0.0
     sent = 0
     step = 320
     try:
-        while sent < len(samples):
-            n = min(step, len(samples) - sent)
-            if args.paced and not args.burst:
-                # Packet i covers audio [i, i+n); it is ready at its end time.
-                delay = (start + (sent + n) / 16000.0) - time.monotonic()
-                if delay > 0:
-                    time.sleep(delay)
-            chunk = samples[sent:sent + n]
-            client.send(OP_APPEND, session, struct.pack("<%df" % n, *chunk))
-            sent += n
-        # Endpoint is the scheduled arrival of the last packet in paced mode, so a
-        # backlog shows up in the number instead of hiding in the sender.
-        endpoint_schedule = start + len(samples) / 16000.0 if args.paced and not args.burst else time.monotonic()
-        commit_sent = time.monotonic()
+        if args.segment:
+            endpoint_schedule = time.monotonic()
+            client.send(OP_APPEND, session,
+                        struct.pack("<%df" % len(samples), *samples) if samples else b"")
+            commit_sent = time.monotonic()
+        else:
+            while sent < len(samples):
+                n = min(step, len(samples) - sent)
+                if args.paced and not args.burst:
+                    # Packet i covers audio [i, i+n); it is ready at its end time.
+                    delay = (start + (sent + n) / 16000.0) - time.monotonic()
+                    if delay > 0:
+                        time.sleep(delay)
+                chunk = samples[sent:sent + n]
+                client.send(OP_APPEND, session, struct.pack("<%df" % n, *chunk))
+                sent += n
+            # Endpoint is the scheduled arrival of the last packet in paced mode,
+            # so a backlog shows up in the number instead of hiding in the sender.
+            endpoint_schedule = (start + len(samples) / 16000.0
+                                 if args.paced and not args.burst else time.monotonic())
+            commit_sent = time.monotonic()
         status, body = client.call(OP_COMMIT, session)
         done = time.monotonic()
         if status != ST_FINAL:
@@ -101,8 +114,12 @@ def run_session(args, samples, start, results, index, n_sessions):
         results[index] = {
             "session": index,
             "server_session": session,
+            "wav": label,
+            "mode": "segment" if args.segment else ("burst" if args.burst else "paced"),
             "planned_start_offset_ms": args.start_offsets_ms[index],
             "audio_ms": len(samples) / 16.0,
+            "t_open_ms": (endpoint_schedule - start) * 1000.0,
+            "t_done_ms": (done - start) * 1000.0,
             "endpoint_to_final_ms": (done - endpoint_schedule) * 1000.0,
             "commit_rtt_ms": (done - commit_sent) * 1000.0,
             "queue_ms": (commit_sent - endpoint_schedule) * 1000.0,
@@ -125,6 +142,8 @@ def main():
     parser.add_argument("--start-offsets-ms", help="comma-separated PCM start offsets, one per session")
     parser.add_argument("--paced", action="store_true")
     parser.add_argument("--burst", action="store_true", help="send each segment as fast as the socket accepts")
+    parser.add_argument("--segment", action="store_true",
+                        help="one APPEND with the whole segment at its offset, then COMMIT")
     parser.add_argument("--reps", type=int, default=1)
     parser.add_argument("--json", action="store_true", help="one JSON object per session and rep")
     args = parser.parse_args()
@@ -136,12 +155,14 @@ def main():
             offsets = [int(value) for value in args.start_offsets_ms.split(",")]
         except ValueError:
             parser.error("--start-offsets-ms expects integers")
-        if not args.paced or len(offsets) != args.sessions or any(offset < 0 for offset in offsets):
-            parser.error("--start-offsets-ms requires --paced and one nonnegative offset per session")
+        if not (args.paced or args.segment) or len(offsets) != args.sessions or any(offset < 0 for offset in offsets):
+            parser.error("--start-offsets-ms requires --paced or --segment and one nonnegative offset per session")
         args.start_offsets_ms = offsets
 
     if not args.wav and not args.wavs:
         parser.error("give --wav or --wavs")
+    labels = ([os.path.basename(p) for p in args.wavs.split(",")] if args.wavs
+              else [os.path.basename(args.wav)] * args.sessions)
     per_session = [read_wav(p) for p in args.wavs.split(",")] if args.wavs else None
     full = read_wav(args.wav) if args.wav else None
     if per_session and len(per_session) != args.sessions:
@@ -158,7 +179,8 @@ def main():
             else:
                 samples = full
             t = threading.Thread(target=run_session,
-                                 args=(args, samples, start + args.start_offsets_ms[i] / 1000, results, i, args.sessions))
+                                 args=(args, samples, start + args.start_offsets_ms[i] / 1000, results, i,
+                                       labels[i]))
             t.start()
             threads.append(t)
         for t in threads:
