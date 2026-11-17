@@ -643,6 +643,87 @@ even when the winner is blank, which is how an early-emission theory was ruled
 out for the English `Set` error. Both require the host joiner (`--joiner-host`
 or the CLI default); the device path returns only the argmax.
 
+### H9. Batching stops paying at a pair, and the tail needs the second engine
+
+**Bottleneck.** H8 left the graph at its dispatch floor, so a smaller four-way
+tail had to come from how the work is placed rather than from the graph.
+`--encoder-batch` arrived after M3 was measured, which reopened the question: is
+one device engine enough for four streams once lanes can share a step?
+
+**What a chunk costs at each batch width.** `--probe-encoder-batch` runs the same
+chunks lane by lane and then as one batched step, and reports the median of
+chunks 3 and later, so the numbers exclude the first chunk's cold caches.
+
+```sh
+adb shell -T "cd /data/local/tmp/llama.cpp && export LD_LIBRARY_PATH=\$PWD/lib \
+  ADSP_LIBRARY_PATH=\$PWD/lib GGML_HEXAGON_DEVICES=HTP0:0 GGML_HEXAGON_OPBATCH=2048 \
+  GGML_HEXAGON_OPPOLL=1 && bin/llama-x-asr x-asr-zh-en-q8_0.gguf HTP0:0 \
+  zh-10.wav en-20.wav --probe-encoder-batch"
+```
+
+| lanes | serial step | per lane | batched step | per lane |
+|---:|---:|---:|---:|---:|
+| 2 | 149.3 ms | 74.6 ms | 123.3 ms | 61.6 ms |
+| 4 | 297.4 ms | 74.4 ms | 220.5 ms | 55.1 ms |
+
+The three widths (1 from the serial arm, 2 and 4 from the batched one) fit
+`step = 25.5 ms + 48.9 ms x lanes`, and that model predicts the four-lane step at
+221.1 ms against 220.5 ms measured. A step therefore has a
+fixed 25.5 ms (2,782 executed nodes at about 9 us, plus the two submissions the
+2,048-op batch limit forces) and 48.9 ms of arithmetic per lane. Batching
+removes the fixed part and nothing else: with dispatch free, four lanes would
+still need 195 ms, so the measured 220.5 ms is 89% of batching's own ceiling and
+the 1.35x against serial is all this width can give.
+
+That answers the question the tail was waiting on. Four lanes on the device cost
+2.9 single streams, not one, because the arithmetic does not shrink; the second
+engine is not an optimisation on top of batching, it is the only thing left.
+
+**The placement rule had to change first.** `reserve_least_loaded` compared
+`queue.size()`, and a worker drains that queue before the next OPEN is routed, so
+each simultaneous arrival saw an empty queue on an engine that was already
+running a request. Four arrivals therefore piled onto the wider engine: the
+default four-device-plus-two-CPU deployment produced 16 device and 9 CPU
+placements over five rounds and behaved like 3+1 at 1,324 ms p95. Placement now
+ranks by what a lane costs, which is the table above written as a rule: complete
+an odd device lane (0), take an idle engine (1), start a new device step (2), then
+fewer live lanes, then the shorter queue. A pair is filled before a third lane
+starts a step, and a second CPU lane is parallel rather than queued because it
+has its own slot and threads.
+
+**Result.** Five rounds per arm, arm order rotated per round, one invocation per
+arm and round with a warm-up clip first, four whole segments of 2.2 to 2.7 s
+committed at the same instant, N=20 per arm, transcripts identical across every
+arm (`tools/bench_engine_split.py`):
+
+| arm | p50 | p95 | p99 |
+|---|---:|---:|---:|
+| four device slots, batch 4 | 1,495 | 1,614 | 1,615 |
+| four device slots, no batch | 1,358 | 1,942 | 1,944 |
+| four device + one CPU slot | 1,052 | 1,328 | 1,330 |
+| three device + one CPU slot | 979 | 1,372 | 1,374 |
+| **default: four device + two CPU slots** | **892** | **1,022** | 1,069 |
+| two device + two CPU slots (explicit) | 880 | 995 | 999 |
+
+Two things in that table are not obvious. Batching lowers the tail 17% (1,942 to
+1,614) while raising the median 10% (1,358 to 1,495): a batch step advances four
+lanes together, so a lane's finish is gated by the slowest member, but the unlucky
+lane no longer waits three serial steps. And the split is decided by how many CPU
+slots exist, not by the batch width: one CPU slot gives 3+1 and recovers 15% of
+the four-device tail, two slots give 2+2 and recover 37%, or 38% when the device
+engine is limited to two slots so the pair cannot be broken. Before the placement
+fix the default deployment measured 1,324 ms p95 on the same harness, so the rule
+is worth 23% on its own.
+
+**What it does not cover.** These are aligned arrivals, the worst case for
+`endpoint -> final`, not the common one; staggered arrival is priced in M3 and in
+the `vadburst` scenario of the load matrix. Five or more streams would fill both
+engines' pairs and the rule then spills back to the device. `--threads 3` and
+`--threads 4` on the CPU engine did not complete within the client's 30 s timeout
+while `--threads 2` finished in about one second; the phone showed 800 MB free and
+2.1 GB of swap in use at the time, so two threads is the most that has been shown
+to work rather than a measured optimum.
+
 ## Next experiments
 
 1. **Measure where the remaining tail goes.** In [`run_chunks`](xasr.cpp#L746) time feature and mask uploads, scheduled compute and completion, and encoder projection readback. In [`stream_accept`](xasr.cpp#L1018) time fbank, predictor/joiner, and text finalization. Tag each chunk with its phase (audio arrival or commit), sequence position, and number of DSP submissions. Collect a separate per-op profile using the [benchmark command](BENCHMARK.md#optional-htp-operator-profile). This distinguishes DSP kernel time from host submission and waiting. Compare CPU, HTP waiting, and HTP polling under both idle and representative CPU load.

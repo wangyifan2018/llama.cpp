@@ -368,11 +368,17 @@ inference: the engine time per commit is unchanged. The cost is a second copy of
 the weights for the CPU engine, about 200 MB of host memory, and the CPU engine
 competes with feature extraction and the predictor in the same process.
 
-The 2+2 split is the one measured. With four aligned streams the HTP engine does
-two commits (about 324 ms) and the CPU engine two (about 300 ms), which is why
-they finish together. A 3+1 or 1+3 split would leave one engine holding twice the
-work. Choosing the split from the arrival pattern is admission control, and it is
-not implemented.
+The commit counts in that table are 24 device and 16 CPU, so the split was 3:2
+rather than the 2+2 the paragraph above describes: the router compared queue
+depth, and a worker drains its queue before the next OPEN is routed. Placement
+now ranks by what a lane costs instead, so an odd device lane is paired before a
+third lane starts a step and a second CPU lane is parallel. With that rule and
+encoder batching in the graph, four aligned segments of 2.2 to 2.7 s go from
+1,614 ms p95 on the device alone to 1,022 ms on this deployment, and the explicit
+2+2 configuration measures 995 ms
+([OPTIMIZATION.md](OPTIMIZATION.md#h9-batching-stops-paying-at-a-pair-and-the-tail-needs-the-second-engine)).
+The rows above predate both changes and are kept as the measurement that
+motivated them; one device slot per stream is now the slower configuration.
 
 Peak RSS is 61 MB with one slot and 112 MB with four. Throughput was not
 measured under free-running load: every scenario above is paced at real time,
