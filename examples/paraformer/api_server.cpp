@@ -463,7 +463,7 @@ static std::string g_vad_model;
 static float g_vad_split_s = 18.0f;   // only split commits longer than this
 static float g_vad_piece_s = 15.0f;    // and never make a piece longer than this
 static float g_silence_rms = 0.004f;   // below this, "no speech" means empty text
-static float g_speaker_max_s = 2.0f;    // only the first N seconds are embedded
+static float g_speaker_max_s = 1.5f;    // only the first N seconds are embedded
 static std::atomic<uint64_t> g_speaker_deferred{0};
 static float g_vad_threshold = 0.5f;
 static float g_vad_min_silence = 0.15f;

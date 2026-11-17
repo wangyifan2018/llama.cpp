@@ -2,133 +2,286 @@
 <html lang="zh">
 <head>
 <meta charset="utf-8">
-<title>Paraformer realtime 测试台</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>座舱 ASR 测试台</title>
 <style>
-  :root { color-scheme: dark; }
-  body { margin: 0; font: 14px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif;
-         background: #10141a; color: #e6edf3; }
-  header { padding: 14px 20px; border-bottom: 1px solid #222c38; display: flex; gap: 16px; align-items: center; }
-  h1 { font-size: 16px; margin: 0; font-weight: 600; }
-  .pill { padding: 2px 10px; border-radius: 999px; font-size: 12px; background: #1f2937; color: #9fb3c8; }
-  .pill.on { background: #14432a; color: #67e8a0; }
-  .pill.rec { background: #4a1717; color: #ff9a9a; }
-  main { display: grid; grid-template-columns: minmax(0,1.4fr) minmax(280px,1fr); gap: 16px; padding: 16px 20px; }
-  canvas { width: 100%; height: 180px; display: block; background: #0b0f14; border: 1px solid #222c38; border-radius: 10px; }
-  .meter { height: 12px; background: #0b0f14; border: 1px solid #222c38; border-radius: 999px; overflow: hidden; margin-top: 10px; }
-  .meter > i { display: block; height: 100%; width: 0%; background: linear-gradient(90deg,#2dd4bf,#f472b6); transition: width .06s linear; }
-  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 12px; }
-  button { background: #1f2937; color: #e6edf3; border: 1px solid #2f3d4d; padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 14px; }
-  button:hover { background: #26323f; }
-  button:disabled { opacity: .45; cursor: not-allowed; }
-  button.primary { background: #2563eb; border-color: #3b82f6; }
-  button.danger { background: #7f1d1d; border-color: #b91c1c; }
-  section { background: #131a22; border: 1px solid #222c38; border-radius: 10px; padding: 14px; }
-  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: #8aa0b6; margin: 0 0 10px; }
-  dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0; }
-  dt { color: #8aa0b6; }
-  dd { margin: 0; font-variant-numeric: tabular-nums; }
-  #transcript { min-height: 56px; font-size: 18px; }
-  #partials { color: #7dd3fc; min-height: 22px; }
-  #log { font: 12px/1.45 ui-monospace, Menlo, monospace; color: #93a4b8; max-height: 170px; overflow: auto; white-space: pre-wrap; }
-  .hint { color: #6b7f95; font-size: 12px; }
+  :root{
+    --bg:#0b0f14; --panel:#121821; --panel-2:#0f1520; --line:#1e2733; --line-2:#2a3646;
+    --fg:#e8eef6; --muted:#8ba0b8; --dim:#5d7089;
+    --accent:#38bdf8; --ok:#34d399; --warn:#fbbf24; --bad:#f87171; --rec:#fb7185;
+    --radius:14px;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0; background:radial-gradient(1200px 600px at 20% -10%,#12202e 0%,var(--bg) 55%) fixed;
+    color:var(--fg); font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1180px;margin:0 auto;padding:20px 20px 56px}
+  header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px}
+  h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.2px}
+  h1 span{color:var(--dim);font-weight:400;margin-left:8px;font-size:13px}
+  .badges{display:flex;gap:8px;margin-left:auto;flex-wrap:wrap}
+  .badge{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;
+         background:var(--panel);border:1px solid var(--line);color:var(--muted);font-size:12px}
+  .badge i{width:7px;height:7px;border-radius:50%;background:var(--dim);display:inline-block}
+  .badge.on i{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+  .badge.rec i{background:var(--rec);box-shadow:0 0 8px var(--rec);animation:blink 1s infinite}
+  .badge.rec{color:#ffd7de;border-color:#7f2733}
+  @keyframes blink{50%{opacity:.35}}
+
+  .grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(300px,1fr);gap:16px}
+  @media (max-width:900px){.grid{grid-template-columns:1fr}}
+
+  .card{background:linear-gradient(180deg,var(--panel) 0%,var(--panel-2) 100%);
+        border:1px solid var(--line);border-radius:var(--radius);padding:16px}
+  .card h2{margin:0 0 12px;font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim);font-weight:600}
+
+  .stage{position:relative;display:flex;gap:18px;align-items:center}
+  .recwrap{position:relative;flex:0 0 104px;height:104px}
+  .ring{position:absolute;inset:0;border-radius:50%;border:2px solid var(--line-2);transition:border-color .2s}
+  .ring.hot{border-color:var(--rec);box-shadow:0 0 24px rgba(251,113,133,.35)}
+  #btnRec{
+    position:absolute;inset:9px;border-radius:50%;border:0;cursor:pointer;color:#03121c;
+    background:linear-gradient(180deg,#7dd3fc,#38bdf8);font-weight:700;font-size:13px;
+    display:flex;align-items:center;justify-content:center;flex-direction:column;gap:2px;
+    box-shadow:0 8px 24px rgba(56,189,248,.25); transition:transform .12s, filter .2s;
+  }
+  #btnRec:hover{filter:brightness(1.06)}
+  #btnRec:active{transform:scale(.97)}
+  #btnRec.rec{background:linear-gradient(180deg,#fda4af,#fb7185);color:#2b0b12;box-shadow:0 8px 26px rgba(251,113,133,.32)}
+  #btnRec .icon{font-size:20px;line-height:1}
+  #btnRec small{font-size:10px;font-weight:600;opacity:.75;letter-spacing:.04em}
+
+  canvas#wave{width:100%;height:132px;display:block;border-radius:10px;background:
+    linear-gradient(180deg,#0a1017,#0c131c);border:1px solid var(--line)}
+
+  .meter{height:6px;border-radius:999px;background:#0a1017;border:1px solid var(--line);overflow:hidden;margin-top:10px}
+  .meter>i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--ok),var(--accent),var(--rec));
+           transition:width .05s linear}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:14px}
+  button.ghost{background:var(--panel-2);color:var(--fg);border:1px solid var(--line-2);padding:9px 14px;
+               border-radius:10px;cursor:pointer;font-size:13px}
+  button.ghost:hover{background:#182231}
+  button.ghost:disabled{opacity:.4;cursor:not-allowed}
+  button.danger{color:#ffc9c9;border-color:#5a232b;background:#1d1013}
+  .hint{color:var(--dim);font-size:12px}
+  kbd{background:#0a1017;border:1px solid var(--line-2);border-radius:5px;padding:1px 6px;font-size:11px;color:var(--muted)}
+
+  .result{margin-top:16px}
+  .final{font-size:24px;line-height:1.35;min-height:34px;font-weight:600;letter-spacing:.2px}
+  .final.empty{color:var(--dim);font-weight:400;font-size:15px}
+  .partial{min-height:22px;color:var(--accent);opacity:.9;font-size:15px}
+  .meta{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
+  .chip{font-size:11px;padding:3px 9px;border-radius:999px;background:#0d1620;border:1px solid var(--line);color:var(--muted)}
+  .chip.spk-ok{color:#062e1f;background:#6ee7b7;border-color:#6ee7b7;font-weight:700}
+  .chip.spk-bad{color:#3a0d13;background:#fda4af;border-color:#fda4af;font-weight:700}
+  .chip.spk-none{opacity:.6}
+
+  .stats{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .stat{background:#0c1219;border:1px solid var(--line);border-radius:11px;padding:10px 12px}
+  .stat .k{font-size:11px;color:var(--dim);letter-spacing:.06em;text-transform:uppercase}
+  .stat .v{font-size:19px;font-variant-numeric:tabular-nums;font-weight:650;margin-top:2px}
+  .stat .v small{font-size:11px;color:var(--dim);font-weight:400;margin-left:3px}
+  canvas#spark{width:100%;height:56px;display:block;margin-top:10px}
+
+  #log{font:11.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);
+       max-height:150px;overflow:auto;white-space:pre-wrap;word-break:break-all}
+  #log:empty::before{content:"等待事件...";color:var(--dim)}
+
+  .toast{position:fixed;left:50%;bottom:24px;transform:translate(-50%,20px);opacity:0;
+         background:#1b2432;border:1px solid var(--line-2);color:var(--fg);padding:10px 16px;border-radius:10px;
+         font-size:13px;transition:all .22s;pointer-events:none;z-index:9;max-width:80vw}
+  .toast.show{opacity:1;transform:translate(-50%,0)}
+  .toast.bad{border-color:#7f2733;background:#2a1216}
 </style>
 </head>
 <body>
-<header>
-  <h1>Paraformer realtime 测试台</h1>
-  <span id="conn" class="pill">未连接</span>
-  <span id="lang" class="pill">lang: -</span>
-  <span class="hint">麦克风或 wav 文件 → 20 ms 分片 → <code>/v1/realtime</code></span>
-</header>
-
-<main>
-  <div>
-    <canvas id="wave"></canvas>
-    <div class="meter"><i id="level"></i></div>
-    <div class="row">
-      <button id="btnRec" class="primary">开始录音</button>
-      <button id="btnStop" disabled>停止并提交</button>
-      <button id="btnClear" class="danger" disabled>清空</button>
-      <input id="file" type="file" accept="audio/wav" style="display:none">
-      <button id="btnFile">用 wav 文件回放</button>
-      <span id="fileHint" class="hint"></span>
+<div class="wrap">
+  <header>
+    <h1>座舱 ASR 测试台<span id="modelName">paraformer</span></h1>
+    <div class="badges">
+      <span class="badge" id="bConn"><i></i>未连接</span>
+      <span class="badge" id="bVad"><i></i>VAD ?</span>
+      <span class="badge" id="bGate"><i></i>声纹 ?</span>
+      <span class="badge" id="bLang"><i></i>语言 -</span>
     </div>
-    <section style="margin-top:14px">
-      <h2>识别结果</h2>
-      <div id="transcript">—</div>
-      <div id="partials"></div>
-    </section>
-  </div>
+  </header>
 
-  <div>
-    <section>
-      <h2>指标</h2>
-      <dl>
-        <dt>已发音频</dt><dd id="mBytes">0.00 s</dd>
-        <dt>endpoint→final</dt><dd id="mE2E">—</dd>
-        <dt>服务端排队</dt><dd id="mQueue">—</dd>
-        <dt>服务端推理</dt><dd id="mInfer">—</dd>
-        <dt>服务端语言</dt><dd id="mLang">—</dd>
-        <dt>说话人相似度</dt><dd id="mSpk">—</dd>
-        <dt>分段数</dt><dd id="mSegs">0</dd>
-        <dt>历史 p50 / p95</dt><dd id="mPct">—</dd>
-        <dt>近 8 段</dt><dd id="mSpark" style="font-family:ui-monospace,monospace">—</dd>
-      </dl>
-    </section>
-    <section style="margin-top:14px">
-      <h2>事件</h2>
-      <div id="log"></div>
-    </section>
+  <div class="grid">
+    <div>
+      <div class="card">
+        <div class="stage">
+          <div class="recwrap">
+            <div class="ring" id="ring"></div>
+            <button id="btnRec"><span class="icon">●</span><small>开始</small></button>
+          </div>
+          <div style="flex:1;min-width:0">
+            <canvas id="wave"></canvas>
+            <div class="meter"><i id="level"></i></div>
+          </div>
+        </div>
+        <div class="row">
+          <button class="ghost" id="btnStop" disabled>停止并提交</button>
+          <button class="ghost danger" id="btnClear" disabled>清空</button>
+          <button class="ghost" id="btnFile">WAV 回放</button>
+          <input id="file" type="file" accept="audio/wav" hidden>
+          <span class="hint" id="fileHint"></span>
+          <span class="hint" style="margin-left:auto"><kbd>空格</kbd> 开始/停止</span>
+        </div>
+
+        <div class="result">
+          <div class="final empty" id="final">等待音频...</div>
+          <div class="partial" id="partial"></div>
+          <div class="meta">
+            <span class="chip" id="chipPieces">分段 -</span>
+            <span class="chip spk-none" id="chipSpk">说话人 -</span>
+            <span class="chip" id="chipSent">已发 0.00 s</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <div class="card">
+        <h2>实时指标</h2>
+        <div class="stats">
+          <div class="stat"><div class="k">endpoint → final</div><div class="v" id="mE2E">—</div></div>
+          <div class="stat"><div class="k">服务端队列</div><div class="v" id="mQueue">—</div></div>
+          <div class="stat"><div class="k">推理耗时</div><div class="v" id="mInfer">—</div></div>
+          <div class="stat"><div class="k">分段</div><div class="v" id="mSegs">0</div></div>
+        </div>
+        <canvas id="spark"></canvas>
+        <div class="hint" id="mPct">p50 / p95 —</div>
+      </div>
+
+      <div class="card" style="margin-top:16px">
+        <h2>事件</h2>
+        <div id="log"></div>
+      </div>
+    </div>
   </div>
-</main>
+</div>
+<div class="toast" id="toast"></div>
 
 <script>
 (() => {
   const $ = (id) => document.getElementById(id);
-  const canvas = $('wave');
-  const ctx2d = canvas.getContext('2d');
-  const connPill = $('conn'), langPill = $('lang');
-  let ws = null, audioCtx = null, node = null, media = null;
-  let sendRate = 16000;
-  let pending = [], sentSamples = 0, recording = false;
-  let endpointAt = 0, committed = 0, segments = 0;
-  let lastPartial = '';
-  const history = [];
-  const trace = new Array(320).fill(0);   // scrolling waveform, one point per ~5 ms
+  const wave = $('wave'), wctx = wave.getContext('2d');
+  const spark = $('spark'), sctx = spark.getContext('2d');
+  const ring = $('ring'), btnRec = $('btnRec');
 
-  function log(msg) {
-    const el = $('log');
-    const t = new Date().toLocaleTimeString('zh-CN', {hour12:false});
-    el.textContent = '[' + t + '] ' + msg + '\n' + el.textContent;
-    if (el.textContent.length > 6000) el.textContent = el.textContent.slice(0, 6000);
+  let ws = null, media = null, actx = null, node = null, recording = false;
+  let pending = [], sentSamples = 0, committedAt = 0, segments = 0, lastPartial = '';
+  const trace = new Array(360).fill(0);
+  const history = [];
+  let dpr = Math.min(devicePixelRatio || 1, 2);
+
+  function fit(canvas, h) {
+    const w = canvas.clientWidth || 600;
+    canvas.width = Math.floor(w * dpr);
+    canvas.height = Math.floor(h * dpr);
   }
 
-  function draw() {
-    const w = canvas.width, h = canvas.height;
-    ctx2d.clearRect(0, 0, w, h);
-    ctx2d.strokeStyle = '#1b2531';
-    ctx2d.beginPath(); ctx2d.moveTo(0, h/2); ctx2d.lineTo(w, h/2); ctx2d.stroke();
-    ctx2d.beginPath();
+  function toast(msg, bad) {
+    const t = $('toast');
+    t.textContent = msg;
+    t.className = 'toast show' + (bad ? ' bad' : '');
+    clearTimeout(t._h);
+    t._h = setTimeout(() => { t.className = 'toast'; }, 2600);
+  }
+
+  function log(kind, msg) {
+    const el = $('log');
+    const t = new Date().toLocaleTimeString('zh-CN', {hour12: false});
+    el.textContent = t + '  ' + kind.padEnd(10) + (msg || '') + '\n' + el.textContent;
+    if (el.textContent.length > 8000) el.textContent = el.textContent.slice(0, 8000);
+  }
+
+  function drawWave() {
+    const w = wave.width, h = wave.height;
+    wctx.clearRect(0, 0, w, h);
+    // centre line
+    wctx.strokeStyle = '#18222f';
+    wctx.lineWidth = 1 * dpr;
+    wctx.beginPath(); wctx.moveTo(0, h / 2); wctx.lineTo(w, h / 2); wctx.stroke();
+    if (!trace.length) return;
+    const g = wctx.createLinearGradient(0, 0, 0, h);
+    g.addColorStop(0, recording ? 'rgba(251,113,133,.85)' : 'rgba(56,189,248,.7)');
+    g.addColorStop(1, recording ? 'rgba(251,113,133,.10)' : 'rgba(56,189,248,.06)');
+    wctx.beginPath();
+    wctx.moveTo(0, h / 2);
     for (let i = 0; i < trace.length; i++) {
       const x = (i / (trace.length - 1)) * w;
-      const y = h/2 - trace[i] * (h/2 - 6);
-      i ? ctx2d.lineTo(x, y) : ctx2d.moveTo(x, y);
+      wctx.lineTo(x, h / 2 - trace[i] * (h / 2 - 6 * dpr));
     }
-    ctx2d.strokeStyle = recording ? '#2dd4bf' : '#3f5163';
-    ctx2d.lineWidth = 1.5;
-    ctx2d.stroke();
+    wctx.lineTo(w, h / 2);
+    wctx.closePath();
+    wctx.fillStyle = g;
+    wctx.fill();
+    wctx.beginPath();
+    for (let i = 0; i < trace.length; i++) {
+      const x = (i / (trace.length - 1)) * w;
+      const y = h / 2 - trace[i] * (h / 2 - 6 * dpr);
+      i ? wctx.lineTo(x, y) : wctx.moveTo(x, y);
+    }
+    wctx.strokeStyle = recording ? '#fb7185' : '#38bdf8';
+    wctx.lineWidth = 1.4 * dpr;
+    wctx.stroke();
   }
+
+  function drawSpark() {
+    const w = spark.width, h = spark.height;
+    sctx.clearRect(0, 0, w, h);
+    const vals = history.slice(-20);
+    if (vals.length < 2) return;
+    const max = Math.max(...vals) * 1.15, min = Math.min(...vals) * 0.85;
+    const span = Math.max(1, max - min);
+    sctx.beginPath();
+    vals.forEach((v, i) => {
+      const x = (i / (vals.length - 1)) * w;
+      const y = h - ((v - min) / span) * (h - 8 * dpr) - 4 * dpr;
+      i ? sctx.lineTo(x, y) : sctx.moveTo(x, y);
+    });
+    sctx.strokeStyle = '#38bdf8';
+    sctx.lineWidth = 1.6 * dpr;
+    sctx.stroke();
+    sctx.lineTo(w, h); sctx.lineTo(0, h); sctx.closePath();
+    sctx.fillStyle = 'rgba(56,189,248,.10)';
+    sctx.fill();
+  }
+
+  function setBadge(id, cls, text) {
+    const b = $(id);
+    b.className = 'badge ' + (cls || '');
+    b.innerHTML = '<i></i>' + text;
+  }
+
   function pushLevel(v) {
     trace.push(Math.max(-1, Math.min(1, v)));
     trace.shift();
-    $('level').style.width = Math.min(100, Math.abs(v) * 180).toFixed(0) + '%';
-    draw();
+    $('level').style.width = Math.min(100, Math.abs(v) * 200).toFixed(0) + '%';
+    ring.classList.toggle('hot', recording && Math.abs(v) > 0.02);
   }
-  requestAnimationFrame(function loop() { draw(); requestAnimationFrame(loop); });
 
-  function setConn(state, text) {
-    connPill.className = 'pill ' + state;
-    connPill.textContent = text;
+  function updatePct() {
+    if (!history.length) { $('mPct').textContent = 'p50 / p95 —'; return; }
+    const s = history.slice().sort((a, b) => a - b);
+    const q = (p) => s[Math.min(s.length - 1, Math.floor((s.length - 1) * p))];
+    $('mPct').textContent = 'p50 ' + q(0.5) + ' ms  ·  p95 ' + q(0.95) + ' ms  ·  n=' + s.length;
+    drawSpark();
+  }
+
+  async function health() {
+    try {
+      const r = await fetch('/health', {cache: 'no-store'});
+      const h = await r.json();
+      $('modelName').textContent = h.model || 'paraformer';
+      setBadge('bVad', h.server_vad ? 'on' : '', 'VAD ' + (h.server_vad ? '开' : '关'));
+      setBadge('bGate', h.speaker_gate ? 'on' : '', '声纹 ' + (h.speaker_gate ? '开' : '关'));
+      log('health', JSON.stringify(h));
+    } catch (e) { log('health', 'fail ' + e.message); }
   }
 
   function connect() {
@@ -137,80 +290,72 @@
     const url = proto + '//' + location.host + '/v1/realtime';
     return new Promise((resolve, reject) => {
       ws = new WebSocket(url);
-      ws.onopen = () => { setConn('on', '已连接'); log('WS 已连接 ' + url); resolve(); };
-      ws.onerror = () => { setConn('', '连接失败'); log('WS 连接失败'); reject(new Error('ws')); };
-      ws.onclose = () => { setConn('', '未连接'); log('WS 关闭'); };
+      ws.onopen = () => { setBadge('bConn', 'on', '已连接'); log('ws', 'open'); resolve(); };
+      ws.onerror = () => { setBadge('bConn', '', '连接失败'); toast('WebSocket 连接失败', true); reject(new Error('ws')); };
+      ws.onclose = () => { setBadge('bConn', '', '未连接'); log('ws', 'closed'); };
       ws.onmessage = (ev) => {
         let m; try { m = JSON.parse(ev.data); } catch { return; }
-        switch (m.type) {
-          case 'session.created':
-          case 'session.updated':
-            break;
-          case 'conversation.item.input_audio_transcription.delta':
-            lastPartial += m.delta;
-            $('partials').textContent = lastPartial;
-            log('delta: ' + m.delta);
-            break;
-          case 'input_audio_buffer.committed':
-            log('committed ' + m.item_id);
-            break;
-          case 'conversation.item.input_audio_transcription.completed': {
-            const e2e = committed ? Math.round(performance.now() - committed) : 0;
-            $('transcript').textContent = m.transcript || '(空)';
-            $('partials').textContent = '';
-            $('mE2E').textContent = e2e + ' ms';
-            segments += 1;
-            $('mSegs').textContent = segments;
-            if (m.speaker_score !== undefined) {
-              $('mSpk').textContent = m.speaker_score.toFixed(3) + (m.speaker_ok ? ' 司机' : ' 非司机');
-              $('mSpk').style.color = m.speaker_ok ? '#67e8a0' : '#ff9a9a';
-            }
-            if (e2e) {
-              history.push(e2e);
-              const sorted = history.slice().sort((a, b) => a - b);
-              const pct = (q) => sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * q))];
-              $('mPct').textContent = pct(0.5) + ' / ' + pct(0.95) + ' ms (n=' + sorted.length + ')';
-              $('mSpark').textContent = history.slice(-8).join(' ');
-            }
-            log('completed (' + e2e + ' ms): ' + m.transcript);
-            committed = 0;
-            lastPartial = '';
-            break;
+        const t = m.type || '';
+        if (t.endsWith('delta')) {
+          lastPartial += m.delta;
+          $('partial').textContent = lastPartial;
+        } else if (t.endsWith('completed')) {
+          const ms = committedAt ? Math.round(performance.now() - committedAt) : 0;
+          committedAt = 0;
+          const text = m.transcript || '';
+          $('final').textContent = text || '(空)';
+          $('final').classList.toggle('empty', !text);
+          $('partial').textContent = '';
+          lastPartial = '';
+          segments += 1;
+          $('mSegs').textContent = segments;
+          if (ms) { history.push(ms); $('mE2E').innerHTML = ms + '<small>ms</small>'; updatePct(); }
+          const spk = m.speaker_score;
+          if (typeof spk === 'number') {
+            const ok = !!m.speaker_ok;
+            const el = $('chipSpk');
+            el.className = 'chip ' + (ok ? 'spk-ok' : 'spk-bad');
+            el.textContent = (ok ? '司机' : '非司机') + ' ' + spk.toFixed(3);
+          } else {
+            $('chipSpk').className = 'chip spk-none';
+            $('chipSpk').textContent = '说话人 未评分';
           }
-          case 'x.pf.metrics':
-            if (m.speaker_score !== undefined) {
-              const ok = m.speaker_ok;
-              $('mSpk').textContent = m.speaker_score.toFixed(3) + (ok ? ' 司机' : ' 非司机');
-              $('mSpk').style.color = ok ? '#67e8a0' : '#ff9a9a';
-            }
-            $('mQueue').textContent = Math.round(m.queue_ms) + ' ms';
-            $('mInfer').textContent = Math.round(m.infer_ms) + ' ms';
-            break;
-          case 'error':
-            log('error: ' + JSON.stringify(m.error));
-            break;
-          default:
-            log(m.type);
+          log('completed', ms + ' ms · ' + (text || '(空)'));
+        } else if (t === 'x.pf.metrics') {
+          if (typeof m.queue_ms === 'number') $('mQueue').innerHTML = Math.round(m.queue_ms) + '<small>ms</small>';
+          if (typeof m.infer_ms === 'number') $('mInfer').innerHTML = Math.round(m.infer_ms) + '<small>ms</small>';
+          if (typeof m.speaker_score === 'number') {
+            const ok = !!m.speaker_ok;
+            const el = $('chipSpk');
+            el.className = 'chip ' + (ok ? 'spk-ok' : 'spk-bad');
+            el.textContent = (ok ? '司机' : '非司机') + ' ' + m.speaker_score.toFixed(3);
+          }
+        } else if (t === 'error') {
+          log('error', JSON.stringify(m.error || m));
+          toast('服务端错误：' + ((m.error && m.error.message) || 'unknown'), true);
+        } else if (t.endsWith('committed')) {
+          log('commit', m.item_id || '');
+        } else {
+          log(t, '');
         }
       };
     });
   }
 
-  function sendChunk(int16) {
+  function sendChunk(i16) {
     if (!ws || ws.readyState !== 1) return;
-    const bytes = new Uint8Array(int16.buffer);
+    const bytes = new Uint8Array(i16.buffer);
     let bin = '';
     for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-    ws.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: btoa(bin) }));
-    sentSamples += int16.length;
-    $('mBytes').textContent = (sentSamples / 16000).toFixed(2) + ' s';
+    ws.send(JSON.stringify({type: 'input_audio_buffer.append', audio: btoa(bin)}));
+    sentSamples += i16.length;
+    $('chipSent').textContent = '已发 ' + (sentSamples / 16000).toFixed(2) + ' s';
   }
 
-  // 20 ms = 320 samples at 16 kHz
   function feed(samples, srcRate) {
-    if (srcRate !== sendRate) {
-      const ratio = srcRate / sendRate;
-      const out = new Int16Array(Math.floor(samples.length / ratio));
+    if (srcRate !== 16000) {
+      const ratio = srcRate / 16000;
+      const out = new Int16Array(Math.max(1, Math.floor(samples.length / ratio)));
       for (let i = 0; i < out.length; i++) {
         const p = i * ratio, i0 = Math.floor(p), i1 = Math.min(i0 + 1, samples.length - 1);
         out[i] = samples[i0] + (samples[i1] - samples[i0]) * (p - i0);
@@ -221,83 +366,102 @@
     while (pending.length >= 320) {
       const chunk = Int16Array.from(pending.slice(0, 320));
       pending = pending.slice(320);
-      let rms = 0;
-      for (let i = 0; i < chunk.length; i++) rms += chunk[i] * chunk[i];
-      pushLevel(Math.sqrt(rms / chunk.length) / 32768 * 3);
+      let acc = 0;
+      for (let i = 0; i < chunk.length; i++) acc += chunk[i] * chunk[i];
+      pushLevel(Math.sqrt(acc / chunk.length) / 32768 * 3);
       sendChunk(chunk);
     }
+    drawWave();
   }
 
-  async function startMic() {
-    await connect();
-    media = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false }
-    });
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const src = audioCtx.createMediaStreamSource(media);
-    node = audioCtx.createScriptProcessor(1024, 1, 1);
+  async function start() {
+    if (recording) return;
+    try {
+      await connect();
+      media = await navigator.mediaDevices.getUserMedia({
+        audio: {channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false}
+      });
+    } catch (e) { toast('无法打开麦克风：' + e.message, true); return; }
+    actx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = actx.createMediaStreamSource(media);
+    node = actx.createScriptProcessor(1024, 1, 1);
     node.onaudioprocess = (ev) => {
       if (!recording) return;
       const f = ev.inputBuffer.getChannelData(0);
       const i16 = new Int16Array(f.length);
       for (let i = 0; i < f.length; i++) i16[i] = Math.max(-1, Math.min(1, f[i])) * 32767;
-      feed(i16, audioCtx.sampleRate);
+      feed(i16, actx.sampleRate);
     };
-    src.connect(node);
-    node.connect(audioCtx.destination);
+    src.connect(node); node.connect(actx.destination);
     recording = true;
-    $('btnRec').disabled = true;
-    $('btnStop').disabled = false;
-    $('btnClear').disabled = false;
-    setConn('rec', '录音中');
-    log('开始录音，源采样率 ' + audioCtx.sampleRate + ' Hz');
+    btnRec.classList.add('rec');
+    btnRec.innerHTML = '<span class="icon">■</span><small>停止</small>';
+    $('btnStop').disabled = false; $('btnClear').disabled = false;
+    setBadge('bConn', 'rec', '录音中');
+    $('final').textContent = ''; $('final').classList.add('empty');
+    log('mic', 'source ' + actx.sampleRate + ' Hz');
   }
 
-  async function stopAndCommit() {
+  async function stop() {
+    if (!recording) return;
     recording = false;
-    $('btnRec').disabled = false;
+    btnRec.classList.remove('rec');
+    btnRec.innerHTML = '<span class="icon">●</span><small>开始</small>';
     $('btnStop').disabled = true;
     if (node) { node.disconnect(); node = null; }
     if (media) { media.getTracks().forEach(t => t.stop()); media = null; }
-    if (audioCtx) { await audioCtx.close(); audioCtx = null; }
-    if (pending.length) { feed(new Int16Array(pending), sendRate); }
+    if (actx) { await actx.close(); actx = null; }
+    if (pending.length) { feed(new Int16Array(pending), 16000); pending = []; }
     if (ws && ws.readyState === 1) {
-      committed = performance.now();
-      ws.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-      setConn('on', '等待结果');
-      log('commit，已发 ' + (sentSamples / 16000).toFixed(2) + ' s');
+      committedAt = performance.now();
+      ws.send(JSON.stringify({type: 'input_audio_buffer.commit'}));
+      setBadge('bConn', 'on', '等待结果');
+      log('commit', (sentSamples / 16000).toFixed(2) + ' s');
     }
   }
 
-  async function clearAll() {
+  function clearAll() {
     recording = false;
-    pending = []; sentSamples = 0; lastPartial = '';
+    pending = []; sentSamples = 0; lastPartial = ''; segments = 0; committedAt = 0;
     history.length = 0;
-    $('mPct').textContent = '—';
-    $('mSpark').textContent = '—';
-    $('mBytes').textContent = '0.00 s';
-    $('partials').textContent = '';
-    $('transcript').textContent = '—';
-    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
-    setConn('on', '已清空');
+    $('chipSent').textContent = '已发 0.00 s';
+    $('final').textContent = '等待音频...'; $('final').classList.add('empty');
+    $('partial').textContent = '';
+    $('mSegs').textContent = '0';
+    $('mE2E').textContent = '—'; $('mQueue').textContent = '—'; $('mInfer').textContent = '—';
+    $('chipSpk').className = 'chip spk-none'; $('chipSpk').textContent = '说话人 -';
+    $('chipPieces').textContent = '分段 -';
+    updatePct();
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({type: 'input_audio_buffer.clear'}));
+    log('clear', '');
   }
 
   async function playFile(file) {
     await connect();
     const buf = await file.arrayBuffer();
-    const audio = await new AudioContext().decodeAudioData(buf);
-    const i16 = new Int16Array(audio.length);
+    const ctx = new AudioContext();
+    const audio = await ctx.decodeAudioData(buf);
     const ch = audio.getChannelData(0);
+    const i16 = new Int16Array(ch.length);
     for (let i = 0; i < ch.length; i++) i16[i] = Math.max(-1, Math.min(1, ch[i])) * 32767;
-    recording = true;
-    setConn('rec', '回放中');
     $('fileHint').textContent = file.name + ' · ' + (audio.length / audio.sampleRate).toFixed(2) + ' s';
+    recording = true;
+    btnRec.classList.add('rec');
+    setBadge('bConn', 'rec', '回放中');
+    log('file', file.name);
     let i = 0;
-    const step = 320;   // 20 ms at 16 kHz after resampling
     const tick = () => {
       if (!recording) return;
-      if (i >= i16.length) { recording = false; setConn('on', '等待结果'); commitFile(); return; }
-      const n = Math.min(i16.length - i, Math.floor(step * (audio.sampleRate / 16000)));
+      if (i >= i16.length) {
+        recording = false;
+        btnRec.classList.remove('rec');
+        if (pending.length) { feed(new Int16Array(pending), 16000); pending = []; }
+        committedAt = performance.now();
+        ws.send(JSON.stringify({type: 'input_audio_buffer.commit'}));
+        setBadge('bConn', 'on', '等待结果');
+        return;
+      }
+      const n = Math.min(i16.length - i, Math.floor(320 * (audio.sampleRate / 16000)));
       feed(i16.slice(i, i + n), audio.sampleRate);
       i += n;
       setTimeout(tick, 20);
@@ -305,18 +469,21 @@
     tick();
   }
 
-  function commitFile() {
-    if (pending.length) feed(new Int16Array(pending), sendRate);
-    committed = performance.now();
-    ws.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-    log('文件回放结束，commit');
-  }
-
-  $('btnRec').onclick = () => startMic().catch(e => log('麦克风失败: ' + e.message));
-  $('btnStop').onclick = () => stopAndCommit();
+  btnRec.onclick = () => (recording ? stop() : start());
+  $('btnStop').onclick = () => stop();
   $('btnClear').onclick = () => clearAll();
   $('btnFile').onclick = () => $('file').click();
   $('file').onchange = (e) => { if (e.target.files[0]) playFile(e.target.files[0]); };
+  addEventListener('keydown', (e) => {
+    if (e.code === 'Space' && !e.repeat && document.activeElement.tagName !== 'INPUT') {
+      e.preventDefault();
+      recording ? stop() : start();
+    }
+  });
+  addEventListener('resize', () => { dpr = Math.min(devicePixelRatio || 1, 2); fit(wave, 132); fit(spark, 56); drawWave(); drawSpark(); });
+
+  fit(wave, 132); fit(spark, 56);
+  drawWave(); updatePct(); health();
 })();
 </script>
 </body>
