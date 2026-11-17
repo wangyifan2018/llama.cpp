@@ -61,8 +61,9 @@ int main(int argc, char ** argv) {
     }
     // Small name table: the only types this tool needs to produce.
     struct { const char * name; enum ggml_type type; } types[] = {
-        { "F16", GGML_TYPE_F16 }, { "Q8_0", GGML_TYPE_Q8_0 }, { "Q5_K", GGML_TYPE_Q5_K },
-        { "Q4_K", GGML_TYPE_Q4_K }, { "Q6_K", GGML_TYPE_Q6_K },
+        { "F16", GGML_TYPE_F16 }, { "Q8_0", GGML_TYPE_Q8_0 }, { "Q4_0", GGML_TYPE_Q4_0 },
+        { "Q5_0", GGML_TYPE_Q5_0 }, { "Q5_K", GGML_TYPE_Q5_K }, { "Q4_K", GGML_TYPE_Q4_K },
+        { "Q6_K", GGML_TYPE_Q6_K },
     };
     enum ggml_type target = GGML_TYPE_COUNT;
     for (const auto & t : types) {
