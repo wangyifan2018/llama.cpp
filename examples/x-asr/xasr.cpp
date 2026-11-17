@@ -18,6 +18,7 @@
 #include <cstring>
 #include <fstream>
 #include <initializer_list>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -64,6 +65,11 @@ struct zstack {
     ggml_tensor * combiner = nullptr;
 };
 
+struct xasr_hotword {
+    float bonus;
+    std::vector<int32_t> tokens;
+};
+
 struct xasr_model {
     xasr_hparams hp;
     ggml_context * ctx = nullptr;
@@ -79,6 +85,7 @@ struct xasr_model {
     std::vector<zstack> stacks;
     std::vector<float> out_ds_w;
     ggml_tensor *enc_proj_w, *enc_proj_b;
+    std::vector<xasr_hotword> hotwords;
     // host copies: decoder + joiner
     std::vector<float> dec_emb, dec_conv, dec_proj_w, dec_proj_b, join_out_w, join_out_b;
 };
@@ -92,6 +99,8 @@ struct xasr_joiner {
     ggml_tensor * act = nullptr;
     ggml_tensor * pred = nullptr;
     ggml_tensor * idx = nullptr;
+    ggml_tensor * raw_idx = nullptr;
+    ggml_tensor * token_bonus = nullptr;
     int max_frames = 0;
     bool ready = false;
 };
@@ -846,6 +855,59 @@ bool prepare_slot(xasr_context * c, xasr_slot & slot) {
     return on_target == total;
 }
 
+bool load_hotwords(xasr_model & m, const char * path) {
+    std::ifstream file(path);
+    if (!file) {
+        fprintf(stderr, "xasr: cannot open hotword file %s\n", path);
+        return false;
+    }
+
+    char line[512];
+    size_t line_no = 0;
+    while (file.getline(line, sizeof(line))) {
+        ++line_no;
+        const std::string text(line);
+        const auto first = text.find_first_not_of(" \t\r");
+        if (first == std::string::npos || text[first] == '#') {
+            continue;
+        }
+
+        xasr_hotword word;
+        std::istringstream record(text);
+        if (!(record >> word.bonus) || !std::isfinite(word.bonus) ||
+            word.bonus <= 0 || word.bonus > 3 || m.hotwords.size() == 128) {
+            fprintf(stderr, "xasr: invalid hotword gain or count at line %zu\n", line_no);
+            return false;
+        }
+        for (std::string piece; record >> piece;) {
+            const auto match = std::find(m.vocab.begin(), m.vocab.end(), piece);
+            const int id = static_cast<int>(match - m.vocab.begin());
+            if (match == m.vocab.end() || id == m.hp.blank_id || id == m.hp.unk_id ||
+                piece.front() == '<' || piece == "\xe2\x96\x81" || word.tokens.size() == 16) {
+                fprintf(stderr, "xasr: invalid hotword token at line %zu\n", line_no);
+                return false;
+            }
+            word.tokens.push_back(id);
+        }
+        if (word.tokens.size() < 2) {
+            fprintf(stderr, "xasr: hotword at line %zu needs at least two tokens\n", line_no);
+            return false;
+        }
+        m.hotwords.push_back(std::move(word));
+    }
+    if (!file.eof() || m.hotwords.empty()) {
+        fprintf(stderr, "xasr: hotword file is empty, too long, or unreadable\n");
+        return false;
+    }
+    fprintf(stderr, "xasr: loaded %zu hotwords\n", m.hotwords.size());
+    return true;
+}
+
+bool is_speech_token(const xasr_model & m, int id) {
+    return id >= 0 && id < m.hp.vocab && id != m.hp.blank_id && id != m.hp.unk_id &&
+           m.vocab[id] != "<sos/eos>";
+}
+
 // Build the joiner graph once. The weight tensors stay in the model buffer on
 // the same backend, so only the activation, the predictor state and the token
 // ids cross the host boundary per call.
@@ -877,11 +939,24 @@ bool prepare_joiner(xasr_context * c) {
     ggml_set_input(pred);
     ggml_tensor * x = ggml_tanh(g, ggml_add(g, act, pred));
     x = ggml_add(g, ggml_mul_mat(g, weight, x), bias);
-    ggml_tensor * idx = ggml_argmax(g, x);
+    ggml_tensor * raw_idx = ggml_argmax(g, x);
+    ggml_tensor * idx = raw_idx;
+    ggml_tensor * token_bonus = nullptr;
+    if (!c->model.hotwords.empty()) {
+        token_bonus = ggml_new_tensor_1d(g, GGML_TYPE_F32, c->model.hp.vocab);
+        ggml_set_name(token_bonus, "j_token_bonus");
+        ggml_set_input(token_bonus);
+        ggml_set_name(raw_idx, "j_raw_idx");
+        ggml_set_output(raw_idx);
+        idx = ggml_argmax(g, ggml_add(g, x, token_bonus));
+    }
     ggml_set_name(idx, "j_idx");
     ggml_set_output(idx);
     c->joiner.gf = ggml_new_graph_custom(g, 256, false);
     ggml_build_forward_expand(c->joiner.gf, idx);
+    if (token_bonus) {
+        ggml_build_forward_expand(c->joiner.gf, raw_idx);
+    }
     ggml_backend_t backends[] = { c->backend, c->backend_cpu };
     c->joiner.sched = ggml_backend_sched_new(backends, nullptr, c->backend == c->backend_cpu ? 1 : 2, 256, false, false);
     if (!c->joiner.sched) {
@@ -895,6 +970,8 @@ bool prepare_joiner(xasr_context * c) {
     c->joiner.act = act;
     c->joiner.pred = pred;
     c->joiner.idx = idx;
+    c->joiner.raw_idx = raw_idx;
+    c->joiner.token_bonus = token_bonus;
     c->joiner.max_frames = T;
     c->joiner.ready = true;
     int nodes = ggml_graph_n_nodes(c->joiner.gf);
@@ -910,14 +987,27 @@ bool prepare_joiner(xasr_context * c) {
     return true;
 }
 
-bool joiner_compute(xasr_context * c, const float * act, const float * pred, int32_t * idx) {
+bool joiner_compute(xasr_context * c, const float * act, const float * pred, const float * bonus, int32_t * idx) {
     xasr_joiner & j = c->joiner;
     ggml_backend_tensor_set(j.act, act, 0, ggml_nbytes(j.act));
     ggml_backend_tensor_set(j.pred, pred, 0, ggml_nbytes(j.pred));
+    if (j.token_bonus) {
+        ggml_backend_tensor_set(j.token_bonus, bonus, 0, ggml_nbytes(j.token_bonus));
+    }
     if (ggml_backend_sched_graph_compute(j.sched, j.gf) != GGML_STATUS_SUCCESS) {
         return false;
     }
     ggml_backend_tensor_get(j.idx, idx, 0, ggml_nbytes(j.idx));
+    if (j.token_bonus) {
+        int32_t raw[12];
+        GGML_ASSERT(j.max_frames <= int(sizeof(raw) / sizeof(raw[0])));
+        ggml_backend_tensor_get(j.raw_idx, raw, 0, ggml_nbytes(j.raw_idx));
+        for (int f = 0; f < j.max_frames; ++f) {
+            if (!is_speech_token(c->model, raw[f])) {
+                idx[f] = raw[f];
+            }
+        }
+    }
     return true;
 }
 
@@ -1033,13 +1123,34 @@ struct greedy_state {
     std::vector<int> hyp;
     std::vector<float> d; // decoder_proj output for the current context
     std::vector<int32_t> toks;
+    std::vector<float> bonus;
 };
+
+void update_hotword_bonus(const xasr_model & m, greedy_state & gs) {
+    if (gs.bonus.empty()) {
+        return;
+    }
+    std::fill(gs.bonus.begin(), gs.bonus.end(), 0.0f);
+    for (const auto & word : m.hotwords) {
+        size_t prefix = std::min(gs.toks.size(), word.tokens.size() - 1);
+        while (prefix && !std::equal(word.tokens.begin(), word.tokens.begin() + prefix, gs.toks.end() - prefix)) {
+            --prefix;
+        }
+        const float gain = prefix ? word.bonus : 0.3f * word.bonus;
+        auto & current = gs.bonus[word.tokens[prefix]];
+        current = std::max(current, gain);
+    }
+}
 
 void greedy_init(const xasr_model & m, greedy_state & gs) {
     gs.hyp.assign((size_t)m.hp.context_size, -1);
     gs.hyp.back() = m.hp.blank_id;
     gs.d = decoder_out(m, gs.hyp);
     gs.toks.clear();
+    if (!m.hotwords.empty()) {
+        gs.bonus.resize(m.hp.vocab);
+        update_hotword_bonus(m, gs);
+    }
 }
 
 void greedy_run(const xasr_model & m, greedy_state & gs, const float * enc, int n_enc) {
@@ -1060,6 +1171,15 @@ void greedy_run(const xasr_model & m, greedy_state & gs, const float * enc, int 
             if (acc > logits[(size_t)best])
                 best = v;
         }
+        if (!gs.bonus.empty() && is_speech_token(m, best)) {
+            int biased = best;
+            for (int v = 0; v < V; ++v) {
+                if (logits[v] + gs.bonus[v] > logits[biased] + gs.bonus[biased]) {
+                    biased = v;
+                }
+            }
+            best = biased;
+        }
         if (best < 0 || best >= V) {
             best = hp.blank_id;
         }
@@ -1067,6 +1187,7 @@ void greedy_run(const xasr_model & m, greedy_state & gs, const float * enc, int 
             gs.toks.push_back(best);
             gs.hyp.push_back(best);
             gs.d = decoder_out(m, gs.hyp);
+            update_hotword_bonus(m, gs);
         }
     }
 }
@@ -1088,7 +1209,7 @@ bool greedy_run_dev(xasr_context * c, greedy_state & gs, const float * enc, int 
             std::memcpy(act.data() + (size_t) i * J, enc + (size_t) src * J, (size_t) J * sizeof(float));
         }
         const auto t = xasr_clock::now();
-        if (!joiner_compute(c, act.data(), gs.d.data(), idx.data())) {
+        if (!joiner_compute(c, act.data(), gs.d.data(), gs.bonus.data(), idx.data())) {
             return false;
         }
         st->joiner_dev_ms += span_ms(t);
@@ -1106,6 +1227,7 @@ bool greedy_run_dev(xasr_context * c, greedy_state & gs, const float * enc, int 
                 gs.hyp.push_back(best);
                 const auto p = xasr_clock::now();
                 gs.d = decoder_out(c->model, gs.hyp);
+                update_hotword_bonus(c->model, gs);
                 st->joiner_pred_ms += span_ms(p);
                 ++f;
                 break;
@@ -1219,6 +1341,9 @@ xasr_context * xasr_init_from_file(const char * path, xasr_context_params params
     }
     try {
         if (!load(c->model, path, c->backend)) {
+            return nullptr;
+        }
+        if (params.hotwords && !load_hotwords(c->model, params.hotwords)) {
             return nullptr;
         }
         c->g.tail_pad_ms = params.tail_pad_ms;

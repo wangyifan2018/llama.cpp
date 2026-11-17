@@ -8,6 +8,7 @@ struct xasr_stream;
 
 struct xasr_context_params {
     const char * device = "CPU";
+    const char * hotwords = nullptr; // optional joiner bias file
     int n_threads = 2;
     int encoder_batch = 1; // HTP graph widths: 1, 2 or 4
     int n_streams = 1;      // independent encoder state slots in one context

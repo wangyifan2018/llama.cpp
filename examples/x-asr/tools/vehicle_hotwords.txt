@@ -1,0 +1,34 @@
+# 车窗
+2 ▁车 ▁窗
+# 空调
+2 ▁空 ▁调
+# 内循环
+2 ▁内 ▁循 ▁环
+# 座椅
+2 ▁座 ▁椅
+# 按摩
+2 ▁按 ▁摩
+# 氛围灯
+2 ▁氛 ▁围 ▁灯
+# 阅读灯
+2 ▁阅 ▁读 ▁灯
+# 脚窝灯
+2 ▁脚 ▁窝 ▁灯
+# 顶灯
+2 ▁顶 ▁灯
+# air conditioning
+2 ▁air ▁con di tion ing
+# seat heater
+2 ▁sea t ▁he ate r
+# seat heating
+2 ▁sea t ▁he ating
+# ambient lights
+2 ▁am bi ent ▁light s
+# reading light
+2 ▁read ing ▁light
+# dome light
+2 ▁do me ▁light
+# footwell lights
+2 ▁f o ot w e ll ▁light s
+# window
+2 ▁w in d ow

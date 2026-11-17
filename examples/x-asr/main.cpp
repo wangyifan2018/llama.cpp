@@ -33,7 +33,7 @@ static double process_cpu_ms() {
 
 int main(int argc, char ** argv) {
     if (argc < 4) {
-        fprintf(stderr, "usage: %s MODEL.gguf DEVICE WAV... [--realtime] [--pad-ms N] [--threads N] [--streams N] [--joiner-host] [--probe-encoder-batch]\n", argv[0]);
+        fprintf(stderr, "usage: %s MODEL.gguf DEVICE WAV... [--hotwords FILE] [--realtime] [--pad-ms N] [--threads N] [--streams N] [--joiner-host] [--probe-encoder-batch]\n", argv[0]);
         return 1;
     }
     xasr_context_params params;
@@ -60,6 +60,12 @@ int main(int argc, char ** argv) {
             hold_ms = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--joiner-device") == 0) {
             params.joiner_on_device = true;
+        } else if (std::strcmp(argv[i], "--hotwords") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "xasr: --hotwords requires a file\n");
+                return 1;
+            }
+            params.hotwords = argv[++i];
         } else if (std::strcmp(argv[i], "--joiner-host") == 0) {
             params.joiner_on_device = false;
         } else {

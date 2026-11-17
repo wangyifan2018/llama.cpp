@@ -170,3 +170,5 @@ See [BENCHMARK.md](BENCHMARK.md) for the reproducible device benchmark, fixture 
 Use [VEHICLE-EVAL.md](VEHICLE-EVAL.md) to reproduce the window, climate, seat, and cabin-light command baseline.
 
 For encoder-only throughput and numerical checks on HTP, see the [fixed-lane B=2/B=4 probe](BENCHMARK.md#fixed-lane-htp-encoder-batch-probe). The default server configuration uses width 1. See the [dynamic HTP batch A/B](BENCHMARK.md#dynamic-htp-encoder-batching) for the opt-in service path.
+
+The CLI and server accept an optional `--hotwords FILE` device-phrase profile. See [the profile format and measured A/B](VEHICLE-EVAL.md#optional-device-phrase-bias).

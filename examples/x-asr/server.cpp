@@ -611,7 +611,7 @@ static void reader_thread(int fd, std::vector<engine *> engines) {
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s MODEL.gguf DEVICE [--port N] [--streams N] [--cpu-streams N] [--queue N] [--bind ADDR] [--chunk-scheduler] [--encoder-batch 1|2|4] [--adaptive-cpu]\n", argv[0]);
+        fprintf(stderr, "usage: %s MODEL.gguf DEVICE [--hotwords FILE] [--port N] [--streams N] [--cpu-streams N] [--queue N] [--bind ADDR] [--chunk-scheduler] [--encoder-batch 1|2|4] [--adaptive-cpu]\n", argv[0]);
         return 1;
     }
     xasr_context_params params;
@@ -644,6 +644,12 @@ int main(int argc, char ** argv) {
             adaptive_cpu = true;
         } else if (std::strcmp(argv[i], "--chunk-scheduler") == 0) {
             chunk_scheduler = true;
+        } else if (std::strcmp(argv[i], "--hotwords") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "xasr: --hotwords requires a file\n");
+                return 1;
+            }
+            params.hotwords = argv[++i];
         } else if (std::strcmp(argv[i], "--joiner-host") == 0) {
             params.joiner_on_device = false;
         }
