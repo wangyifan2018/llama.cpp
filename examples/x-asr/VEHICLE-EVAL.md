@@ -39,6 +39,52 @@ Waveforms, reference manifests, and hashes are in
 Tingting's artifacts are in its `tingting` subdirectory. Set `ZH_VOICE=Tingting`
 before the generator command to reproduce that voice.
 
+## Grading by field instead of by character error
+
+CER is the wrong headline for a command set. `Set the passenger seat heater to
+level two` recognised as `said the passenger seat peter to level two` costs six
+characters out of ninety-five, and no seat heater is addressed at all. The
+evaluator therefore parses each transcript into clauses of device, position,
+on/off state and value, and compares them with `tools/vehicle_semantics.tsv`.
+
+```sh
+python3 examples/x-asr/tools/eval_vehicle.py --check \
+    --pack tingting="$PACK/tingting/manifest.tsv" \
+    --pack holdout="$PACK/holdout/manifest.tsv" \
+    --pack controls="$PACK/controls/manifest.tsv" \
+    --pack hardneg="$PACK/hardneg/manifest.tsv"
+```
+
+`--check` re-parses every reference sentence and fails unless the fields it
+extracts equal the annotation. That gate is the reason a parser bug cannot be
+mistaken for an ASR error: the instrument is verified against ground truth
+before it grades anything. All 96 references agree.
+
+The annotation is `device|position|state|value` per clause. `fl`/`fr` are the
+front seats, so 主驾 and `driver` mean `fl` and 副驾 and `passenger` mean `fr`.
+Two clauses carry `?` for state because their own reference drops the verb
+(`Only the rear right window.`); those are graded on device and position only.
+
+Counters, in increasing severity:
+
+| counter | meaning |
+|---|---|
+| device | the device and its position were recognised |
+| state | the on/off direction was recognised |
+| value | the level, percentage, temperature or colour was recognised |
+| clause | all three of one clause |
+| command | every clause of the utterance |
+| wrong direction | device recognised with the opposite state, so acting on it does the opposite of what was asked |
+| unstated | device and value recognised but no verb, so nothing would execute |
+| false trigger | a clip annotated `none` produced a device with a stated state |
+| near miss | a `none` clip produced a device word without a direction |
+
+`none` covers ordinary speech, homophone traps and a new hard-negative pack in
+`tools/vehicle_hard_negatives.tsv`: statements that name a controllable device
+without commanding it (`顶灯坏了，一直在闪`, `The reading light is too bright`,
+`My seat heater died last winter`). Their purpose is the false-trigger rate,
+not coverage of a device.
+
 ## Optional device-phrase bias
 
 Pass `--hotwords examples/x-asr/tools/vehicle_hotwords.txt` to the CLI or
@@ -75,6 +121,8 @@ ZH_VOICE='Eddy (中文（中国大陆）)' XASR_EVAL_TEXTS=examples/x-asr/tools/
     sh examples/x-asr/tools/make_eval_pack.sh /tmp/xasr-hotword-holdout
 ZH_VOICE=Tingting XASR_EVAL_TEXTS=examples/x-asr/tools/vehicle_hotword_controls.tsv \
     sh examples/x-asr/tools/make_eval_pack.sh /tmp/xasr-hotword-controls
+ZH_VOICE=Tingting XASR_EVAL_TEXTS=examples/x-asr/tools/vehicle_hard_negatives.tsv \
+    sh examples/x-asr/tools/make_eval_pack.sh /tmp/xasr-hotword-hardneg
 
 build-x-asr/bin/llama-x-asr x-asr-zh-en-q8_0.gguf CPU /tmp/xasr-hotword-controls/*.wav > baseline.tsv
 build-x-asr/bin/llama-x-asr x-asr-zh-en-q8_0.gguf CPU /tmp/xasr-hotword-controls/*.wav \
@@ -135,6 +183,92 @@ python3 examples/x-asr/tools/asr_client.py --port 18775 --sessions 4 --reps 2 --
     --wavs "$TUNING/seat_zh01.wav,$TUNING/seat_en01.wav,$TUNING/seat_zh03.wav,$TUNING/win_zh03.wav"
 ```
 
+### Field-level result, three rounds over four packs
+
+The numbers above compare one pass per arm against CER. That is enough to rank
+variants and not enough to claim a command works, so the same profile was
+re-run through the field grader: three rounds per arm, arms alternating inside
+each round, a warm-up clip first, and every clip of every pack in one
+invocation.
+
+```sh
+python3 examples/x-asr/tools/bench_vehicle.py --rounds 3 --arms off,on \
+    --sets tingting,holdout,controls,hardneg
+```
+
+It copies each pack's manifest off the phone, runs the arms itself, grades
+every round, and writes `config.json`, `report.json` and `summary.md` with the
+run identity: binary, model and profile hashes, device, and the exact
+environment. Counts are rows, so each of the 32 tuning clips appears three
+times; percentages are identical to per-clip rates.
+
+| arm | pack | clips | device | state | value | clause | command | wrong dir | unstated | false trig | near miss | zh CER | en WER |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| off | Tingting tuning | 96 | 83.3% (105/126) | 76.2% (96/126) | 77.8% (42/54) | 76.2% (96/126) | 68.8% (66/96) | 0 | 9 | 0/0 | 0/0 | 8.43% | 5.34% |
+| on | Tingting tuning | 96 | 90.5% (114/126) | 81.0% (102/126) | 94.4% (51/54) | 81.0% (102/126) | 75.0% (72/96) | 0 | 12 | 0/0 | 0/0 | 7.23% | 4.58% |
+| off | Eddy holdout | 96 | 59.5% (75/126) | 45.2% (57/126) | 55.6% (30/54) | 45.2% (57/126) | 34.4% (33/96) | 3 | 15 | 0/0 | 0/0 | 44.58% | 5.34% |
+| on | Eddy holdout | 96 | 61.9% (78/126) | 45.2% (57/126) | 61.1% (33/54) | 45.2% (57/126) | 34.4% (33/96) | 3 | 18 | 0/0 | 0/0 | 44.58% | 4.58% |
+| off | controls | 48 | 100% (24/24) | 100% (24/24) | - | 100% (24/24) | 100% (12/12) | 0 | 0 | 0/36 | 3/36 | 1.23% | 0.00% |
+| on | controls | 48 | 100% (24/24) | 100% (24/24) | - | 100% (24/24) | 100% (12/12) | 0 | 0 | 0/36 | 3/36 | 1.23% | 0.00% |
+| off | hard negatives | 48 | - | - | - | - | - | 0 | 0 | 0/48 | 27/48 | 8.62% | 6.67% |
+| on | hard negatives | 48 | - | - | - | - | - | 0 | 0 | 0/48 | 30/48 | 6.90% | 6.67% |
+
+| arm | pack | wall ms p50 | p95 | p99 | RTF median |
+|---|---|---:|---:|---:|---:|
+| off | Tingting tuning | 544 | 697 | 708 | 0.216 |
+| on | Tingting tuning | 546 | 701 | 712 | 0.216 |
+| off | Eddy holdout | 543 | 696 | 708 | 0.216 |
+| on | Eddy holdout | 546 | 701 | 712 | 0.217 |
+
+`wall_ms` is the CLI's per-clip time for one whole VAD segment, unpaced, so it
+is the endpoint-to-final interval without transport or queueing. It is not the
+server's first-byte or completion latency.
+
+**An 8.43% CER hides a 31.3% command error rate.** Without the profile, 10 of
+32 tuning commands would not execute: three Mandarin seat commands
+(`座以/座已` for 座椅), two interior-light commands (`分为灯` for 氛围灯), four
+English commands whose `Set` became `said`, and one `seat heater` that became
+`seat peter`.
+
+The profile repairs nouns and leaves verbs alone. It fixes `座以/座已 → 座椅` on
+two seat commands and `seat peter → seat heater`, which raises device hits from
+105 to 114 of 126 clauses and value hits from 42 to 51 of 54. The four `Set →
+said` commands still fail, including the one whose noun the profile just fixed,
+because `said` carries no direction. Two clips (six rows) change verdict, from
+22/32 to 24/32. The `unstated` count rises from 9 to 12 for the same reason:
+more devices are recognised with no verb attached.
+
+The control and hard-negative packs are where the profile could have done
+damage, and it does not. All 12 control commands keep their direction, 0 of 36
+control rows and 0 of 48 hard-negative rows become actionable, including
+`Do not open the front right window, open the rear left window`,
+`座椅加热别开，只打开座椅通风` and `Leave the air conditioning off`. The near-miss
+count rises by one clip (`角窝灯 → 脚窝灯` on `脚窝灯有点暗`), so the boost is
+active on statements too; the verb gate is what keeps them from executing.
+
+It does not transfer to the second Mandarin voice. The Eddy pack fails 63 of 96
+rows in both arms and its CER is identical at 44.58%: 把 becomes 马/买/脑袋,
+座椅 becomes 手架/座后, 内循环 becomes `i 类循环`. One of those rows is a
+direction flip that survives every round and both arms — `别开左后车窗` is
+recognised as `解开左后车窗`, which opens the window the driver asked to keep
+shut. A single synthetic voice is not evidence of field behaviour, and this is
+the failure class that matters most.
+
+Transcripts are identical across all three rounds and both arms for 91 of 96
+clips. The five that move are the four seat clips the profile touches plus the
+`角窝灯` statement. The same 32 tuning clips also transcribe byte-identically to
+the pre-fold build in both arms, so the streaming cache change in this branch
+is transcription-neutral on this set.
+
+The profile costs 2 ms at p50 and 4 ms at p95 over 96 rows, which is inside the
+run-to-run spread of a single arm; this sample does not establish a latency
+cost. The profile stays opt-in.
+
 The raw A/B TSVs, device placement logs, audio and profile hashes, and
 source digest are in
 `$HOME/Library/Caches/qwen3-asr-htp/xasr-multistream/cabin-hotwords.DRzGS6`.
+The three-round field run, its per-round TSVs, `config.json` and `report.json`
+are in
+`$HOME/Library/Caches/qwen3-asr-htp/xasr-vehicle-20261117-115921`. The hard
+negatives are in
+`$HOME/Library/Caches/qwen3-asr-htp/xasr-multistream/vehicle-hardneg.3hSTPf`.

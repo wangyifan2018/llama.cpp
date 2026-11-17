@@ -176,9 +176,9 @@ For C++ integration, load the GGML backends, open a context, create a stream, an
 
 The example covers the inference path. A server can put a request queue and IPC around this API. True in-flight batching will require independent persistent stream state and a batched encoder graph.
 
-See [BENCHMARK.md](BENCHMARK.md) for the reproducible device benchmark, fixture hashes, and results. [OPTIMIZATION.md](OPTIMIZATION.md) explains the graph changes, how to isolate each one, and the next experiments. [BUILD.md](BUILD.md) has the host, Android and incremental build steps. [ALIGNMENT.md](ALIGNMENT.md) compares the streaming configuration with sherpa-onnx, and [ONNX-ANALYSIS.md](ONNX-ANALYSIS.md) compares the ONNX graph with this implementation. `tools/` holds the sherpa-onnx control harness, the same-arrival matrix driver that also reports transcript parity, the per-stage and per-operator budget tool, the four-configuration driver and the tail fixture generator.
+See [BENCHMARK.md](BENCHMARK.md) for the reproducible device benchmark, fixture hashes, and results. [OPTIMIZATION.md](OPTIMIZATION.md) explains the graph changes, how to isolate each one, and the next experiments. [BUILD.md](BUILD.md) has the host, Android and incremental build steps. [ALIGNMENT.md](ALIGNMENT.md) compares the streaming configuration with sherpa-onnx, and [ONNX-ANALYSIS.md](ONNX-ANALYSIS.md) compares the ONNX graph with this implementation. `tools/` holds the sherpa-onnx control harness, the same-arrival matrix driver that also reports transcript parity, the per-stage and per-operator budget tool, the four-configuration driver, the cabin-command field grader, the phrase-bias driver and the tail fixture generator.
 
-Use [VEHICLE-EVAL.md](VEHICLE-EVAL.md) to reproduce the window, climate, seat, and cabin-light command baseline.
+Use [VEHICLE-EVAL.md](VEHICLE-EVAL.md) to reproduce the window, climate, seat, and cabin-light command baseline and to grade a transcript by device, position, direction and value instead of by CER.
 
 For encoder-only throughput and numerical checks on HTP, see the [fixed-lane B=2/B=4 probe](BENCHMARK.md#fixed-lane-htp-encoder-batch-probe). The default server configuration uses width 1. See the [dynamic HTP batch A/B](BENCHMARK.md#dynamic-htp-encoder-batching) for the opt-in service path.
 

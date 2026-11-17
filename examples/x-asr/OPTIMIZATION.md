@@ -620,7 +620,16 @@ confusion pairs, one/two/three levels, off versus leave on, and non-command
 speech. Report Chinese CER and English WER alongside those checks.
 
 `tools/vehicle_commands.tsv` and the evaluation generator provide a synthetic
-starting set. Keep an independent set of real cabin VAD cuts for accuracy
+starting set. `tools/eval_vehicle.py` implements those checks against
+`tools/vehicle_semantics.tsv` and reports the counters separately, because CER
+ranks variants while the command counters decide acceptance: on the tuning pack
+the same rows read 8.43% CER and 68.8% command accuracy, and a phrase-bias
+change can repair a noun without repairing the verb that carries the
+direction. Keep the parser honest by re-parsing every reference sentence and
+failing when its fields differ from the annotation; otherwise a parser bug
+looks like a recognition error.
+
+Keep an independent set of real cabin VAD cuts for accuracy
 decisions. Before adding a bias list, measure which names, actions, or values
 are missed. For recurring entity misses, A/B a bounded, session-scoped phrase
 bias at token selection and verify it with negatives and confusable targets.
