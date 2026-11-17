@@ -78,7 +78,10 @@ static double g_seg_gap_ms = 600;       // silence that starts a new subtitle/se
 static double g_punct_gap_ms = 600;     // silence that earns a clause separator
 static double g_partial_min_ms = 800;   // new audio needed before a partial
 static double g_partial_interval = 600; // minimum time between partials
+static double g_partial_max_s = 2.0;    // stop partials past this much audio
 static bool g_partials = true;
+static std::atomic<uint64_t> g_partials_run{0};
+static std::atomic<uint64_t> g_partials_skipped{0};
 
 static double now_ms() {
     return std::chrono::duration<double, std::milli>(pf_clock::now().time_since_epoch()).count();
@@ -517,6 +520,17 @@ static void maybe_schedule_partial(const std::shared_ptr<WsSession>& s) {
     if (!g_partials) {
         return;
     }
+    // A partial costs a full decode. Never let one run while a commit (or any
+    // other request) is waiting, and stop partials once the segment is long
+    // enough that the final matters more than the preview.
+    if (g_queue.size() > 0) {
+        g_partials_skipped.fetch_add(1);
+        return;
+    }
+    if (g_partial_max_s > 0 && s->pcm.size() > (size_t) (g_partial_max_s * 16000.0)) {
+        g_partials_skipped.fetch_add(1);
+        return;
+    }
     const size_t new_samples = s->pcm.size() - s->partial_mark;
     if (s->partial_inflight || new_samples < (size_t) (g_partial_min_ms * 16.0)) {
         return;
@@ -556,7 +570,9 @@ static void maybe_schedule_partial(const std::shared_ptr<WsSession>& s) {
     if (!ok) {
         std::lock_guard<std::mutex> lock(s->m);
         s->partial_inflight = false;
+        return;
     }
+    g_partials_run.fetch_add(1);
 }
 
 static void ws_handle_text(const std::shared_ptr<WsSession>& s, const std::string& msg) {
@@ -782,7 +798,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "usage: %s MODEL.gguf [--device HTP0:0] [--port N] [--engines N] [--threads N] "
                      "[--bind ADDR] [--queue N] [--timeout-ms N] [--model-id ID] [--warmup WAV] "
-                     "[--partial-ms N] [--partial-interval-ms N] [--no-partials] [--seg-gap-ms N] [--punct-gap-ms N] "
+                     "[--partial-ms N] [--partial-interval-ms N] [--partial-max-s N] [--no-partials] "
+                     "[--seg-gap-ms N] [--punct-gap-ms N] "
                      "[--web-dir DIR]\n",
                      argv[0]);
         return 1;
@@ -824,6 +841,8 @@ int main(int argc, char** argv) {
             g_partial_interval = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--no-partials") == 0) {
             g_partials = false;
+        } else if (std::strcmp(argv[i], "--partial-max-s") == 0 && i + 1 < argc) {
+            g_partial_max_s = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--seg-gap-ms") == 0 && i + 1 < argc) {
             g_seg_gap_ms = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--punct-gap-ms") == 0 && i + 1 < argc) {
@@ -907,6 +926,8 @@ int main(int argc, char** argv) {
         json j = {{"requests", g_requests.load()},
                   {"rejected", g_rejected.load()},
                   {"failed", g_failed.load()},
+                  {"partials", g_partials_run.load()},
+                  {"partials_skipped", g_partials_skipped.load()},
                   {"queue", g_queue.size()},
                   {"engines", g_engines.size()}};
         res.set_content(j.dump(), "application/json");
