@@ -81,8 +81,9 @@ def run_session(args, samples, start, results, index, n_sessions):
     try:
         while sent < len(samples):
             n = min(step, len(samples) - sent)
-            if args.paced:
-                delay = (start + sent / 16000.0) - time.monotonic()
+            if args.paced and not args.burst:
+                # Packet i covers audio [i, i+n); it is ready at its end time.
+                delay = (start + (sent + n) / 16000.0) - time.monotonic()
                 if delay > 0:
                     time.sleep(delay)
             chunk = samples[sent:sent + n]
@@ -90,7 +91,7 @@ def run_session(args, samples, start, results, index, n_sessions):
             sent += n
         # Endpoint is the scheduled arrival of the last packet in paced mode, so a
         # backlog shows up in the number instead of hiding in the sender.
-        endpoint_schedule = start + len(samples) / 16000.0 if args.paced else time.monotonic()
+        endpoint_schedule = start + len(samples) / 16000.0 if args.paced and not args.burst else time.monotonic()
         commit_sent = time.monotonic()
         status, body = client.call(OP_COMMIT, session)
         done = time.monotonic()
@@ -123,6 +124,7 @@ def main():
                         help="the last session keeps this much more audio")
     parser.add_argument("--start-offsets-ms", help="comma-separated PCM start offsets, one per session")
     parser.add_argument("--paced", action="store_true")
+    parser.add_argument("--burst", action="store_true", help="send each segment as fast as the socket accepts")
     parser.add_argument("--reps", type=int, default=1)
     parser.add_argument("--json", action="store_true", help="one JSON object per session and rep")
     args = parser.parse_args()
@@ -155,7 +157,8 @@ def main():
                 samples = full[: max(0, len(full) - args.stagger_ms * 16)]
             else:
                 samples = full
-            t = threading.Thread(target=run_session, args=(args, samples, start + args.start_offsets_ms[i] / 1000, results, i, args.sessions))
+            t = threading.Thread(target=run_session,
+                                 args=(args, samples, start + args.start_offsets_ms[i] / 1000, results, i, args.sessions))
             t.start()
             threads.append(t)
         for t in threads:

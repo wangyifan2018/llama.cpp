@@ -797,6 +797,76 @@ The raw client JSONL, per-arm server logs, device hashes, fixture WAVs,
 and summary are in
 `$HOME/Library/Caches/qwen3-asr-htp/xasr-multistream/adaptive-ab.P9xmgB`.
 
+## Same-arrival comparison: ONNX CPU, HTP B=1, B=2, B=4
+
+Every arm below is driven by the same client, over the same socket protocol,
+with the same WAVs, 20 ms packets, 1,200 ms tail padding and client-side
+endpoint-to-final timing. Per-request records, not single-stream RTF, are the
+unit. The ONNX control is `tools/onnx_server.cpp`, a service wrapper with the
+same protocol, one worker, commit priority and a drain after every APPEND, so
+both engines do their encoder work while audio arrives and only the tail at
+commit.
+
+| Arm | Engine | Threads | Batch cap | Actual widths seen |
+|---|---|---|---:|---|
+| `onnx-cpu` | sherpa-onnx INT8, CPU | 2 | n/a | n/a |
+| `htp-b1` | same GGUF, HTP polling | 2 | 1 | B=1 only |
+| `htp-b2` | same GGUF, HTP polling | 2 | 2 | 91 x B=2 |
+| `htp-b4` | same GGUF, HTP polling | 2 | 4 | 63 x B=2, 16 x B=4 |
+
+Scenarios: one stream; four starting together; four with start offsets
+0/250/500/750 ms; mixed lengths (2.65 s, 2.71 s, 10 s, 20 s); and a burst where
+each VAD segment arrives as fast as the socket accepts. Three rounds per cell,
+so N=3 for single and N=12 for the four-stream scenarios.
+
+| Arm | single p50/p95 | aligned4 p50/p95/p99 | stagger4 p50/p95 | mixed4 p50/p95 | burst4 p50/p95 |
+|---|---|---|---|---|---|
+| `onnx-cpu` | 117.8 / 120.7 | 348.9 / 540.6 / 547.6 | 120.8 / 131.2 | 160.1 / 220.8 | 956.4 / 1596.3 |
+| `htp-b1` | 171.1 / 176.9 | 598.4 / 946.7 / 950.5 | 266.8 / 370.5 | 255.3 / 455.3 | 1531.4 / 2447.4 |
+| `htp-b2` | 166.3 / 174.6 | 593.8 / 856.0 / 856.9 | 275.4 / 372.2 | 273.8 / 485.6 | 1528.3 / 2439.4 |
+| `htp-b4` | 169.1 / 173.1 | 573.9 / 811.1 / 827.7 | 305.7 / 342.7 | 300.0 / 483.4 | 1584.7 / 2443.7 |
+
+Findings:
+
+- The ONNX INT8 CPU control wins every scenario, by 1.4x on single, 1.7x on
+  aligned four-way, 2.2x on staggered starts and 1.5x on the burst. Per chunk
+  this is the same gap measured in the unified benchmark: about 52 ms per
+  decoder-ready chunk for sherpa-onnx against 81 ms of DSP time for our encoder.
+  Scheduling cannot close a per-chunk gap; this is the HTP graph work.
+- Batching helps the case it was built for: aligned four-way p95 falls 946.7 to
+  856.0 (B=2) and 811.1 (B=4), and staggered starts p95 falls 370.5 to 342.7 at
+  B=4. It costs median time in mixed and burst loads (mixed p50 255 to 300,
+  burst p50 1531 to 1585), because a wider graph waits for lanes that a serial
+  schedule would have started.
+- The burst case is the one that looks worst for HTP: all four segments arrive
+  at once, so the tail is just 28 encoder chunks back to back, 2.44 s at 87 ms
+  per chunk against 1.60 s at 52 ms for the CPU control. Batching does not
+  recover it here: a burst has only four lanes and the run is dominated by the
+  per-chunk cost.
+- GGUF transcripts are identical across B=1, B=2 and B=4 on all 51 requests per
+  arm, so the batched graphs are numerically equivalent on this workload.
+- ONNX and GGUF disagree on 48 of 51 requests, and the difference is systematic
+  rather than random: the INT8 export drops the leading 请 on the Mandarin
+  fixtures (擎导航到上海虹桥机场) and reads the 20 s English clip as "Sarah. Set"
+  where the GGUF reads "Sarah, said". Report those separately from latency.
+
+Caveats: N=3 or 12 per cell, one device, client on the host through ADB forward,
+one ONNX thread count (2) and one GGUF thread count. The client paced each packet
+one interval early in this run, which biases every arm the same way by under
+20 ms; the client is fixed for later runs and these numbers are otherwise
+comparable.
+
+Reproduce:
+
+```sh
+export ADB=$ANDROID_SDK/platform-tools/adb ANDROID_SERIAL=ADNQ6R5823007930
+export XASR_REPS=3 XASR_OUT=/tmp/xasr-arrival-1
+bash examples/x-asr/tools/bench_arrival_matrix.sh
+```
+
+Raw per-request JSONL, per-arm server logs and width counts:
+`/tmp/xasr-arrival-1/`.
+
 ## Reproduce on Android
 
 Run these blocks from the repository root in the same Bash session. The [Snapdragon toolchain guide](../../docs/backend/snapdragon/README.md) covers Docker and ADB setup. Set `ANDROID_SERIAL` if several devices are attached.
