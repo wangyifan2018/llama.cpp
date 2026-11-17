@@ -34,7 +34,7 @@
 | ASR 权重 Q8_0 | `~/Library/Caches/qwen3-asr-htp/paraformer-models/paraformer-zh-q8_0.gguf` | 226 MB | `e73232ecf7e48490` | cstr/paraformer-zh-GGUF |
 | ASR 权重 Q4_K | 同目录 `paraformer-zh-q4_k.gguf` | 123 MB | `c3dc70409857d745` | 本仓库 `llama-paraformer-requant` 离线再量化 |
 | 说话人 CAM++（torch） | `~/Library/Caches/qwen3-asr-htp/speaker-models/campplus_cn_common.bin` | 27 MB | `3388cf5fd3493c9a` | ModelScope `iic/speech_campplus_sv_zh-cn_16k-common` |
-| 说话人 CAM++（ONNX） | 同目录 `campplus.onnx` | 27 MB | `1888d70cfac8db8f` | `tools/export_campplus_onnx.py` 导出 |
+| 说话人 CAM++（ONNX，定长 2 s） | 同目录 `campplus_t200.onnx` | 26.7 MB | `36c56a1b2c3d83b6` | `tools/export_campplus_onnx.py` 导出（parity 1.000000） |
 | 车控夹具 | `…/paraformer-models/tingting/` | 32 条 | — | `tools/make_eval_pack.sh` + Tingting/Samantha |
 | 独立音色夹具 | `…/paraformer-models/voice2/` | 32 条 | — | Flo + Daniel |
 | SeACo 权重（研究用） | `…/seaco/model.pt` | 944 MB | — | ModelScope，未移植 |
@@ -97,12 +97,14 @@ python3 examples/paraformer/tools/ws_client.py --url ws://127.0.0.1:8899/v1/real
 1. 质量数字全部来自**合成音色**（Tingting/Samantha/Flo/Daniel）；换音色 CER 可从 0.6% 掉到 34%。
 2. Realtime 的 partial 是"整段重解码"，间隔 ≥600 ms；不是流式模型。
 3. 英文 OOV 名字的分词无法与模型对齐（GGUF 无 merge 表），需要 `a+b+c` 显式 token。
-4. CAM++ 的 ONNX 与 eager 余弦只有 0.95，尚未修到可上线精度；门控结论只说明机制成立。
+4. CAM++ 只导出**定长 2 s** 图（动态轴在部分长度上数值错误，实测 T=100 余弦 0.571、T=300 0.940）；
+   音频按 2 s 分块、尾部均值补齐后平均 embedding，门控余量 0.25（本人最小 0.793 / 冒充最大 0.541）。
 5. 设备端尚未集成声纹（缺 `onnxruntime_c_api.h`），门控目前只在本机 Python 侧验证。
 
 ## 7. 下一批（按优先级）
 
-1. 修 CAM++ ONNX parity 到 0.999（逐层对拍），再把门控接到设备（补 onnxruntime 头文件）。
+1. 把门控接到设备：补 `onnxruntime_c_api.h`（或用 sherpa-onnx 封装），在 API 里加 `--speaker-gate`，
+   用 CPU 与 HTP 的 ASR 并行；同时把实测的 FRR/FAR 写进服务指标。
 2. 测试台补"实时吞吐"面板（每段毫秒数分布、连续 N 段的 p50/p95），用于回归。
 3. CIF 上 DSP（省 ~8 ms）；decoder/encoder 已无更多 runtime 杠杆。
 4. 真实录音采集与评测（换掉 TTS 夹具）。
