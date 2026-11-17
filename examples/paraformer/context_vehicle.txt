@@ -1,0 +1,22 @@
+# Segment context for PF_CONTEXT: one "<gain> <phrase>" per line.
+#
+# Each phrase is tokenised against the model vocab and stored in a prefix trie.
+# While decoding, the token that continues a started phrase gets <gain> added to
+# its logit, so a name the model started is finished the way the domain spells
+# it. The first token of a phrase gets the separate PF_CONTEXT_START bias
+# (absolute logits, default 0, keep it <= 2: a multiplier or a large value
+# dominates the acoustic scores and destroys the transcript).
+#
+# Measured on 10 TTS name clips: 6/10 correct without context, 8/10 with gain
+# 8.0, no change to the 32-clip cabin field (command 71.9%, zh CER 0.60%).
+# English names that the model misspells at the first token (pudong -> "put on")
+# cannot be fixed here; use the R rewrite rules in hotwords_vehicle_replace.txt
+# with an explicit token sequence instead.
+8.0 虹桥火车站
+8.0 王梓涵
+8.0 陆家嘴
+8.0 李沐宸
+8.0 徐家汇
+8.0 张一鸣
+8.0 首都机场
+8.0 五角场

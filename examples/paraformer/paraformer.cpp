@@ -195,6 +195,18 @@ struct paraformer_context {
     struct SeqRule { int prefix, target; float gain; };
     std::vector<SeqRule> hotword_seq;
     std::vector<pf_repl> hotword_repl;
+
+    // Section 28: segment context. A trie of phrase token sequences (POI names,
+    // contact names, cabin words). While decoding, the token that continues an
+    // active phrase gets its logit boosted, so a phrase the model started is
+    // much more likely to be finished as the domain spells it.
+    struct CtxNode {
+        std::vector<std::pair<int, int>> child; // token id -> node index
+        float gain = 0.0f;                      // boost for entering this node
+    };
+    std::vector<CtxNode> ctx_trie;
+    int ctx_phrases = 0;
+    bool ctx_loaded = false;
     int hotword_count = 0;
     bool hotword_loaded = false;
 
@@ -294,6 +306,131 @@ static int pf_apply_replacements(std::vector<int>& chosen, const float* logits, 
         }
     }
     return applied;
+}
+
+// Greedy longest-match tokenisation of one phrase: Chinese characters and Latin
+// BPE pieces both resolve against the model vocab. Explicit token sequences can
+// be given as a+b+c when the greedy match is not what the model would emit.
+static std::vector<int> pf_tokenize_phrase(const paraformer_context* ctx, const std::string& text) {
+    std::vector<int> ids;
+    if (text.find('+') != std::string::npos) {
+        size_t i = 0;
+        for (;;) {
+            const size_t j = text.find('+', i);
+            const std::string tok = text.substr(i, j == std::string::npos ? std::string::npos : j - i);
+            if (!tok.empty()) {
+                int id = -1;
+                for (size_t k = 0; k < ctx->vocab.size(); ++k) {
+                    if (ctx->vocab[k] == tok) {
+                        id = (int) k;
+                        break;
+                    }
+                }
+                if (id < 0) {
+                    fprintf(stderr, "paraformer: context token not in vocab: '%s'\n", tok.c_str());
+                    return {};
+                }
+                ids.push_back(id);
+            }
+            if (j == std::string::npos) {
+                break;
+            }
+            i = j + 1;
+        }
+        return ids;
+    }
+    // Longest match, at most 12 UTF-8 bytes (a 4-character Chinese phrase).
+    for (size_t i = 0; i < text.size();) {
+        int best = -1;
+        size_t best_len = 0;
+        const size_t max_len = std::min<size_t>(12, text.size() - i);
+        for (size_t len = max_len; len >= 1; --len) {
+            // The piece must end on a UTF-8 boundary: the byte after it, when
+            // present, must not be a continuation byte.
+            if (i + len < text.size() && ((unsigned char) text[i + len] & 0xC0) == 0x80) {
+                continue;
+            }
+            const std::string piece = text.substr(i, len);
+            for (size_t k = 0; k < ctx->vocab.size(); ++k) {
+                if (ctx->vocab[k] == piece) {
+                    best = (int) k;
+                    best_len = len;
+                    break;
+                }
+            }
+            if (best >= 0) {
+                break;
+            }
+        }
+        if (best < 0) {
+            fprintf(stderr, "paraformer: cannot tokenise '%s'\n", text.substr(i).c_str());
+            return {};
+        }
+        ids.push_back(best);
+        i += best_len;
+    }
+    return ids;
+}
+
+// PF_CONTEXT: one "<gain> <phrase>" per line. Phrases share a prefix tree, so
+// only the continuation of a started phrase is boosted.
+static void paraformer_load_context(paraformer_context* ctx) {
+    if (!ctx || ctx->ctx_loaded || ctx->vocab.empty()) {
+        return;
+    }
+    ctx->ctx_loaded = true;
+    const char* path = std::getenv("PF_CONTEXT");
+    if (!path || !path[0]) {
+        return;
+    }
+    std::FILE* f = std::fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "paraformer: cannot open PF_CONTEXT '%s'\n", path);
+        return;
+    }
+    ctx->ctx_trie.clear();
+    ctx->ctx_trie.emplace_back(); // root
+    char line[512];
+    while (std::fgets(line, sizeof(line), f)) {
+        std::string text(line);
+        const size_t c = text.find('#');
+        if (c != std::string::npos) {
+            text.resize(c);
+        }
+        while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' ' || text.back() == '\t')) {
+            text.pop_back();
+        }
+        float gain = 0.0f;
+        char body[400] = {0};
+        if (std::sscanf(text.c_str(), "%f %399s", &gain, body) != 2 || gain <= 0.0f || gain > 8.0f) {
+            continue;
+        }
+        const std::vector<int> ids = pf_tokenize_phrase(ctx, std::string(body));
+        if (ids.empty()) {
+            continue;
+        }
+        int node = 0;
+        for (int id : ids) {
+            int next = -1;
+            for (const auto& kv : ctx->ctx_trie[(size_t) node].child) {
+                if (kv.first == id) {
+                    next = kv.second;
+                    break;
+                }
+            }
+            if (next < 0) {
+                next = (int) ctx->ctx_trie.size();
+                ctx->ctx_trie.emplace_back();
+                ctx->ctx_trie[(size_t) next].gain = gain;
+                ctx->ctx_trie[(size_t) node].child.push_back({id, next});
+            }
+            node = next;
+        }
+        ++ctx->ctx_phrases;
+    }
+    std::fclose(f);
+    fprintf(stderr, "paraformer: loaded %d context phrases (%zu trie nodes)\n", ctx->ctx_phrases,
+            ctx->ctx_trie.size());
 }
 
 static void paraformer_load_hotwords(paraformer_context* ctx) {
@@ -936,6 +1073,7 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     paraformer_bench_lap _lap;
     // §13: load whole-word logit bias once (env PF_HOTWORDS); no-op by default.
     paraformer_load_hotwords(ctx);
+    paraformer_load_context(ctx);
 
     // 1. Feature extraction
     int T_lfr = 0, D_lfr_actual = 0;
@@ -1357,10 +1495,23 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     // §13: optional diagnostics — how many positions to dump top-K logits at.
     const char* dump_env = std::getenv("PF_DUMP_LOGITS");
     const int dump_n = dump_env ? std::atoi(dump_env) : 0;
-    const bool apply_bias = !ctx->hotword_bonus.empty() || !ctx->hotword_seq.empty();
+    const bool apply_bias = !ctx->hotword_bonus.empty() || !ctx->hotword_seq.empty() || !ctx->ctx_trie.empty();
     std::vector<float> biased_row; // only allocated when dumping with bias on
     if (dump_n > 0 && apply_bias)
         biased_row.resize(V);
+
+    // Section 28: active context-trie nodes. The root stays active so a phrase
+    // can start anywhere; its children carry a configurable start gain (default
+    // 0) while continuations carry the full phrase gain.
+    float ctx_start_gain = 0.0f;
+    if (const char* sg = std::getenv("PF_CONTEXT_START")) {
+        ctx_start_gain = (float) std::atof(sg);
+    }
+    std::vector<int> ctx_active;
+    if (!ctx->ctx_trie.empty()) {
+        ctx_active.push_back(0);
+    }
+    std::vector<std::pair<int, float>> ctx_here;
 
     std::string result;
     bool prev_was_bpe_cont = false; // true if previous token ended with @@
@@ -1377,9 +1528,45 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
                 if (r.prefix == prev_token)
                     seq_here.push_back({ r.target, r.gain });
         }
+        // §28: gains for tokens that continue an active context phrase. Root
+        // children (phrase starts) take the maximum, not the sum, so the start
+        // bias stays bounded no matter how many phrases are registered.
+        ctx_here.clear();
+        std::vector<std::pair<int, float>> ctx_start;
+        for (int node : ctx_active) {
+            for (const auto& kv : ctx->ctx_trie[(size_t) node].child) {
+                const float g = ctx->ctx_trie[(size_t) kv.second].gain;
+                if (node == 0) {
+                    bool merged = false;
+                    for (auto& s : ctx_start) {
+                        if (s.first == kv.first) {
+                            s.second = std::max(s.second, g);
+                            merged = true;
+                            break;
+                        }
+                    }
+                    if (!merged) {
+                        ctx_start.push_back({ kv.first, g });
+                    }
+                } else if (g > 0.0f) {
+                    ctx_here.push_back({ kv.first, g });
+                }
+            }
+        }
+        if (ctx_start_gain > 0.0f) {
+            // Absolute logits, not a multiplier: the start bias must stay small
+            // or it dominates the acoustic scores (measured: 3x gain destroyed
+            // every transcript).
+            for (const auto& s : ctx_start) {
+                ctx_here.push_back({ s.first, ctx_start_gain });
+            }
+        }
         auto bias_of = [&](int v) -> float {
             float b = ctx->hotword_bonus.empty() ? 0.0f : ctx->hotword_bonus[(size_t) v];
             for (const auto& kv : seq_here)
+                if (kv.first == v)
+                    b += kv.second;
+            for (const auto& kv : ctx_here)
                 if (kv.first == v)
                     b += kv.second;
             return b;
@@ -1403,6 +1590,20 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
             } else {
                 paraformer_dump_logits(ctx, row, V, n, 5);
             }
+        }
+        if (!ctx->ctx_trie.empty()) {
+            std::vector<int> next_active;
+            next_active.push_back(0); // root: a new phrase may start later
+            for (int node : ctx_active) {
+                for (const auto& kv : ctx->ctx_trie[(size_t) node].child) {
+                    if (kv.first == best) {
+                        next_active.push_back(kv.second);
+                    }
+                }
+            }
+            std::sort(next_active.begin(), next_active.end());
+            next_active.erase(std::unique(next_active.begin(), next_active.end()), next_active.end());
+            ctx_active.swap(next_active);
         }
         prev_token = best;
         chosen[(size_t) n] = best;
@@ -2045,7 +2246,7 @@ paraformer_tokens* paraformer_transcribe_tokens(paraformer_context* ctx, const f
     r->text = (char*) std::malloc(s.size() + 1);
     if (r->text) {
         std::memcpy(r->text, s.data(), s.size());
-        r->text[s.size()] = ' ';
+        r->text[s.size()] = '\0';
     }
     r->n_tokens = (int) toks.size();
     r->tokens = r->n_tokens ? (paraformer_token*) std::calloc((size_t) r->n_tokens, sizeof(paraformer_token)) : nullptr;
@@ -2053,7 +2254,7 @@ paraformer_tokens* paraformer_transcribe_tokens(paraformer_context* ctx, const f
         r->tokens[i].text = (char*) std::malloc(toks[(size_t) i].text.size() + 1);
         if (r->tokens[i].text) {
             std::memcpy(r->tokens[i].text, toks[(size_t) i].text.data(), toks[(size_t) i].text.size());
-            r->tokens[i].text[toks[(size_t) i].text.size()] = ' ';
+            r->tokens[i].text[toks[(size_t) i].text.size()] = '\0';
         }
         r->tokens[i].t_ms = (int32_t) toks[(size_t) i].t_ms;
         r->tokens[i].posterior = toks[(size_t) i].posterior;
