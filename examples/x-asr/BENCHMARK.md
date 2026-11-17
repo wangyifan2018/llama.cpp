@@ -319,6 +319,11 @@ across streams without that, so a partial batch is possible first.
 
 ## Server: end to end
 
+These numbers predate encoder batching and the cost-ranked placement rule. For
+the current default deployment and its four-way tail, see the
+[stage baseline](OPTIMIZATION.md#stage-baseline-after-six-batches); the rows
+below remain the reference for the pre-batching server.
+
 `llama-x-asr-server` on the device (HTP polling, 4 slots, 64 request queue),
 client on the host through `adb forward`, so every number includes the socket,
 the queue and the USB path. Twelve paced repetitions per scenario, sampled with

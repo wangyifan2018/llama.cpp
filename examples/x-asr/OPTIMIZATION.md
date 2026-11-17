@@ -724,17 +724,111 @@ while `--threads 2` finished in about one second; the phone showed 800 MB free a
 2.1 GB of swap in use at the time, so two threads is the most that has been shown
 to work rather than a measured optimum.
 
-## Next experiments
+## Stage baseline after six batches
 
-1. **Measure where the remaining tail goes.** In [`run_chunks`](xasr.cpp#L746) time feature and mask uploads, scheduled compute and completion, and encoder projection readback. In [`stream_accept`](xasr.cpp#L1018) time fbank, predictor/joiner, and text finalization. Tag each chunk with its phase (audio arrival or commit), sequence position, and number of DSP submissions. Collect a separate per-op profile using the [benchmark command](BENCHMARK.md#optional-htp-operator-profile). This distinguishes DSP kernel time from host submission and waiting. Compare CPU, HTP waiting, and HTP polling under both idle and representative CPU load.
+Six measured batches between 2026-11-16 and 2026-11-17 fixed the comparison
+harness, then moved the service from "one device engine, unknown cost" to a
+two-engine layout with a placement rule. This section states where that left
+it, so the next change is judged against a baseline rather than against whichever
+number was quoted last. Every figure below is on SM6650, with the fixtures and
+hashes in [BENCHMARK.md](BENCHMARK.md#setup), 20 ms packets, and 1,200 ms of
+tail padding.
 
-2. **Reduce the work triggered by commit.** At 480 ms, the encoder consumes a 61-frame window and advances by 48 frames. The 1,200 ms of virtual silence is appended immediately but still triggers real inference. The readiness test is `pos + 61 < n_frames`, with `pos` advancing by 48 after each chunk. Using the fixture sample counts and the frame counts before and after padding yields two commit-time chunks on both short clips and the 20 s clip, and three on the exact 10 s clip. Count those chunks explicitly and sweep shorter padding only after testing clips that end at different offsets within the 480 ms window. Include clipped endpoints, final digits, addresses, and Chinese/English code-switching. Require stable final token sequences on reference clips and measure CER/WER and command success on real VAD segments before adopting a shorter flush.
+**Default deployment.** Four HTP lanes with batching, two CPU lanes with two
+threads each, cost-ranked placement. This is the configuration the table at the
+end of H9 was measured with.
 
-3. **Optimize the dominant stage identified by profiling.** If host overhead dominates, reuse mask buffers and stop rewriting the masks once the left context is fully populated. If HTP kernels dominate, start with the ConvNeXt depthwise convolution and its two pointwise projections. The short-clip profile measured about 11.4 ms of DSP time per chunk across those three operators. Check layout conversions between them and A/B the whole block before pursuing a fused kernel. If the CPU joiner dominates, benchmark a vectorized matrix-vector path against the current 512-by-5,000 projection in [`greedy_run`](xasr.cpp#L824). Keep the greedy recurrence intact because the winning token from one encoder frame can change the predictor input for the next frame. Evaluate joiner offload only after measuring the dispatch cost at that granularity.
+```sh
+export LD_LIBRARY_PATH=$PWD/lib ADSP_LIBRARY_PATH=$PWD/lib \
+       GGML_HEXAGON_DEVICES=HTP0:0 GGML_HEXAGON_OPBATCH=2048 GGML_HEXAGON_OPPOLL=1
+bin/llama-x-asr-server x-asr-zh-en-q8_0.gguf HTP0:0 --port 8765 \
+    --streams 4 --encoder-batch 4 --cpu-streams 2 --threads 2
+```
 
-4. **Prove batching on service traffic.** Separate shared weights and graph metadata from per-stream encoder caches and predictor state. Start with batch size 1 and 2, then measure 4. Use ready chunks to fill a batch and prefer committed streams when their remaining chunks are ready. Compare no intentional batch wait with a bounded batching window. Preserve stream order, ensure ongoing streams get service, and test cancel, reset, and reuse for state leakage. Replay staggered arrivals, four simultaneous endpoints, and three endpoints while another stream keeps recording. Record queue wait, commit-to-final, endpoint-to-final P50/P95/P99, throughput, CPU time, and memory. Report sample count and run long enough to include thermal steady state. Compare with the current single-stream HTP and the shared-weight CPU ONNX scheduler before enabling batching by default.
+| Measure | Harness | N | p50 | p95 |
+|---|---|---:|---:|---:|
+| one stream, in process | `bench_profile --mode timing`, `en-20`, 43 chunks | 1 | 3,440.8 ms wall, RTF 0.172 | |
+| one stream, through the socket | `bench_load_matrix`, `single` | 6 | 173.9 | 177.7 |
+| two aligned streams | CLI `--streams 2` | 10 requests | 968 / 977 | |
+| four aligned segments, 2.2–2.7 s | `bench_engine_split`, default arm | 20 | 892 | 1,022 |
+| one stream, whole clip, no queue | `bench_vehicle`, Tingting pack | 96 | 546 | 701 |
 
-5. **Revisit model variants after the latency breakdown.** Keep Q8_0 as the reference. A shorter chunk is a separate model geometry experiment with different left context, invocation frequency, and endpoint behavior. A lower-precision variant is a separate accuracy experiment. Compare both with Q8_0 on identical VAD cuts under road noise, music, and overlapping speech. Use Chinese CER, English WER, entity accuracy, and command success to decide if the measured tail reduction is acceptable.
+The first and last rows are not comparable: the CLI runs one process with no
+service queue, the socket rows include the forward and the queue, and the
+four-way row commits four segments at the same instant, which is the worst case
+for `endpoint -> final`, not the common one.
+
+### What each batch settled
+
+| Batch | Commits | Result |
+|---|---|---|
+| 1. Same-load comparison | `231249726` | B=1/2/4 return byte-identical text on every fixture (63/63). Batching only pays when endpoints align: `aligned4` p95 964 → 908 → 827 ms, `vadburst` 3,786 → 5,055 → 5,045 ms. |
+| 2. Routing and the bulk control | `1f0141452`, `4629a229f` | The default hybrid already exhausts the CPU engine's worth: short-command p95 825 → 415 ms. Bulk RTF is 0.177 on our CPU and 0.192 on HTP against 0.119 for the sherpa-onnx INT8 CPU control, so the gap is this implementation's graph, not the NPU. |
+| 3. Cache fold | `87b021a64` | One copy instead of two per streaming cache: 4,945 fewer nodes, `compute_ms` −10.4%, RTF 0.1905 → 0.1720, single-stream p50 198.2 → 173.9 ms. Each remaining operator costs a flat 6.3–8.7 µs regardless of size. |
+| 4. Cabin command fields | `2f259dffd`, `c43006ac5` | The same rows read 8.43% CER and 68.8% executable commands; a phrase bias repairs nouns and reaches 75.0% but not the verb. One speaker's voice does not transfer at all (34.4%). |
+| 5. Phrase-bias ceiling | `eca64cc26`, `85e98575a` | A word-initial token can win at most 0.9 logit of bias, while the English `Set` misses need 1.76–6.42, so no legal entry fixes them. Bias is per stream: 12/12 identical under four concurrent sessions. |
+| 6. Placement and engine split | `782f62ef1`, `f185e1b9f` | Ranking a lane by what it costs instead of by a queue the worker already drained: four-way p95 1,324 → 1,022 ms. Batching is worth 1.35x at four lanes and no more; the second engine is what carries the tail. |
+
+### Where the limits now are
+
+- **Graph dispatch is the floor at this chunk size.** 2,449 executed operators
+  per chunk at ~7 µs is 17 ms of a 77 ms chunk. The two remaining bookkeeping
+  candidates (`swoosh` offset folding, depthwise tap MACs) are each under 2%,
+  below the four-stream spread, so the next double-digit change has to alter the
+  arithmetic: a wider chunk, or a fused `scale_bias`/`softplus` on the DSP side.
+- **Batching is worth 1.35x, not four.** `step = 25.5 + 48.9 x lanes` predicts
+  the four-lane step within 0.3%. With dispatch free four lanes still cost
+  195 ms, so 220.5 ms measured is 89% of batching's own ceiling. Batching
+  amortises the fixed part and nothing else.
+- **The four-way tail is set by the CPU lane.** At two lanes each, the device
+  spends 61.6 ms per chunk per lane and the CPU engine about 135 ms, so 2+2
+  finishes when the CPU pair does. Everything above that in the p95 is queueing.
+- **A phrase bias cannot move a first-token decision that far.** The head token
+  receives `0.3 x gain` and `gain <= 3`, so the ceiling is 0.9 logit. Fixes for
+  the English failures have to be a constrained decoder or a different acoustic
+  model.
+- **The CPU engine is memory-bound before it is thread-bound.** `--threads 3`
+  and `--threads 4` did not return within a 30 s client timeout while the phone
+  reported 800 MB free and 2.1 GB of swap, so two threads is a proven limit, not
+  a measured optimum.
+
+### How a change is accepted
+
+Interleave the arms within a round and rotate the order, one process per arm,
+with one warm-up request discarded. Report N next to every percentile, and the
+service number as `endpoint -> final` pooled over requests rather than the
+timing of one profile: a single-process profile attributes a global cache effect
+to one operator, which is how the cache fold first looked like a per-operator
+win. Require the transcript to be byte-identical, or the command fields
+unchanged, before accepting a latency win; a different transcript is a different
+change. Record a negative result with its mechanism and its revival condition.
+Index fixtures as `<pack>/<id>`, because a bare id silently merges the tuning and
+holdout packs.
+
+## Remaining work
+
+1. **Real cabin VAD cuts.** Every number here uses synthetic fixtures and
+   appended virtual silence. Acceptance needs real endpoint cuts under road
+   noise, music, and overlapping speech, with the VAD's own jitter in the
+   arrival schedule. The synthetic pack is a regression set, not an accuracy
+   estimate.
+2. **Five and six streams.** H9 covers four. Past two pairs the rule spills back
+   to the device (4+0); whether a third batch lane or a third CPU slot is better
+   is unmeasured, and the third CPU slot was already shown to slow the three
+   short commands while speeding the long recording.
+3. **Staggered arrivals under the cost-ranked rule.** H9 measured aligned
+   commits only. The `vadburst` and `stagger4` cells in BENCHMARK.md predate the
+   placement fix, so they have to be replayed before the rule is quoted for the
+   common case.
+4. **Where the CPU lane's 135 ms per chunk goes.** The device lane is 61.6 ms
+   against roughly 135 ms on the CPU engine with two threads. The ConvNeXt f32
+   projections and the small-K attention matmuls are the candidates; this is the
+   tail setter in 2+2 and the only place left with a 2x gap.
+5. **Model variants.** A shorter chunk or a lower-bit encoder changes the
+   dispatch floor itself. Compare either against Q8_0 on identical VAD cuts
+   before changing a default. Also open on quality: English `Set` needs a
+   constrained decoder, and `氛围灯`/`座已` may still be reachable with a larger
+   head gain.
 
 
 ## Cabin acceptance cases
