@@ -44,14 +44,22 @@ struct Engine {
     std::atomic<uint64_t> requests{0};
 };
 
-// status, text, queue_ms, infer_ms
-using pool_done = std::function<void(int, std::string, double, double)>;
+struct TokensDeleter {
+    void operator()(paraformer_tokens* t) const {
+        paraformer_tokens_free(t);
+    }
+};
+using TokensPtr = std::shared_ptr<paraformer_tokens>;
+
+// status, text, queue_ms, infer_ms, tokens (null unless requested)
+using pool_done = std::function<void(int, std::string, double, double, TokensPtr)>;
 
 struct PoolTask {
     std::vector<float> samples;
     pool_done done;
     double enqueued_ms = 0;
-    int priority = 0; // 1 = commit, 0 = partial
+    int priority = 0;    // 1 = commit, 0 = partial
+    bool want_tokens = false;
 };
 
 static std::deque<std::unique_ptr<PoolTask>> g_queue;
@@ -66,6 +74,8 @@ static std::atomic<uint64_t> g_requests{0};
 static std::atomic<uint64_t> g_rejected{0};
 static std::atomic<uint64_t> g_failed{0};
 static std::atomic<uint64_t> g_event_seq{0};
+static double g_seg_gap_ms = 600;       // silence that starts a new subtitle/segment
+static double g_punct_gap_ms = 600;     // silence that earns a clause separator
 static double g_partial_min_ms = 800;   // new audio needed before a partial
 static double g_partial_interval = 600; // minimum time between partials
 static bool g_partials = true;
@@ -161,6 +171,16 @@ static std::vector<float> resample_to_16k(const int16_t* pcm, size_t n, int rate
     return out;
 }
 
+// Chinese/CJK shows up as multi-byte UTF-8; English transcripts are ASCII.
+static bool any_multibyte(const std::string& s) {
+    for (unsigned char c : s) {
+        if (c >= 0x80) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static std::string srt_time(double seconds) {
     int ms = (int) std::lround(seconds * 1000.0);
     char buf[32];
@@ -201,29 +221,43 @@ static void worker_loop(Engine* eng) {
         g_cv.notify_all();
         const double queue_ms = now_ms() - task->enqueued_ms;
         if (g_timeout_ms > 0 && queue_ms > g_timeout_ms) {
-            task->done(503, "queue timeout", queue_ms, 0.0);
+            task->done(503, "queue timeout", queue_ms, 0.0, nullptr);
             continue;
         }
         const double t0 = now_ms();
-        std::unique_ptr<char, decltype(&std::free)> text(
-            paraformer_transcribe(eng->ctx, task->samples.data(), (int) task->samples.size()), &std::free);
+        TokensPtr tokens;
+        std::string text;
+        if (task->want_tokens) {
+            tokens.reset(paraformer_transcribe_tokens(eng->ctx, task->samples.data(), (int) task->samples.size()),
+                         TokensDeleter{});
+            if (tokens && tokens->text) {
+                text = tokens->text;
+            }
+        } else {
+            std::unique_ptr<char, decltype(&std::free)> t(
+                paraformer_transcribe(eng->ctx, task->samples.data(), (int) task->samples.size()), &std::free);
+            if (t) {
+                text = t.get();
+            }
+        }
         const double infer_ms = now_ms() - t0;
-        if (!text) {
+        if (!tokens && text.empty()) {
             g_failed.fetch_add(1);
-            task->done(500, "inference failed", queue_ms, infer_ms);
+            task->done(500, "inference failed", queue_ms, infer_ms, nullptr);
             continue;
         }
         eng->requests.fetch_add(1);
-        task->done(200, std::string(text.get()), queue_ms, infer_ms);
+        task->done(200, std::move(text), queue_ms, infer_ms, std::move(tokens));
     }
 }
 
 // Returns false when the queue is full (the caller maps that to 429 / an error event).
-static bool submit(std::vector<float> samples, int priority, pool_done done) {
+static bool submit(std::vector<float> samples, int priority, pool_done done, bool want_tokens = false) {
     auto task = std::make_unique<PoolTask>();
     task->samples = std::move(samples);
     task->done = std::move(done);
     task->priority = priority;
+    task->want_tokens = want_tokens;
     task->enqueued_ms = now_ms();
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -243,21 +277,26 @@ struct SyncReply {
     std::string text;
     double queue_ms = 0;
     double infer_ms = 0;
+    TokensPtr tokens;
 };
 
 // Synchronous helper for the REST endpoints.
-static SyncReply transcribe_sync(const std::vector<float>& samples) {
+static SyncReply transcribe_sync(const std::vector<float>& samples, bool want_tokens = false) {
     struct Result {
         int status;
         std::string text;
         double queue_ms;
         double infer_ms;
+        TokensPtr tokens;
     };
     auto promise = std::make_shared<std::promise<Result>>();
     auto fut = promise->get_future();
-    const bool ok = submit(samples, 1, [promise](int status, std::string text, double queue_ms, double infer_ms) {
-        promise->set_value({status, std::move(text), queue_ms, infer_ms});
-    });
+    const bool ok = submit(
+        samples, 1,
+        [promise](int status, std::string text, double queue_ms, double infer_ms, TokensPtr tokens) {
+            promise->set_value({status, std::move(text), queue_ms, infer_ms, std::move(tokens)});
+        },
+        want_tokens);
     if (!ok) {
         SyncReply r;
         r.status = 429;
@@ -270,7 +309,97 @@ static SyncReply transcribe_sync(const std::vector<float>& samples) {
     r.text = v.text;
     r.queue_ms = v.queue_ms;
     r.infer_ms = v.infer_ms;
+    r.tokens = v.tokens;
     return r;
+}
+
+// ---- word and clause structure from token times ----
+
+// A word is one or more BPE pieces; a piece ending in @@ continues the word.
+struct WordSpan {
+    std::string text;
+    double start_ms = 0;
+    double end_ms = 0;
+};
+
+static std::vector<WordSpan> build_words(const paraformer_tokens* t) {
+    std::vector<WordSpan> out;
+    if (!t || t->n_tokens <= 0) {
+        return out;
+    }
+    WordSpan cur;
+    bool open = false;
+    for (int i = 0; i < t->n_tokens; ++i) {
+        const char* p = t->tokens[i].text ? t->tokens[i].text : "";
+        std::string s(p);
+        const bool cont = s.size() >= 2 && s.compare(s.size() - 2, 2, "@@") == 0;
+        if (!open) {
+            cur = WordSpan();
+            // Start at this word's first fire time: the gap to the previous word
+            // is then (start_next - end_prev), which is what the pause test needs.
+            cur.start_ms = (double) t->tokens[i].t_ms;
+            open = true;
+        }
+        cur.text += cont ? s.substr(0, s.size() - 2) : s;
+        cur.end_ms = (double) t->tokens[i].t_ms;
+        if (!cont) {
+            out.push_back(cur);
+            open = false;
+        }
+    }
+    if (open) {
+        out.push_back(cur);
+    }
+    return out;
+}
+
+// Insert a separator where consecutive words are separated by a pause longer
+// than gap_ms. Acoustic evidence, unlike the keyword restorer that split inside
+// single commands.
+static std::string punctuate_words(const std::vector<WordSpan>& words, bool zh, double gap_ms) {
+    std::string out;
+    for (size_t i = 0; i < words.size(); ++i) {
+        if (i > 0) {
+            const double gap = words[i].start_ms - words[i - 1].end_ms;
+            if (gap >= gap_ms) {
+                out += zh ? "，" : ",";
+            } else if (!zh) {
+                out += " ";
+            }
+        }
+        out += words[i].text;
+    }
+    out += zh ? "。" : ".";
+    return out;
+}
+
+static json segments_json(const std::vector<WordSpan>& words, bool zh, double gap_ms, const std::string& fallback) {
+    json segs = json::array();
+    if (words.empty()) {
+        segs.push_back({{"id", 0}, {"start", 0.0}, {"end", 0.0}, {"text", fallback}});
+        return segs;
+    }
+    size_t idx = 0;
+    std::string cur;
+    double start = words[0].start_ms;
+    for (size_t i = 0; i < words.size(); ++i) {
+        if (i > 0) {
+            const double gap = words[i].start_ms - words[i - 1].end_ms;
+            if (gap >= gap_ms) {
+                segs.push_back({{"id", (int) idx++},
+                                {"start", start / 1000.0},
+                                {"end", words[i - 1].end_ms / 1000.0},
+                                {"text", cur}});
+                cur.clear();
+                start = words[i].start_ms;
+            } else if (!zh) {
+                cur += " ";
+            }
+        }
+        cur += words[i].text;
+    }
+    segs.push_back({{"id", (int) idx}, {"start", start / 1000.0}, {"end", words.back().end_ms / 1000.0}, {"text", cur}});
+    return segs;
 }
 
 // ---- base64 ----
@@ -371,7 +500,7 @@ static void maybe_schedule_partial(const std::shared_ptr<WsSession>& s) {
     s->last_partial_ms = t;
     std::vector<float> snapshot = s->pcm;
     const uint64_t gen = s->gen;
-    const bool ok = submit(std::move(snapshot), 0, [s, gen](int status, std::string text, double, double) {
+    const bool ok = submit(std::move(snapshot), 0, [s, gen](int status, std::string text, double, double, TokensPtr) {
         {
             std::lock_guard<std::mutex> lock(s->m);
             s->partial_inflight = false;
@@ -459,7 +588,7 @@ static void ws_handle_text(const std::shared_ptr<WsSession>& s, const std::strin
         ws_send_event(*s, "input_audio_buffer.committed", {{"item_id", s->item_id}, {"previous_item_id", nullptr}});
         const std::string item = s->item_id;
         const bool ok = submit(std::move(snapshot), 1, [s, gen, item](int status, std::string text, double queue_ms,
-                                                                     double infer_ms) {
+                                                                     double infer_ms, TokensPtr) {
             if (gen != s->gen) {
                 return; // cleared or superseded
             }
@@ -544,32 +673,46 @@ static void handle_transcription(const httplib::Request& req, httplib::Response&
         return;
     }
     const std::string fmt = req.form.has_field("response_format") ? req.form.get_field("response_format") : "json";
-    const SyncReply r = transcribe_sync(samples);
+    const std::string punct = req.form.has_field("punctuate") ? req.form.get_field("punctuate") : "false";
+    const bool want_punct = punct == "true" || punct == "1";
+    const bool want_tokens = fmt == "verbose_json" || fmt == "srt" || want_punct;
+    const SyncReply r = transcribe_sync(samples, want_tokens);
     res.set_header("X-Queue-Ms", std::to_string((int) std::lround(r.queue_ms)));
     res.set_header("X-Infer-Ms", std::to_string((int) std::lround(r.infer_ms)));
     if (r.status != 200) {
         reply_error(res, r.status, r.text, r.status == 429 ? "rate_limit_error" : "server_error");
         return;
     }
-    const std::string& text = r.text;
+    const std::vector<WordSpan> words = build_words(r.tokens.get());
+    const bool zh = any_multibyte(r.text);
+    const std::string text = want_punct && !words.empty() ? punctuate_words(words, zh, g_punct_gap_ms) : r.text;
     if (fmt == "text") {
         res.set_content(text, "text/plain; charset=utf-8");
         return;
     }
     if (fmt == "verbose_json") {
         const double duration = (double) samples.size() / 16000.0;
+        json jw = json::array();
+        for (const auto& w : words) {
+            jw.push_back({{"word", w.text}, {"start", w.start_ms / 1000.0}, {"end", w.end_ms / 1000.0}});
+        }
         json j = {{"task", "transcribe"},
                   {"language", req.form.has_field("language") ? req.form.get_field("language") : std::string("zh")},
                   {"duration", duration},
                   {"text", text},
-                  {"segments", {{{"id", 0}, {"start", 0.0}, {"end", duration}, {"text", text}}}}};
+                  {"words", jw},
+                  {"segments", segments_json(words, zh, g_seg_gap_ms, text)}};
         res.set_content(j.dump(2), "application/json");
         return;
     }
     if (fmt == "srt") {
-        const double duration = (double) samples.size() / 16000.0;
-        res.set_content("1\n" + srt_time(0.0) + " --> " + srt_time(duration) + "\n" + text + "\n",
-                        "text/plain; charset=utf-8");
+        const json segs = segments_json(words, zh, g_seg_gap_ms, text);
+        std::string body;
+        for (size_t i = 0; i < segs.size(); ++i) {
+            body += std::to_string(i + 1) + "\n" + srt_time(segs[i]["start"].get<double>()) + " --> " +
+                    srt_time(segs[i]["end"].get<double>()) + "\n" + segs[i]["text"].get<std::string>() + "\n\n";
+        }
+        res.set_content(body.empty() ? text + "\n" : body, "text/plain; charset=utf-8");
         return;
     }
     if (fmt != "json") {
@@ -606,7 +749,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "usage: %s MODEL.gguf [--device HTP0:0] [--port N] [--engines N] [--threads N] "
                      "[--bind ADDR] [--queue N] [--timeout-ms N] [--model-id ID] [--warmup WAV] "
-                     "[--partial-ms N] [--partial-interval-ms N] [--no-partials]\n",
+                     "[--partial-ms N] [--partial-interval-ms N] [--no-partials] [--seg-gap-ms N] [--punct-gap-ms N]\n",
                      argv[0]);
         return 1;
     }
@@ -644,6 +787,10 @@ int main(int argc, char** argv) {
             g_partial_interval = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--no-partials") == 0) {
             g_partials = false;
+        } else if (std::strcmp(argv[i], "--seg-gap-ms") == 0 && i + 1 < argc) {
+            g_seg_gap_ms = std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--punct-gap-ms") == 0 && i + 1 < argc) {
+            g_punct_gap_ms = std::atof(argv[++i]);
         }
     }
     if (device_set && std::strcmp(device, "CPU") != 0) {

@@ -2028,6 +2028,49 @@ paraformer_result* paraformer_transcribe_with_timestamps(paraformer_context* ctx
     return r;
 }
 
+paraformer_tokens* paraformer_transcribe_tokens(paraformer_context* ctx, const float* samples, int n_samples) {
+    if (!ctx || !samples || n_samples <= 0)
+        return nullptr;
+    std::vector<pf_token> toks;
+    std::string s;
+    const pf_long_cfg lc = paraformer_long_cfg();
+    if (paraformer_use_long(lc, n_samples)) {
+        s = paraformer_transcribe_long(ctx, samples, n_samples, lc, &toks);
+    } else {
+        s = paraformer_transcribe_impl(ctx, samples, n_samples, nullptr, nullptr, nullptr, &toks);
+    }
+    auto* r = (paraformer_tokens*) std::malloc(sizeof(paraformer_tokens));
+    if (!r)
+        return nullptr;
+    r->text = (char*) std::malloc(s.size() + 1);
+    if (r->text) {
+        std::memcpy(r->text, s.data(), s.size());
+        r->text[s.size()] = ' ';
+    }
+    r->n_tokens = (int) toks.size();
+    r->tokens = r->n_tokens ? (paraformer_token*) std::calloc((size_t) r->n_tokens, sizeof(paraformer_token)) : nullptr;
+    for (int i = 0; i < r->n_tokens; ++i) {
+        r->tokens[i].text = (char*) std::malloc(toks[(size_t) i].text.size() + 1);
+        if (r->tokens[i].text) {
+            std::memcpy(r->tokens[i].text, toks[(size_t) i].text.data(), toks[(size_t) i].text.size());
+            r->tokens[i].text[toks[(size_t) i].text.size()] = ' ';
+        }
+        r->tokens[i].t_ms = (int32_t) toks[(size_t) i].t_ms;
+        r->tokens[i].posterior = toks[(size_t) i].posterior;
+    }
+    return r;
+}
+
+void paraformer_tokens_free(paraformer_tokens* r) {
+    if (!r)
+        return;
+    for (int i = 0; i < r->n_tokens; ++i)
+        std::free(r->tokens[i].text);
+    std::free(r->tokens);
+    std::free(r->text);
+    std::free(r);
+}
+
 void paraformer_result_free(paraformer_result* r) {
     if (!r)
         return;

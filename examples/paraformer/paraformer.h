@@ -74,6 +74,26 @@ struct paraformer_result* paraformer_transcribe_with_timestamps(paraformer_conte
                                                                 int n_samples);
 void paraformer_result_free(struct paraformer_result* r);
 
+// Token-level output: one entry per emitted token with its CIF fire time and
+// posterior. Chinese tokens are characters, English ones are BPE pieces (a piece
+// ending in "@@" continues the same word), so callers can build word timestamps
+// and clause boundaries from the gaps between entries.
+struct paraformer_token {
+    char* text;
+    int32_t t_ms;    // token end time from the CIF fire frame
+    float posterior; // softmax probability of the chosen token
+};
+
+struct paraformer_tokens {
+    char* text; // the same transcript the plain API returns
+    struct paraformer_token* tokens;
+    int n_tokens;
+};
+
+// Returns NULL on failure. Free with paraformer_tokens_free().
+struct paraformer_tokens* paraformer_transcribe_tokens(paraformer_context* ctx, const float* samples, int n_samples);
+void paraformer_tokens_free(struct paraformer_tokens* r);
+
 // Stage-capture API for the diff harness.
 float* paraformer_extract_stage(paraformer_context* ctx, const float* samples, int n_samples, const char* stage_name,
                                 int* n_out);

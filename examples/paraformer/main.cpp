@@ -120,11 +120,12 @@ int main(int argc, char ** argv) {
         const auto begin = pf_clock::now();
         std::unique_ptr<char, decltype(&std::free)> text(nullptr, &std::free);
         std::unique_ptr<paraformer_result, decltype(&paraformer_result_free)> result(nullptr, paraformer_result_free);
+        std::unique_ptr<paraformer_tokens, decltype(&paraformer_tokens_free)> toks(nullptr, paraformer_tokens_free);
         if (timestamps) {
-            result.reset(paraformer_transcribe_with_timestamps(model.get(), samples.data(), (int) samples.size()));
-            if (result) {
-                text.reset(result->text);
-                result->text = nullptr;
+            toks.reset(paraformer_transcribe_tokens(model.get(), samples.data(), (int) samples.size()));
+            if (toks) {
+                text.reset(toks->text);
+                toks->text = nullptr;
             }
         } else {
             text.reset(paraformer_transcribe(model.get(), samples.data(), (int) samples.size()));
@@ -137,14 +138,15 @@ int main(int argc, char ** argv) {
         const double audio_ms = samples.size() * 1000.0 / 16000.0;
         printf("%s\taudio_ms=%.3f\twall_ms=%.3f\trtf=%.4f", wave, audio_ms, wall_ms,
                audio_ms > 0 ? wall_ms / audio_ms : 0.0);
-        if (timestamps && result) {
-            printf("\tn_chars=%d", result->n_chars);
-            // §15: dump raw per-char centiseconds so the LFR time base can be
-            // checked against audio length instead of assumed.
-            if (result->n_chars > 0) {
+        if (timestamps && toks) {
+            printf("\tn_tokens=%d", toks->n_tokens);
+            if (toks->n_tokens > 0) {
                 printf("\tts_cs=");
-                for (int i = 0; i < result->n_chars; ++i)
-                    printf("%s%d", i ? "," : "", result->char_times_cs[i]);
+                for (int i = 0; i < toks->n_tokens; ++i)
+                    printf("%s%d", i ? "," : "", toks->tokens[i].t_ms);
+                printf("\ttok=");
+                for (int i = 0; i < toks->n_tokens; ++i)
+                    printf("%s%s", i ? "|" : "", toks->tokens[i].text);
             }
         }
         printf("\t%s\n", text.get());
