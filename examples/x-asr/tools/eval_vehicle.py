@@ -27,9 +27,13 @@ fails if the fields it extracts differ from `vehicle_semantics.tsv`. Without
 that gate a parser bug and an ASR error look the same in the report.
 
     python3 eval_vehicle.py --semantics tools/vehicle_semantics.tsv \
-        --pack tuning=$PACK/tingting/manifest.tsv \
+        --pack tingting=$PACK/tingting/manifest.tsv \
         --pack controls=$PACK/controls/manifest.tsv \
         --run off=off.tsv --run on=on.tsv
+
+The `--pack` label must be the pack directory name under `hotword-eval`: that
+is the prefix `load_transcripts` reads from each transcript path, and it is
+what keeps the tuning and holdout packs, which share clip ids, apart.
 """
 
 import argparse
@@ -416,7 +420,7 @@ def check_parser(packs, semantics):
     """Every reference sentence must parse back to its own annotation."""
     bad = 0
     for label, manifest in packs:
-        for key, row in load_manifest(manifest).items():
+        for key, row in load_manifest(manifest, pack=label).items():
             clip_id = row["id"]
             ref = semantics.get(clip_id)
             if ref is None:
@@ -499,9 +503,11 @@ def main():
     # Keyed by pack directory as well as clip id: the tuning and holdout packs
     # share clip ids and differ only in voice, so an id-only table silently
     # drops one of them.
+    # The label is the pack directory name under `hotword-eval`, so it matches
+    # the prefix that `load_transcripts` derives from each transcript path.
     clips = {}
     for label, manifest in packs:
-        for key, row in load_manifest(manifest).items():
+        for key, row in load_manifest(manifest, pack=label).items():
             row["pack"] = label
             clips[key] = row
 
@@ -541,14 +547,15 @@ def main():
 
         print("## %s" % arm)
         for pack, s in by_pack.items():
-            print("%-10s clips=%-3d device=%.1f%% state=%.1f%% value=%.1f%% clause=%.1f%% "
-                  "command=%.1f%% (%d/%d) wrong=%d unstated=%d false_trig=%d/%d zhCER=%.2f%% enWER=%.2f%% "
-                  "wall p50/p95/p99=%.0f/%.0f/%.0f ms" % (
+            print("%-10s clips=%-3d device=%s state=%s value=%s clause=%s command=%s "
+                  "wrong=%d unstated=%d false_trig=%d/%d near_miss=%d/%d "
+                  "zhCER=%.2f%% enWER=%.2f%% wall p50/p95/p99=%.0f/%.0f/%.0f ms" % (
                       pack, s["clips"],
-                      pct(s["device"], s["total"]), pct(s["state"], s["total"]),
-                      pct(s["value"], s["value_total"]), pct(s["clause"], s["total"]),
-                      pct(s["command_ok"], s["command_clips"]), s["command_ok"], s["command_clips"],
+                      fmt(s["device"], s["total"]), fmt(s["state"], s["total"]),
+                      fmt(s["value"], s["value_total"]), fmt(s["clause"], s["total"]),
+                      fmt(s["command_ok"], s["command_clips"]),
                       s["wrong_direction"], s["unstated"], s["false_trigger"], s["negative_clips"],
+                      s["near_miss"], s["negative_clips"],
                       s["zh_cer"], s["en_wer"],
                       s["latency"].get(50, 0), s["latency"].get(95, 0), s["latency"].get(99, 0)))
 
