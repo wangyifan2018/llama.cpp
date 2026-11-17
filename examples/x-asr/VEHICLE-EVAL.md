@@ -100,7 +100,8 @@ pieces from the GGUF vocabulary. A line beginning with `#` is a comment.
 Each entry uses 2–16 tokens and a gain in (0, 3]. The loader caps the profile
 at 128 entries. The first piece receives 30% of the configured gain and
 continuations receive the full gain when prior emitted tokens match the
-prefix. Bias vectors are maintained per stream. The built-in profile gives
+prefix. `XASR_HOTWORD_HEAD=<fraction>` overrides that 30% for measurement; the
+default is unchanged. Bias vectors are maintained per stream. The built-in profile gives
 device words a gain of 2 and leaves action, position, negation and value
 tokens out of the list. A changed device token can still affect later decoder
 decisions, so always test the full transcript.
@@ -272,3 +273,81 @@ are in
 `$HOME/Library/Caches/qwen3-asr-htp/xasr-vehicle-20261117-115921`. The hard
 negatives are in
 `$HOME/Library/Caches/qwen3-asr-htp/xasr-multistream/vehicle-hardneg.3hSTPf`.
+
+### Why the profile cannot repair `Set the`
+
+The four English commands that still fail all begin `Set the <noun>`. Before
+adding verbs to the profile, check what the joiner actually scored. The
+diagnostic prints the five best candidates at every emitted token:
+
+```sh
+XASR_DEBUG_LOGITS=1 build-x-asr/bin/llama-x-asr x-asr-zh-en-q8_0.gguf CPU \
+    "$TUNING/hvac_en01.wav" --joiner-host
+```
+
+| clip | winner | `▁Said` | `▁set` |
+|---|---|---:|---:|
+| `hvac_en01` `Set the driver temperature …` | `▁said` | −2.64 | **−6.38** |
+| `hvac_en02` `Set the passenger temperature …` | `▁said` | −2.70 | **−5.70** |
+| `seat_en01` `Set the passenger seat heater …` | `▁said` | −2.51 | **−6.42** |
+| `seat_en03` `Set the rear left seat ventilation …` | `▁said` | −2.71 | **−1.76** |
+
+Gaps are raw logits below the winner. `▁set` is not even the runner-up: the
+vocabulary holds `▁set` (4405), `▁said` (4118) and `▁Said` (4881), and both
+`said` forms outrank it, so this is not a capitalisation or tokenisation
+mismatch — there is no `▁Set` token to aim at.
+
+The bias cannot close that gap. A phrase's first piece receives 0.3 × gain and
+the loader accepts at most 3, so the ceiling is **0.9 logits** against a needed
+1.76–6.42. No entry, at any allowed gain, can flip these four tokens; adding
+`▁set ▁the` to the profile would only raise the false-trigger surface. This is
+why the field result above repairs nouns and not verbs.
+
+The failure is a property of the audio-and-model pair, not of one fixture:
+
+- **Position.** Same voice, one word changed. `Set the fan to level three` →
+  `said` (`▁set` −1.88). `Set fan to level three` → `set` (−5.21). `Please set
+  the fan …` → `set`. `Turn on recirculation and set the fan …` → `set`. Only
+  the bare utterance-initial `Set the` fails.
+- **Speaker.** Six synthesised voices, same sentence: Samantha, Daniel, Karen
+  and Kathy produce `said`, Moira `Seth`, and Reed returns an empty transcript.
+  The holdout pack, which uses a different Mandarin voice, fails the same five
+  English clips.
+
+```sh
+for v in Samantha Daniel Karen Moira Kathy Reed; do
+    say -v "$v" -o /tmp/set.aiff "Set the driver temperature to twenty one degrees"
+    afconvert -f WAVE -d LEI16@16000 -c 1 /tmp/set.aiff "/tmp/set-$v.wav"
+done
+for text in "Set the fan to level three" "Set fan to level three" \
+            "Please set the fan to level three"; do
+    say -v Samantha -o /tmp/pos.aiff "$text"
+    afconvert -f WAVE -d LEI16@16000 -c 1 /tmp/pos.aiff "/tmp/pos-${text// /_}.wav"
+done
+```
+
+So the pattern is a real /t/-before-/ð/ reduction that the model resolves toward
+the more common sentence-initial word. Repairing it needs something the current
+mechanism cannot do: a decoder restricted to a closed verb set (a gain of ≥7
+logits, i.e. a command grammar rather than a phrase list), an English acoustic
+model, or post-hoc rescoring that rewrites the verb — the last one changes the
+transcript and is a product decision, not a tuning knob.
+
+### The bias is per stream
+
+Bias vectors live in the per-stream decoder state and the phrase list is
+read-only, so concurrent streams should not share a boost. The check runs each
+clip alone and then all of them at one endpoint, and requires the same text:
+
+```sh
+python3 examples/x-asr/tools/bench_bias_isolation.py --port 18081 --rounds 3 \
+    --wavs "$HN/neg_zh01.wav,$TUNING/seat_zh03.wav,$HN/neg_en01.wav,$TUNING/hvac_en01.wav"
+```
+
+Four streams (two commands, two statements that name devices) over three rounds:
+**12 of 12 concurrent transcripts identical to their single-stream text**, with
+`endpoint→final` 1249–1601 ms for four lanes committing at the same endpoint.
+The statements stay non-actionable (`车窗外面风有点大`,
+`The window is a little dirty.`) while the commands beside them keep their
+device, direction and value, which is the case a leaked boost would break.
+
