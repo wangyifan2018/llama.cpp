@@ -171,16 +171,6 @@ static std::vector<float> resample_to_16k(const int16_t* pcm, size_t n, int rate
     return out;
 }
 
-// Chinese/CJK shows up as multi-byte UTF-8; English transcripts are ASCII.
-static bool any_multibyte(const std::string& s) {
-    for (unsigned char c : s) {
-        if (c >= 0x80) {
-            return true;
-        }
-    }
-    return false;
-}
-
 static std::string srt_time(double seconds) {
     int ms = (int) std::lround(seconds * 1000.0);
     char buf[32];
@@ -313,6 +303,16 @@ static SyncReply transcribe_sync(const std::vector<float>& samples, bool want_to
     return r;
 }
 
+// Chinese/CJK shows up as multi-byte UTF-8; English transcripts are ASCII.
+static bool any_multibyte(const std::string& s) {
+    for (unsigned char c : s) {
+        if (c >= 0x80) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // ---- word and clause structure from token times ----
 
 // A word is one or more BPE pieces; a piece ending in @@ continues the word.
@@ -361,9 +361,12 @@ static std::string punctuate_words(const std::vector<WordSpan>& words, bool zh, 
     for (size_t i = 0; i < words.size(); ++i) {
         if (i > 0) {
             const double gap = words[i].start_ms - words[i - 1].end_ms;
+            // Spacing is per pair, not per utterance: a mixed zh+en transcript
+            // needs spaces inside its English run and none inside its Chinese one.
+            const bool latin_pair = !any_multibyte(words[i].text) && !any_multibyte(words[i - 1].text);
             if (gap >= gap_ms) {
-                out += zh ? "，" : ",";
-            } else if (!zh) {
+                out += (!any_multibyte(words[i].text) && !any_multibyte(words[i - 1].text)) ? "," : "，";
+            } else if (latin_pair) {
                 out += " ";
             }
         }
@@ -373,10 +376,31 @@ static std::string punctuate_words(const std::vector<WordSpan>& words, bool zh, 
     return out;
 }
 
+// Whole-utterance label from the word scripts: mixed when both carry weight.
+// Decoder-side LID: no extra audio pass. On a 4.97 s mixed zh+en clip the first
+// Latin token landed 40 ms after the true English onset.
+static std::string utterance_language(const std::vector<WordSpan>& words) {
+    size_t zh = 0, en = 0;
+    for (const auto& w : words) {
+        (any_multibyte(w.text) ? zh : en)++;
+    }
+    if (zh + en == 0) {
+        return "zh";
+    }
+    const double zf = (double) zh / (double) (zh + en);
+    if (zf > 0.9) {
+        return "zh";
+    }
+    if (zf < 0.1) {
+        return "en";
+    }
+    return "mixed";
+}
+
 static json segments_json(const std::vector<WordSpan>& words, bool zh, double gap_ms, const std::string& fallback) {
     json segs = json::array();
     if (words.empty()) {
-        segs.push_back({{"id", 0}, {"start", 0.0}, {"end", 0.0}, {"text", fallback}});
+        segs.push_back({{"id", 0}, {"start", 0.0}, {"end", 0.0}, {"text", fallback}, {"language", "zh"}});
         return segs;
     }
     size_t idx = 0;
@@ -385,20 +409,26 @@ static json segments_json(const std::vector<WordSpan>& words, bool zh, double ga
     for (size_t i = 0; i < words.size(); ++i) {
         if (i > 0) {
             const double gap = words[i].start_ms - words[i - 1].end_ms;
+            const bool latin_pair = !any_multibyte(words[i].text) && !any_multibyte(words[i - 1].text);
             if (gap >= gap_ms) {
                 segs.push_back({{"id", (int) idx++},
                                 {"start", start / 1000.0},
                                 {"end", words[i - 1].end_ms / 1000.0},
-                                {"text", cur}});
+                                {"text", cur},
+                                {"language", any_multibyte(cur) ? "zh" : "en"}});
                 cur.clear();
                 start = words[i].start_ms;
-            } else if (!zh) {
+            } else if (latin_pair) {
                 cur += " ";
             }
         }
         cur += words[i].text;
     }
-    segs.push_back({{"id", (int) idx}, {"start", start / 1000.0}, {"end", words.back().end_ms / 1000.0}, {"text", cur}});
+    segs.push_back({{"id", (int) idx},
+                    {"start", start / 1000.0},
+                    {"end", words.back().end_ms / 1000.0},
+                    {"text", cur},
+                    {"language", any_multibyte(cur) ? "zh" : "en"}});
     return segs;
 }
 
@@ -685,7 +715,10 @@ static void handle_transcription(const httplib::Request& req, httplib::Response&
     }
     const std::vector<WordSpan> words = build_words(r.tokens.get());
     const bool zh = any_multibyte(r.text);
+    const std::string detected =
+        words.empty() ? (any_multibyte(r.text) ? std::string("zh") : std::string("en")) : utterance_language(words);
     const std::string text = want_punct && !words.empty() ? punctuate_words(words, zh, g_punct_gap_ms) : r.text;
+    res.set_header("X-Language", detected);
     if (fmt == "text") {
         res.set_content(text, "text/plain; charset=utf-8");
         return;
@@ -697,7 +730,7 @@ static void handle_transcription(const httplib::Request& req, httplib::Response&
             jw.push_back({{"word", w.text}, {"start", w.start_ms / 1000.0}, {"end", w.end_ms / 1000.0}});
         }
         json j = {{"task", "transcribe"},
-                  {"language", req.form.has_field("language") ? req.form.get_field("language") : std::string("zh")},
+                  {"language", detected},
                   {"duration", duration},
                   {"text", text},
                   {"words", jw},
