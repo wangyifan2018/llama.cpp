@@ -461,3 +461,46 @@ token-level 编辑，与 NAR argmax 无关）。这是为什么文本层 ITN 也
 - 残余失败（hardneg 未验）：`footwall/likes/reevent/and` 名词粘连、`driversee peater`/
   `massaician` 双错粘连、中文「掉/调」同音、标点插错位。这些要么需重训 / token 编辑，
   要么属后处理层，且 hardneg 陈述句易误触发，不在解码偏置范围。上线前应补独立包对拍。
+
+## 16. M7 实测：图与 arena 复用（2026-11-17，SM6650 + 宿主 CPU）
+
+**问题**：M1 把首包 1 s 的建图/分配挪到 warmup 之后，但每个请求仍在重建图。原代码有一条注释
+`#215e UAF fix: always rebuild (sched gallocr regrow frees cached buffers)`：每次请求
+`assign(256 MB, 0)` 一块 arena、重建 encoder 图（设备 20 ms）、再 reset+alloc；decoder 图完全
+没缓存（形状随 token 数变，设备约 10 ms）。稳态 306 ms 里约 31 ms 是这部分，且 256 MB × 2 块
+arena 常驻。
+
+**根因**：encoder 与 decoder 共用一个 scheduler，给 decoder 分配图会让 encoder 的缓冲区失效，
+当时用“每次重建”换安全。正确做法是一个 stage 一个 scheduler，各自分配一次后常驻。
+
+**改动**：
+1. 新增 `pf_stage_cache{ sched, ctx, gf, keys, meta, hits, misses }`，encoder / decoder 各一份；
+   命中条件是 `T_lfr` 与 `(T_lfr, N_tokens)` 精确相等，命中时只上传输入并计算。
+2. 两个 scheduler 分开创建，互不失效；只在 miss 时 reset+alloc。
+3. arena 从 256 MB 每次 `assign` 改为 32 MB 惰性 `resize`（只建一次）；tensor 元数据实测只占
+   1–2 MB（`no_alloc=true`，激活在 scheduler 缓冲里）。
+4. 新增 `paraformer_cache_stats()` 与 `PF_CACHE_STATS=1`，lap 增加 `enc graph cached` / `enc graph miss`。
+
+**结果（设备，同一段 2.65 s 音频连跑三次，warmup 后）**：
+
+| 指标 | 改动前 | 改动后（cache hit） |
+|---|---:|---:|
+| enc graph build | 20 ms | 3.6 ms（含 lap 开销） |
+| enc sched alloc | 2.6 ms | 0.03 ms |
+| enc compute | 235 ms | 238.6 ms |
+| 单请求 wall | 306 ms | 280.4 ms（−8.4%） |
+| 峰值 RSS (VmHWM) | ~700 MB | 252 MB |
+
+**32 条车控夹具（每条长度不同，命中率低）**：设备 p50/p95/p99 = 280 / 367 / 373 ms（改前
+290 / 380），32/32 转写与记录的 `run.tsv` 逐条一致；cache 统计 `enc hit=3 miss=29,
+dec hit=1 miss=31`。
+
+**边界与遗留**：
+- 精确按长度缓存，对“长度每次都不同”的流量命中率很低（夹具 3/32），平均只有 3–4%；同长度重复
+  （同一句话、同一 VAD 段重放）才有 8% 以上。
+- 提高命中率要做 T 分桶 + 注意力 mask + FSMN 边缘复制，padding 会带来与帧数成正比的额外计算
+  （约 5 ms/帧）。按当前 235 ms/44 帧，分桶最多净赚约 10 ms，优先级低于量化。
+- arena 从 512 MB 降到 64 MB 是本批最大的副作用收益：双引擎服务从约 1.4 GB 降到约 500 MB，
+  为第三引擎或标点模型腾出内存。
+- decoder 按 `(T, N)` 缓存，长度变化即 miss；N 分桶会改变尾部 token 的 logits（FSMN 居中卷积），
+  必须过转写对拍才能上，本批不做。

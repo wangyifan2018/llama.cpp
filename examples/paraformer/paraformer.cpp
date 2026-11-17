@@ -145,13 +145,28 @@ struct paraformer_model {
     ggml_tensor* dec_embed_w = nullptr; // (vocab, d_model)
 };
 
+// One stage's cached graph and scheduler. A hit reuses the allocated graph, so
+// the per-request cost falls to setting inputs and computing. Encoder and
+// decoder keep separate schedulers: allocating a graph on a scheduler
+// invalidates the other graph's buffers, which is what forced the old
+// rebuild-every-call workaround.
+struct pf_stage_cache {
+    ggml_backend_sched_t sched = nullptr;
+    ggml_context* ctx = nullptr;
+    ggml_cgraph* gf = nullptr;
+    std::vector<char> meta;
+    int k0 = -1, k1 = -1;
+    uint64_t hits = 0, misses = 0;
+};
+
 struct paraformer_context {
     paraformer_model model;
     core_gguf::WeightLoad wl;
     std::string model_path;
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
-    ggml_backend_sched_t sched = nullptr;
+    pf_stage_cache enc_cache;
+    pf_stage_cache dec_cache;
     int n_threads = 4;
     bool flash_attn = true;
     int verbosity = 0;
@@ -172,11 +187,6 @@ struct paraformer_context {
     int hotword_count = 0;
     bool hotword_loaded = false;
 
-    // §176s: cached encoder graph — reused when T_lfr matches.
-    ggml_cgraph* cached_enc_gf = nullptr;
-    ggml_context* cached_enc_ctx = nullptr;
-    std::vector<char> cached_enc_meta;
-    int cached_enc_T_lfr = 0;
 };
 
 // Shared, read-only weight set loaded once from GGUF. A canonical copy lives
@@ -782,18 +792,29 @@ static ggml_tensor* build_decoder_post(ggml_context* ctx0, ggml_tensor* cur, con
 // Full inference
 // ===========================================================================
 
-static bool paraformer_ensure_sched(paraformer_context* ctx) {
-    if (ctx->sched)
+static bool paraformer_ensure_sched(paraformer_context* ctx, pf_stage_cache& cache) {
+    if (cache.sched)
         return true;
     ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
     int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
-    ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 8192, false, false);
-    return ctx->sched != nullptr;
+    cache.sched = ggml_backend_sched_new(backends, nullptr, n_be, 8192, false, false);
+    return cache.sched != nullptr;
 }
+
+// §15: one decoded token with the time and confidence stitch needs.
+// Produced only when the caller asks for it (long-audio path); the plain
+// string path skips it, so single-utterance output stays bit-identical.
+struct pf_token {
+    std::string text;     // as emitted (may end in @@ for BPE continuation)
+    int64_t t_ms;         // fire frame * ms_per_alpha_frame
+    float posterior;      // softmax probability of the chosen token
+    int local_index;      // position within its window
+};
 
 static std::string paraformer_transcribe_impl(paraformer_context* ctx, const float* pcm, int n_samples,
                                               std::vector<float>* staged_out = nullptr, const char* stage = nullptr,
-                                              std::vector<int>* out_fire_frames = nullptr) {
+                                              std::vector<int>* out_fire_frames = nullptr,
+                                              std::vector<pf_token>* out_tokens = nullptr) {
     const auto& hp = ctx->model.hp;
     const int D = (int)hp.d_model;
     paraformer_bench_lap _lap;
@@ -816,27 +837,36 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     ggml_context* ctx0 = nullptr;
     ggml_cgraph* gf = nullptr;
     ggml_tensor* cur = nullptr;
-    const size_t meta_sz = 256 * 1024 * 1024; // 256 MB compute buffer
-    if (ctx->compute_meta.empty())
-        ctx->compute_meta.resize(meta_sz);
+    // Tensor metadata only: no_alloc keeps tensor data in the scheduler buffer,
+    // so this arena holds objects and the graph node array, not activations.
+    const size_t meta_sz = 32 * 1024 * 1024;
 
-    ggml_init_params ip = {meta_sz, ctx->compute_meta.data(), true};
-
-    // #215e UAF fix: always rebuild (sched gallocr regrow frees cached buffers).
+    // Encoder graph cache, keyed by the exact LFR length. A hit reuses the
+    // allocated graph, so the request pays only input upload and compute.
+    pf_stage_cache& ec = ctx->enc_cache;
     const bool can_cache = (stage == nullptr);
-    {
-        if (ctx->cached_enc_ctx) {
-            ggml_free(ctx->cached_enc_ctx);
-            ctx->cached_enc_ctx = nullptr;
-            ctx->cached_enc_gf = nullptr;
+    const bool enc_hit = can_cache && ec.gf && ec.k0 == T_lfr;
+    if (enc_hit) {
+        ++ec.hits;
+        gf = ec.gf;
+        _lap.mark("enc graph cached");
+    } else {
+        ++ec.misses;
+        _lap.mark("enc graph miss");
+        if (ec.ctx) {
+            ggml_free(ec.ctx);
+            ec.ctx = nullptr;
+            ec.gf = nullptr;
         }
-
-        // Build graph in a dedicated arena (survives across calls).
         if (can_cache) {
-            ctx->cached_enc_meta.assign(meta_sz, 0);
-            ggml_init_params cache_ip = {meta_sz, ctx->cached_enc_meta.data(), true};
+            if (ec.meta.empty())
+                ec.meta.resize(meta_sz);
+            ggml_init_params cache_ip = {ec.meta.size(), ec.meta.data(), true};
             ctx0 = ggml_init(cache_ip);
         } else {
+            if (ctx->compute_meta.empty())
+                ctx->compute_meta.resize(meta_sz);
+            ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
             ctx0 = ggml_init(ip);
         }
         gf = ggml_new_graph_custom(ctx0, 32768, false);
@@ -903,24 +933,32 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
         ggml_build_forward_expand(gf, cur);
 
         if (can_cache) {
-            ctx->cached_enc_ctx = ctx0;
-            ctx->cached_enc_gf = gf;
-            ctx->cached_enc_T_lfr = T_lfr;
-            ctx0 = nullptr; // don't free — owned by cache
+            ec.ctx = ctx0;
+            ec.gf = gf;
+            ec.k0 = T_lfr;
+            ctx0 = nullptr; // owned by the cache now
         }
     }
     _lap.mark("enc graph built");
 
     // Allocate and run encoder
-    if (!paraformer_ensure_sched(ctx)) {
-        ggml_free(ctx0);
+    if (!paraformer_ensure_sched(ctx, ec)) {
+        if (ctx0)
+            ggml_free(ctx0);
         return "";
     }
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
-        fprintf(stderr, "paraformer: sched alloc encoder graph failed\n");
-        ggml_free(ctx0);
-        return "";
+    if (!enc_hit) {
+        ggml_backend_sched_reset(ec.sched);
+        if (!ggml_backend_sched_alloc_graph(ec.sched, gf)) {
+            fprintf(stderr, "paraformer: sched alloc encoder graph failed\n");
+            if (can_cache) {
+                ec.ctx = nullptr;
+                ec.gf = nullptr;
+            }
+            if (ctx0)
+                ggml_free(ctx0);
+            return "";
+        }
     }
     _lap.mark("enc sched alloc");
     {
@@ -972,7 +1010,7 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
         fprintf(stderr, "paraformer: running encoder graph...\n");
     {
         paraformer_bench_stage _b("encoder");
-        if (core_sched_prof::compute(ctx->sched, gf, "paraformer") != GGML_STATUS_SUCCESS) {
+        if (core_sched_prof::compute(ec.sched, gf, "paraformer") != GGML_STATUS_SUCCESS) {
             fprintf(stderr, "paraformer: encoder graph compute failed\n");
             ggml_free(ctx0);
             return "";
@@ -1040,11 +1078,13 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     std::vector<int> fire_frames_vec;
     {
         paraformer_bench_stage _b("cif_predict");
+        // §15: tokens need their fire frames too, so request them when either
+        // the caller asked for frames or for token records.
         cif_predict(ctx, enc_out.data(), T_lfr, D, acoustic_embeds, N_tokens,
-                    out_fire_frames ? &fire_frames_vec : nullptr);
+                    (out_fire_frames || out_tokens) ? &fire_frames_vec : nullptr);
     }
     if (out_fire_frames)
-        *out_fire_frames = std::move(fire_frames_vec);
+        *out_fire_frames = fire_frames_vec;
 
     if (ctx->verbosity >= 1)
         fprintf(stderr, "paraformer: CIF predicted %d tokens from T_lfr=%d\n", N_tokens, T_lfr);
@@ -1057,56 +1097,104 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
         return "";
     }
 
-    // 4. Decoder graph
-    ctx0 = ggml_init(ip);
-    gf = ggml_new_graph_custom(ctx0, 32768, false);
+    // 4. Decoder graph, cached by the exact pair of shapes it embeds.
+    pf_stage_cache& dc = ctx->dec_cache;
+    const bool dec_cacheable = (stage == nullptr);
+    const bool dec_hit = dec_cacheable && dc.gf && dc.k0 == T_lfr && dc.k1 == N_tokens;
+    ggml_tensor* dec_inp = nullptr;
+    ggml_tensor* enc_tensor = nullptr;
+    if (dec_hit) {
+        ++dc.hits;
+        gf = dc.gf;
+        dec_inp = ggml_graph_get_tensor(gf, "acoustic_embeds");
+        enc_tensor = ggml_graph_get_tensor(gf, "enc_for_decoder");
+    } else {
+        ++dc.misses;
+        if (dc.ctx) {
+            ggml_free(dc.ctx);
+            dc.ctx = nullptr;
+            dc.gf = nullptr;
+        }
+        if (dec_cacheable) {
+            if (dc.meta.empty())
+                dc.meta.resize(meta_sz);
+            ggml_init_params cache_ip = {dc.meta.size(), dc.meta.data(), true};
+            ctx0 = ggml_init(cache_ip);
+        } else {
+            ggml_init_params ip2 = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
+            ctx0 = ggml_init(ip2);
+        }
+        gf = ggml_new_graph_custom(ctx0, 32768, false);
 
-    // Decoder inputs
-    ggml_tensor* dec_inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D, N_tokens);
-    ggml_set_name(dec_inp, "acoustic_embeds");
-    ggml_set_input(dec_inp);
+        dec_inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D, N_tokens);
+        ggml_set_name(dec_inp, "acoustic_embeds");
+        ggml_set_input(dec_inp);
 
-    ggml_tensor* enc_tensor = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D, T_lfr);
-    ggml_set_name(enc_tensor, "enc_for_decoder");
-    ggml_set_input(enc_tensor);
+        enc_tensor = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D, T_lfr);
+        ggml_set_name(enc_tensor, "enc_for_decoder");
+        ggml_set_input(enc_tensor);
+    }
 
-    cur = dec_inp;
     const int n_heads = (int)hp.n_heads;
     const int head_dim = D / n_heads;
 
-    for (uint32_t i = 0; i < hp.n_dec_blocks; i++) {
-        cur = build_decoder_block(ctx0, cur, enc_tensor, N_tokens, T_lfr, ctx->model.dec[i], D, n_heads, head_dim,
-                                  hp.ln_eps, ctx->flash_attn);
+    if (!dec_hit) {
+        cur = dec_inp;
+        for (uint32_t i = 0; i < hp.n_dec_blocks; i++) {
+            cur = build_decoder_block(ctx0, cur, enc_tensor, N_tokens, T_lfr, ctx->model.dec[i], D, n_heads, head_dim,
+                                      hp.ln_eps, ctx->flash_attn);
+            if (stage) {
+                char nm[64];
+                std::snprintf(nm, sizeof(nm), "decoder_layer_%u", i);
+                ggml_set_name(cur, nm);
+                ggml_set_output(cur);
+            }
+        }
+
+        // Post block
+        if (ctx->model.dec_post.norm1_w) {
+            cur = build_decoder_post(ctx0, cur, ctx->model.dec_post, hp.ln_eps);
+        }
+
+        // after_norm → output_layer
+        cur = ggml_norm_affine(ctx0, cur, ctx->model.dec_after_norm_w, ctx->model.dec_after_norm_b, hp.ln_eps);
         if (stage) {
-            char nm[64];
-            std::snprintf(nm, sizeof(nm), "decoder_layer_%u", i);
-            ggml_set_name(cur, nm);
+            ggml_set_name(cur, "decoder_output");
             ggml_set_output(cur);
         }
+        cur = mm_bias(ctx0, ctx->model.dec_output_w, cur, ctx->model.dec_output_b); // (vocab, N)
+        ggml_set_name(cur, "logits");
+        ggml_build_forward_expand(gf, cur);
+        _lap.mark("dec graph built");
+    } else {
+        _lap.mark("dec graph cached");
     }
-
-    // Post block
-    if (ctx->model.dec_post.norm1_w) {
-        cur = build_decoder_post(ctx0, cur, ctx->model.dec_post, hp.ln_eps);
-    }
-
-    // after_norm → output_layer
-    cur = ggml_norm_affine(ctx0, cur, ctx->model.dec_after_norm_w, ctx->model.dec_after_norm_b, hp.ln_eps);
-    if (stage) {
-        ggml_set_name(cur, "decoder_output");
-        ggml_set_output(cur);
-    }
-    cur = mm_bias(ctx0, ctx->model.dec_output_w, cur, ctx->model.dec_output_b); // (vocab, N)
-    ggml_set_name(cur, "logits");
-    ggml_build_forward_expand(gf, cur);
-    _lap.mark("dec graph built");
 
     // Allocate and run decoder
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
-        fprintf(stderr, "paraformer: sched alloc decoder graph failed\n");
-        ggml_free(ctx0);
+    if (!paraformer_ensure_sched(ctx, dc)) {
+        if (ctx0)
+            ggml_free(ctx0);
         return "";
+    }
+    if (!dec_hit) {
+        ggml_backend_sched_reset(dc.sched);
+        if (!ggml_backend_sched_alloc_graph(dc.sched, gf)) {
+            fprintf(stderr, "paraformer: sched alloc decoder graph failed\n");
+            if (dec_cacheable) {
+                dc.ctx = nullptr;
+                dc.gf = nullptr;
+            }
+            if (ctx0)
+                ggml_free(ctx0);
+            return "";
+        }
+        if (dec_cacheable) {
+            dc.ctx = ctx0;
+            dc.gf = gf;
+            dc.k0 = T_lfr;
+            dc.k1 = N_tokens;
+            ctx0 = nullptr;
+        }
     }
     _lap.mark("dec sched alloc");
 
@@ -1117,7 +1205,7 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     ggml_backend_tensor_set(enc_tensor, enc_out.data(), 0, enc_out.size() * sizeof(float));
     {
         paraformer_bench_stage _b("decoder");
-        if (core_sched_prof::compute(ctx->sched, gf, "paraformer") != GGML_STATUS_SUCCESS) {
+        if (core_sched_prof::compute(dc.sched, gf, "paraformer") != GGML_STATUS_SUCCESS) {
             fprintf(stderr, "paraformer: decoder graph compute failed\n");
             ggml_free(ctx0);
             return "";
@@ -1199,6 +1287,30 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
         if ((size_t)best < ctx->vocab.size()) {
             std::string tok = ctx->vocab[best];
             bool is_bpe_cont = (tok.size() >= 2 && tok.substr(tok.size() - 2) == "@@");
+            // §15: record time/confidence for the long-audio stitcher. Posterior
+            // is a numerically stable softmax over the (biased) row; cost is
+            // only paid when out_tokens is requested, so the plain path is
+            // unchanged.
+            if (out_tokens) {
+                float mx = -1e30f;
+                for (int v = 0; v < V; ++v) {
+                    const float val = row[v] + (apply_bias ? bias_of(v) : 0.0f);
+                    if (val > mx)
+                        mx = val;
+                }
+                double sum = 0.0;
+                for (int v = 0; v < V; ++v)
+                    sum += std::exp((double) (row[v] + (apply_bias ? bias_of(v) : 0.0f) - mx));
+                const float best_biased = row[best] + (apply_bias ? bias_of(best) : 0.0f);
+                const float posterior = (float) (std::exp((double) (best_biased - mx)) / sum);
+                const int frame = (n < (int) fire_frames_vec.size()) ? fire_frames_vec[(size_t) n] : 0;
+                pf_token rec;
+                rec.text = tok;
+                rec.t_ms = (int64_t) frame * (int64_t) hp.lfr_n * 10;
+                rec.posterior = posterior;
+                rec.local_index = n;
+                out_tokens->push_back(std::move(rec));
+            }
             // Insert space before Latin-script tokens that start a new word.
             // Paraformer-zh uses character-level Chinese + word-level English
             // with @@ BPE continuation markers. Space is needed between
@@ -1228,8 +1340,249 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
 }
 
 // ===========================================================================
+// §15 Long audio: window segmentation + token stitching
+//
+// A UDP is not one utterance. The decoder's CIF and cross-attention cost grow
+// with length and the encoder's global attention makes very long inputs
+// unreliable, so audio beyond PARAFORMER_LONG_MS is cut into overlapping
+// windows, each decoded independently, then stitched by global token time.
+//
+// Design follows design doc §2.1/§2.3 but only the parts that survive
+// measurement:
+//   * fixed window W with overlap O (default 8 s / 1 s), each window decoded
+//     with its own CIF fire positions;
+//   * tokens are placed on a global time axis; a token whose centre falls in a
+//     window's *core* (not its overlap margin) is kept; duplicates in the
+//     overlap are resolved by keeping the higher-posterior one.
+//   * BPE words are never split: a token ending in @@ drags its continuation
+//     with it, and merging is only allowed at word boundaries.
+//
+// Windows are decoded in the same process/context sequentially; parallelism is
+// out of scope here (the server already parallelises whole utterances).
+// ===========================================================================
+
+struct pf_long_cfg {
+    bool enabled = true;     // PARAFORMER_LONG=0 disables, restoring single-shot
+    int win_ms = 8000;       // window length
+    int overlap_ms = 1000;   // overlap between adjacent windows
+    int min_ms = 15000;      // only engage beyond this length
+};
+
+static pf_long_cfg paraformer_long_cfg() {
+    pf_long_cfg c;
+    if (const char* e = std::getenv("PARAFORMER_LONG"))
+        c.enabled = std::atoi(e) != 0;
+    if (const char* e = std::getenv("PARAFORMER_WIN_MS"))
+        c.win_ms = std::max(2000, std::atoi(e));
+    if (const char* e = std::getenv("PARAFORMER_OVERLAP_MS"))
+        c.overlap_ms = std::max(0, std::atoi(e));
+    if (const char* e = std::getenv("PARAFORMER_LONG_MIN_MS"))
+        c.min_ms = std::max(1000, std::atoi(e));
+    if (c.overlap_ms >= c.win_ms)
+        c.overlap_ms = c.win_ms / 4;
+    return c;
+}
+
+// Join token texts into a string, applying the same Latin-space rule as the
+// single-utterance path (space between two English words, none after @@).
+static void pf_append_token(std::string& out, const std::string& tok, bool prev_cont) {
+    if (tok.empty())
+        return;
+    bool is_cont = (tok.size() >= 2 && tok.substr(tok.size() - 2) == "@@");
+    if (!out.empty() && !prev_cont) {
+        const unsigned char fb = (unsigned char) tok[0];
+        const unsigned char lb = (unsigned char) out.back();
+        const bool cur_latin = (fb >= 'a' && fb <= 'z') || (fb >= 'A' && fb <= 'Z');
+        const bool prev_latin = (lb >= 'a' && lb <= 'z') || (lb >= 'A' && lb <= 'Z');
+        if (cur_latin && prev_latin)
+            out += ' ';
+    }
+    out += is_cont ? tok.substr(0, tok.size() - 2) : tok;
+}
+
+// Decode a long utterance window-by-window and stitch the transcripts. Returns
+// the joined text; `out_tokens` (optional) receives the merged token stream.
+//
+// Ownership is per *token*: a token belongs to the window whose core contains
+// it. The cores tile the timeline exactly — core_e of window i equals core_s of
+// window i+1 — so every token is kept by exactly one window and none is lost.
+//
+// A per-*word* rule looks tidier but is wrong, and measuring it proved it: a
+// word whose first token sits just inside core_e while its tail spills past it
+// is rejected as "still open, the next window owns it", yet the next window's
+// core starts at core_e, so nobody owns it and the word vanishes (19.8 s English
+// clip: `ro@@ of` -> dropped, `on` -> dropped, "sun roof a little" came out
+// "sun of the little", 106 -> 103 tokens).
+//
+// BPE words cut at a boundary survive anyway: if window i keeps `se@@` and
+// window i+1 keeps `at`, the plain @@ join below reassembles `seat`. The two
+// halves may come from different windows and disagree (`seed` vs `seat`), which
+// is the documented cost of context windows, not a stitch bug.
+static std::string paraformer_transcribe_long(paraformer_context* ctx, const float* pcm, int n_samples,
+                                             const pf_long_cfg& cfg, std::vector<pf_token>* out_tokens) {
+    const int sr = 16000;
+    const int64_t total_ms = (int64_t) n_samples * 1000 / sr;
+    const int64_t win = cfg.win_ms, ov = cfg.overlap_ms;
+    const int64_t step = win - ov;
+    if (win <= 0 || step <= 0 || total_ms <= 0)
+        return {};
+
+    // Window plan: [start, end) in ms. Each window is decoded whole; its core
+    // is [start + ov/2, end - ov/2] except at the utterance edges, so overlap
+    // tokens are only kept from one side.
+    struct Win { int64_t s, e, core_s, core_e; };
+    std::vector<Win> wins;
+    for (int64_t s = 0; s < total_ms; s += step) {
+        int64_t e = std::min(total_ms, s + win);
+        Win w;
+        w.s = s;
+        w.e = e;
+        w.core_s = (s == 0) ? 0 : s + ov / 2;
+        w.core_e = (e >= total_ms) ? total_ms : e - ov / 2;
+        wins.push_back(w);
+        if (e >= total_ms)
+            break;
+    }
+
+    // Decode every window, offset its tokens into global time, keep those in
+    // the window's core.
+    std::vector<pf_token> merged;
+    std::vector<size_t> seams; // merged index where each window's block starts
+    for (size_t wi = 0; wi < wins.size(); ++wi) {
+        const Win& w = wins[wi];
+        const int off = (int) ((int64_t) w.s * sr / 1000);
+        const int len = (int) (((int64_t) w.e - w.s) * sr / 1000);
+        if (off < 0 || len <= 0 || off + len > n_samples)
+            continue;
+        std::vector<pf_token> toks;
+        paraformer_transcribe_impl(ctx, pcm + off, len, nullptr, nullptr, nullptr, &toks);
+        seams.push_back(merged.size());
+        // PF_DUMP_WINDOWS=1 prints each window's own hypothesis, so a bad
+        // stitch can be told apart from a bad window decode. Must run before
+        // the keep loop: that loop moves tokens out and leaves the retained
+        // ones empty in `toks`.
+        if (const char* dump = std::getenv("PF_DUMP_WINDOWS")) {
+            if (std::atoi(dump) != 0) {
+                std::string all;
+                bool pc = false;
+                for (const auto& t : toks) {
+                    pf_append_token(all, t.text, pc);
+                    pc = t.text.size() >= 2 && t.text.substr(t.text.size() - 2) == "@@";
+                }
+                fprintf(stderr, "paraformer:   win%zu raw (%zu tok): %s\n", wi + 1, toks.size(), all.c_str());
+            }
+        }
+        size_t kept = 0;
+        for (auto& t : toks) {
+            t.t_ms += w.s;
+            if (t.t_ms < w.core_s || t.t_ms >= w.core_e)
+                continue;
+            merged.push_back(std::move(t));
+            kept++;
+        }
+        if (ctx->verbosity >= 1)
+            fprintf(stderr, "paraformer: long window %zu/%zu [%lld,%lld) core [%lld,%lld) -> %zu tokens, %zu kept\n",
+                    wi + 1, wins.size(), (long long) w.s, (long long) w.e, (long long) w.core_s,
+                    (long long) w.core_e, (long long) toks.size(), kept);
+    }
+
+    // Cores tile the timeline exactly, so a token is normally owned by exactly
+    // one window. The remaining seam risk is the same speech decoded twice with
+    // fire times straddling the boundary: if both copies carry the same text
+    // within 120 ms, keep the more confident one.
+    //
+    // Two guards keep this from damaging real output:
+    //   * only standalone words are eligible — a token ending in @@ or one that
+    //     follows a @@ belongs to a BPE word, and deleting half of it is worse
+    //     than the duplicate;
+    //   * only the first couple of tokens of each window are compared against
+    //     the last couple of the previous one, so genuine repeats inside a
+    //     window ("谢谢", "看看") are never touched.
+    if (merged.size() > 1 && seams.size() > 1) {
+        const auto is_cont = [](const std::string& t) {
+            return t.size() >= 2 && t.compare(t.size() - 2, 2, "@@") == 0;
+        };
+        const auto is_standalone = [&](size_t i) {
+            if (is_cont(merged[i].text))
+                return false;
+            return i == 0 || !is_cont(merged[i - 1].text);
+        };
+        std::vector<char> drop(merged.size(), 0);
+        for (size_t si = 1; si < seams.size(); ++si) {
+            const size_t base = seams[si];
+            if (base == 0 || base >= merged.size())
+                continue;
+            for (size_t j = base; j < std::min(merged.size(), base + 2); ++j) {
+                if (drop[j] || !is_standalone(j))
+                    continue;
+                const size_t lo = base > 2 ? base - 2 : 0;
+                for (size_t i = base; i-- > lo;) {
+                    if (drop[i] || !is_standalone(i) || merged[i].text != merged[j].text)
+                        continue;
+                    if (std::llabs((long long) (merged[j].t_ms - merged[i].t_ms)) >= 120)
+                        continue;
+                    if (merged[j].posterior > merged[i].posterior)
+                        drop[i] = 1;
+                    else
+                        drop[j] = 1;
+                    break;
+                }
+            }
+        }
+        size_t removed = 0;
+        std::vector<pf_token> survivors;
+        survivors.reserve(merged.size());
+        for (size_t i = 0; i < merged.size(); ++i) {
+            if (drop[i]) {
+                removed++;
+                continue;
+            }
+            survivors.push_back(std::move(merged[i]));
+        }
+        merged.swap(survivors);
+        if (removed && ctx->verbosity >= 1)
+            fprintf(stderr, "paraformer: stitch dropped %zu duplicate token(s) at seams\n", removed);
+    }
+
+    // Sort by global time so the stitch order matches speech order.
+    std::stable_sort(merged.begin(), merged.end(), [](const pf_token& a, const pf_token& b) { return a.t_ms < b.t_ms; });
+    std::vector<pf_token>& keep = merged;
+
+    std::string out;
+    bool prev_cont = false;
+    for (const auto& t : keep) {
+        pf_append_token(out, t.text, prev_cont);
+        prev_cont = (t.text.size() >= 2 && t.text.substr(t.text.size() - 2) == "@@");
+    }
+    if (out_tokens)
+        *out_tokens = std::move(keep);
+    return out;
+}
+
+// ===========================================================================
 // Public API
 // ===========================================================================
+
+// Single entry point for every caller: pick single-shot or windowed decoding
+// from the clip length. Short clips take exactly the old path, so their
+// transcripts stay bit-identical; PARAFORMER_LONG=0 forces single-shot
+// everywhere.
+static bool paraformer_use_long(const pf_long_cfg& cfg, int n_samples) {
+    if (!cfg.enabled || n_samples <= 0)
+        return false;
+    const int64_t total_ms = (int64_t) n_samples * 1000 / 16000;
+    return total_ms >= cfg.min_ms;
+}
+
+static std::string paraformer_run(paraformer_context* ctx, const float* pcm, int n_samples,
+                                  std::vector<pf_token>* out_tokens) {
+    const pf_long_cfg lc = paraformer_long_cfg();
+    if (paraformer_use_long(lc, n_samples))
+        return paraformer_transcribe_long(ctx, pcm, n_samples, lc, out_tokens);
+    if (out_tokens)
+        out_tokens->clear();
+    return paraformer_transcribe_impl(ctx, pcm, n_samples);
+}
 
 paraformer_context_params paraformer_context_default_params() {
     return {4, 0, true, true};
@@ -1422,13 +1775,26 @@ paraformer_context* paraformer_init_from_file(const char* path, paraformer_conte
     return ctx;
 }
 
+void paraformer_cache_stats(const paraformer_context* ctx, unsigned long long* enc_hit, unsigned long long* enc_miss,
+                            unsigned long long* dec_hit, unsigned long long* dec_miss) {
+    if (!ctx) {
+        return;
+    }
+    if (enc_hit) *enc_hit = ctx->enc_cache.hits;
+    if (enc_miss) *enc_miss = ctx->enc_cache.misses;
+    if (dec_hit) *dec_hit = ctx->dec_cache.hits;
+    if (dec_miss) *dec_miss = ctx->dec_cache.misses;
+}
+
 void paraformer_free(paraformer_context* ctx) {
     if (!ctx)
         return;
-    if (ctx->cached_enc_ctx)
-        ggml_free(ctx->cached_enc_ctx);
-    if (ctx->sched)
-        ggml_backend_sched_free(ctx->sched);
+    for (pf_stage_cache* c : {&ctx->enc_cache, &ctx->dec_cache}) {
+        if (c->ctx)
+            ggml_free(c->ctx);
+        if (c->sched)
+            ggml_backend_sched_free(c->sched);
+    }
     core_gguf::free_weights(ctx->wl);
     if (ctx->backend && ctx->backend != ctx->backend_cpu)
         ggml_backend_free(ctx->backend);
@@ -1448,7 +1814,7 @@ void paraformer_warmup(paraformer_context* ctx, const float* samples, int n_samp
 char* paraformer_transcribe(paraformer_context* ctx, const float* samples, int n_samples) {
     if (!ctx || !samples || n_samples <= 0)
         return nullptr;
-    std::string s = paraformer_transcribe_impl(ctx, samples, n_samples);
+    std::string s = paraformer_run(ctx, samples, n_samples, nullptr);
     char* buf = (char*)std::malloc(s.size() + 1);
     if (buf) {
         std::memcpy(buf, s.data(), s.size());
@@ -1460,8 +1826,17 @@ char* paraformer_transcribe(paraformer_context* ctx, const float* samples, int n
 paraformer_result* paraformer_transcribe_with_timestamps(paraformer_context* ctx, const float* samples, int n_samples) {
     if (!ctx || !samples || n_samples <= 0)
         return nullptr;
+    // Long audio returns stitched token times directly (window offsets already
+    // applied); short audio keeps the CIF fire-frame path untouched.
+    std::vector<pf_token> tokens;
     std::vector<int> fire_frames;
-    std::string s = paraformer_transcribe_impl(ctx, samples, n_samples, nullptr, nullptr, &fire_frames);
+    const pf_long_cfg lc = paraformer_long_cfg();
+    std::string s;
+    if (paraformer_use_long(lc, n_samples)) {
+        s = paraformer_transcribe_long(ctx, samples, n_samples, lc, &tokens);
+    } else {
+        s = paraformer_transcribe_impl(ctx, samples, n_samples, nullptr, nullptr, &fire_frames);
+    }
 
     auto* r = (paraformer_result*)std::malloc(sizeof(paraformer_result));
     if (!r)
@@ -1473,16 +1848,28 @@ paraformer_result* paraformer_transcribe_with_timestamps(paraformer_context* ctx
     }
 
     // Convert fire frame indices to centiseconds.
-    // LFR (low frame rate) subsampling: each LFR frame covers `lfr_m` raw
-    // mel frames. Raw mel frames are 10ms apart (hop=160 at 16kHz).
-    // So frame t in the encoder corresponds to t * lfr_m * 10ms.
-    const int lfr_m = (int)ctx->model.hp.lfr_m;
-    const int ms_per_frame = lfr_m * 10;
-    r->n_chars = (int)fire_frames.size();
-    r->char_times_cs = (int32_t*)std::malloc(fire_frames.size() * sizeof(int32_t));
+    // CIF fires on LFR (low frame rate) frames. core_lfr::stack steps by
+    // `lfr_n` raw mel frames (T_lfr = ceil(T/lfr_n)), and raw mel frames are
+    // 10 ms apart — so one LFR frame is lfr_n*10 = 60 ms, NOT lfr_m*10 = 70 ms.
+    // Using lfr_m over-counted every frame by 10 ms (win_zh02: 26 LFR frames
+    // predicted 1750 ms for 1543 ms of audio, ratio 1.13); the 60 ms base gives
+    // 26*60 = 1560 ms, matching the clip. This matters most for stitching,
+    // where a per-frame error accumulates across windows.
+    const int lfr_n = (int)ctx->model.hp.lfr_n;
+    const int ms_per_frame = lfr_n * 10;
+    // Long path: token times are already absolute ms (window offset applied),
+    // and one entry per emitted token — the same granularity as fire frames for
+    // the single-shot path, so callers see one timestamp per character either way.
+    r->n_chars = (int)(tokens.empty() ? fire_frames.size() : tokens.size());
+    r->char_times_cs = (int32_t*)std::malloc((size_t)r->n_chars * sizeof(int32_t));
     if (r->char_times_cs) {
-        for (int i = 0; i < r->n_chars; i++)
-            r->char_times_cs[i] = fire_frames[i] * ms_per_frame / 10; // ms → cs
+        if (!tokens.empty()) {
+            for (int i = 0; i < r->n_chars; i++)
+                r->char_times_cs[i] = (int32_t)(tokens[(size_t) i].t_ms / 10); // ms → cs
+        } else {
+            for (int i = 0; i < r->n_chars; i++)
+                r->char_times_cs[i] = fire_frames[i] * ms_per_frame / 10; // ms → cs
+        }
     }
     return r;
 }
@@ -1503,7 +1890,7 @@ float* paraformer_extract_stage(paraformer_context* ctx, const float* samples, i
         return nullptr;
 
     if (std::strcmp(stage_name, "generated_text") == 0) {
-        std::string txt = paraformer_transcribe_impl(ctx, samples, n_samples);
+        std::string txt = paraformer_run(ctx, samples, n_samples, nullptr);
         char* buf = (char*)std::malloc(txt.size() + 1);
         if (!buf)
             return nullptr;

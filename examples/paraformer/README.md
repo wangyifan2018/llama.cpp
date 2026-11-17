@@ -76,6 +76,13 @@ See design doc §13–14.
 - x-asr reference on the same fixture (on-arm): command 75.0%, CER 7.23%.
 - Device SM6650, 32 clips, warm-run excluded: CPU p50/p95 357/496 ms, HTP
   290/380 ms; transcripts are identical between CPU and HTP.
+- **Graph and arena reuse (§16)**: encoder and decoder graphs are now cached per
+  exact shape with one scheduler each, and the 256 MB per-call arena zeroing is
+  gone. Device HTP: 32-clip p50/p95/p99 280/367/373 ms, 32/32 transcripts
+  unchanged; a repeated same-length request drops 306 to 280 ms; peak RSS falls
+  from about 700 MB to 252 MB per process, which is what makes a third engine or
+  a punctuation model affordable. Cache hit rate on the varied-length field is
+  only 3/32, so the average gain is 3-4%.
 - **Warmup (M1)**: the HTP first call pays ~1 s in `ggml_backend_sched_alloc_graph`
   (encoder 733 ms + decoder 221 ms; first DSP buffer allocation + graph dispatch).
   `--warmup FILE` runs one full inference off the measured path and cuts the first

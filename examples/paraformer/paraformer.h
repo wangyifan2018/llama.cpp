@@ -23,6 +23,10 @@ extern "C" {
 #endif
 
 struct paraformer_context;
+
+// Graph-cache counters: encoder hits/misses, decoder hits/misses.
+void paraformer_cache_stats(const paraformer_context* ctx, unsigned long long* enc_hit, unsigned long long* enc_miss,
+                            unsigned long long* dec_hit, unsigned long long* dec_miss);
 struct paraformer_weights;
 
 struct paraformer_context_params {

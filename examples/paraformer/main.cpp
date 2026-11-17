@@ -58,6 +58,7 @@ int main(int argc, char ** argv) {
     paraformer_context_params params = paraformer_context_default_params();
     params.use_gpu = false;
     params.flash_attn = false;
+    params.verbosity = 0;   // per-clip results go to stdout; stderr stays quiet
     bool timestamps = false;
     const char * warmup_file = nullptr;
     std::vector<const char *> waves;
@@ -73,6 +74,8 @@ int main(int argc, char ** argv) {
             timestamps = true;
         } else if (std::strcmp(argv[i], "--quiet") == 0) {
             params.verbosity = 0;
+        } else if (std::strcmp(argv[i], "--verbose") == 0) {
+            params.verbosity = 1;
         } else if (std::strcmp(argv[i], "--hotwords") == 0 && i + 1 < argc) {
             setenv("PF_HOTWORDS", argv[++i], 1);
         } else if (std::strcmp(argv[i], "--dump-logits") == 0 && i + 1 < argc) {
@@ -136,8 +139,20 @@ int main(int argc, char ** argv) {
                audio_ms > 0 ? wall_ms / audio_ms : 0.0);
         if (timestamps && result) {
             printf("\tn_chars=%d", result->n_chars);
+            // §15: dump raw per-char centiseconds so the LFR time base can be
+            // checked against audio length instead of assumed.
+            if (result->n_chars > 0) {
+                printf("\tts_cs=");
+                for (int i = 0; i < result->n_chars; ++i)
+                    printf("%s%d", i ? "," : "", result->char_times_cs[i]);
+            }
         }
         printf("\t%s\n", text.get());
+    }
+    if (getenv("PF_CACHE_STATS")) {
+        unsigned long long eh = 0, em = 0, dh = 0, dm = 0;
+        paraformer_cache_stats(model.get(), &eh, &em, &dh, &dm);
+        fprintf(stderr, "pf-cache: enc hit=%llu miss=%llu dec hit=%llu miss=%llu\n", eh, em, dh, dm);
     }
     return 0;
 }
