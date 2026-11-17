@@ -269,3 +269,36 @@ CONT（6%）这类搬运优化上限太低，不值得动图结构；把 FSMN co
 在本权重下，继续优化 encoder 的投入应转向服务化后测真实并发 P95、以及识别质量（标点/英文）。
 
 **工程交付**：`tools/profile_ops.py` 固化了 enc/dec 分段 + op 聚合方法，后续任何图改动都能复用同一口径。
+
+## 11. M3 实测：服务化与并发 P95（2026-11-17，SM6650 HTP）
+
+**目标**：把指标口径从 CLI 单进程对齐到产品需求（VAD 端点→最终转写 P95、最多四路并发）。
+
+**实现**：新增 `llama-paraformer-server`（`examples/paraformer/server.cpp`）。Paraformer 是全句一次性
+推理，无 append/commit 状态，线协议简化为单事务：`RECOGNIZE(op=0, payload=整段 float32) → FINAL(status=1,
+payload=UTF-8 文本)`，帧头仍用 `u32 op,u32 reserved,u32 bytes` / `u32 status,u32 bytes`，可复用 x-asr
+客户端的 framing。**单 context + mutex 串行**：`paraformer_transcribe_impl` 会写共享的 sched 与 encoder
+图缓存，多实例共用一个 context 不安全；而每实例各加载 226 MB 权重在设备上内存不可行。启动时 `--warmup F32`
+在 accept 前预热一次（实测 1191 ms），把一次性 HTP 注册开销挪出请求路径。新工具
+`tools/bench_pf_service.py`：生成 warmup f32、N 路同时/错峰请求、报 P50/P95/P99 与转写一致性。
+
+**结果（每条音频 2.0–2.7 s，每格 N=8 轮，0 错误，转写逐条一致）**：
+
+| 场景 | p50 | p95 | p99 | 说明 |
+|---|---:|---:|---:|---|
+| 单路（warm） | 285 ms | 295 ms | 297 ms | 与 CLI 稳态 290 ms 一致，warmup 生效 |
+| 2 路同时到达 | 449 ms | 587 ms | 591 ms | ≈2× 单路（串行排队） |
+| 4 路同时到达 | 707 ms | **1126 ms** | 1128 ms | ≈4× 单路，串行 head-of-line |
+| 4 路错峰 300 ms | 295 ms | **317 ms** | 320 ms | 错峰 > 单条推理 285 ms，几乎不排队 |
+
+**结论**：
+- 单 worker 串行的吞吐上限就是 1/285 ms ≈ 3.5 段/s；四路同时到达时 P95 线性累加到 1.13 s，
+  达不到产品对四路并发的低尾延迟期望。这是架构限制，不是 HTP 算力问题（单路已到 kernel 天花板）。
+- **错峰是最有效的低成本缓解**：VAD 段天然错峰若 > 单条推理时长（车内多说话人通常不会精确同时断句），
+  P95 就回到单路水平（317 ms）。运维上可加一个小的入口抖动/排队整形避免同时 commit。
+- 转写在 1/2/4 路下逐条一致（4 条 wav 各 distinct=1），并发无状态串扰；warmup 后首请求无 1 s 尖峰。
+
+**复活条件 / 下一批**：若要压四路同时到达的 P95，唯一路径是**多 context 共享权重**（改 GGUF loader
+让多 context 复用同一份只读权重 tensor，各自持有 sched/图缓存/激活），再按 x-asr 的 2+2 思路做
+HTP/CPU 双引擎路由；那会重新引入内存压力（x-asr 已测得 CPU 3/4 线程被内存卡死）。在此之前，
+先用错峰整形 + 识别质量（标点/英文）作为投入方向。

@@ -56,6 +56,25 @@ printed by the CLI).
 - Paraformer fixes `Set the driver temperature...` in one clip, but still emits
   `said` in two English seat/light clips; English remains the open risk.
 
+## Server
+
+`llama-paraformer-server` is a whole-utterance ASR daemon. Framing matches the
+x-asr client (`<III` request header, `<II` reply header); `RECOGNIZE` (op 0)
+carries one float32 16 kHz segment and the reply is `FINAL` (status 1) with the
+UTF-8 transcript. Inference is serialized over one shared context, so warm up
+before accepting traffic:
+
+```sh
+python3 tools/bench_pf_service.py --wavs WAV --emit-warmup warmup.f32
+llama-paraformer-server MODEL.gguf HTP0:0 --port 8876 --warmup warmup.f32 --threads 2
+python3 tools/bench_pf_service.py --port 8876 --wavs WAV1,WAV2,WAV3,WAV4 --lanes 1,2,4 --reps 8
+```
+
+SM6650: single lane p95 295 ms; four simultaneous lanes p95 1126 ms (single
+worker serializes), but four lanes staggered 300 ms p95 317 ms. See design doc
+§11. To lower the simultaneous-arrival tail requires multi-context weight
+sharing plus HTP/CPU routing — not done yet.
+
 ## Profiling
 
 Capture a per-op HTP profile (one warmup + one measured utterance) and
