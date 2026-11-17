@@ -96,6 +96,17 @@ python3 examples/paraformer/tools/ws_client.py --url ws://127.0.0.1:8899/v1/real
 - 服务端实测：`GET /` 返回 200（12 KB HTML），`ws_client` 在同一实例上跑通
   （设备上 endpoint→final 328 ms，queue 1 ms，infer 305 ms）。
 
+## 4.1 生产化补充（2026-11-18）
+
+- **服务端 VAD（可选，默认关）**：silero + sherpa，仅当 commit 超过 `--vad-split-s`（18 s）
+  才可能拆分，且按 `--vad-piece-s`（15 s）合并语音段；正常短句原样送 ASR，对"客户端已有 VAD、
+  尾部静音很少"的场景安全。纯静音返回空文本（`X-Empty: silence`），不再输出幻觉音节。
+  真机：2.3 s 单段 305 ms；23.1 s → 2 段、2456 ms；纯静音 0 段、空文本。
+- **调用方文档**：`docs/backend/snapdragon/api-reference.md`（端点、字段、响应头、错误码、
+  门控与 VAD 开关、示例、集成要点）。
+- **门控默认状态**：二进制以 `-DXASR_SPEAKER=ON` 构建时具备能力，但**运行时默认关闭**，
+  必须同时给 `--speaker-model` 与 `--enroll-dir` 才启用；`/health` 的 `speaker_gate` 为真实状态。
+
 ## 5. 关键脚本
 
 | 脚本 | 用途 |

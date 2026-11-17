@@ -138,6 +138,13 @@ Q4_K halves resident memory (252 to 146 MB) and is 17 percent slower on both HTP
 and CPU, with transcripts inside quantization noise, so Q8_0 stays the default.
 Q5_K/Q6_K use the same tool. See design doc section 24.
 
+## API
+
+Callers should read [docs/backend/snapdragon/api-reference.md](../../docs/backend/snapdragon/api-reference.md):
+endpoints, request fields, response formats, headers (`X-Queue-Ms`, `X-Infer-Ms`,
+`X-Language`, `X-Vad-Pieces`, `X-Speaker-Score`), error codes, the optional
+speaker gate and server VAD, and integration notes.
+
 ## OpenAI-compatible API
 
 `llama-paraformer-api` serves the engine over HTTP with the OpenAI audio shape.
