@@ -289,8 +289,8 @@ int main(int argc, char** argv) {
     }
     if (n_engines < 1)
         n_engines = 1;
-    if (n_engines > 2)
-        n_engines = 2;
+    if (n_engines > 4)
+        n_engines = 4; // one device engine plus up to three CPU engines
 
     // The HTP backend is selected via a device env read by crispasr_init_gpu_backend.
     if (device_set && std::strcmp(device, "CPU") != 0) {
@@ -335,7 +335,7 @@ int main(int argc, char** argv) {
     };
     std::vector<EngineSpec> specs;
     specs.push_back({device_set && std::strcmp(device, "CPU") != 0, device});
-    if (n_engines >= 2)
+    for (int i = 1; i < n_engines; ++i)
         specs.push_back({false, "CPU"});
 
     for (size_t i = 0; i < specs.size(); ++i) {
