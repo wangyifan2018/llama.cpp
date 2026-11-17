@@ -368,17 +368,42 @@ static engine * reserve_resident(const std::vector<engine *> & engines) {
     return best;
 }
 
-// Fallback rule: the engine with the fewest queued frames that still has a slot.
+// Device lanes serialise into batch steps, so the cheap unit is the pair: the
+// first lane costs a whole step, the second shares that step (61.6 ms per lane
+// against 74.5 alone), and a third lane starts another step. A CPU lane runs in
+// its own slot on its own threads, so a second CPU lane is parallel, not queued.
+// Rank a placement by what it costs: completing an odd lane on the device is
+// cheapest, an idle engine is next, and starting a new device step is last.
+static int route_rank(const engine * eng, int live) {
+    if (eng->max_batch > 1 && (live % 2) == 1) {
+        return 0;
+    }
+    return live == 0 ? 1 : 2;
+}
+
+// Fallback rule: rank first, then occupancy, then queue depth. Ranking by queue
+// alone made every simultaneous arrival see an empty queue on an engine that was
+// already running a request, because its worker drains the queue before the next
+// OPEN is routed, so four arrivals piled onto the device engine and paid three
+// steps where two pairs would have done.
 static engine * reserve_least_loaded(const std::vector<engine *> & engines, const char * mode) {
     engine * best = nullptr;
+    int best_rank = 0;
+    int best_live = 0;
     size_t best_pending = 0;
     for (auto * eng : engines) {
         std::lock_guard<std::mutex> lock(eng->mutex);
         if (eng->live >= eng->max_sessions) {
             continue;
         }
-        if (!best || eng->queue.size() < best_pending) {
+        const int rank = route_rank(eng, eng->live);
+        const bool better = !best || rank < best_rank ||
+                            (rank == best_rank && (eng->live < best_live ||
+                             (eng->live == best_live && eng->queue.size() < best_pending)));
+        if (better) {
             best = eng;
+            best_rank = rank;
+            best_live = eng->live;
             best_pending = eng->queue.size();
         }
     }
