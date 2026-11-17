@@ -158,6 +158,14 @@ struct paraformer_context {
     std::vector<std::string> vocab; // token strings
     std::vector<char> compute_meta;
 
+    // §13: NAR logit bias for confusable whole-word tokens. Loaded once from
+    // PF_HOTWORDS; empty by default, so the baseline is bit-identical. Each
+    // entry adds a fixed gain to one token id at every CIF position (NAR has
+    // no autoregressive prefix, so no head/prefix weighting is possible).
+    std::vector<float> hotword_bonus; // size == vocab_size, 0 where unbiased
+    int hotword_count = 0;
+    bool hotword_loaded = false;
+
     // §176s: cached encoder graph — reused when T_lfr matches.
     ggml_cgraph* cached_enc_gf = nullptr;
     ggml_context* cached_enc_ctx = nullptr;
@@ -188,6 +196,114 @@ struct paraformer_weights {
 static inline ggml_tensor* mm_bias(ggml_context* ctx0, ggml_tensor* W, ggml_tensor* x, ggml_tensor* b) {
     ggml_tensor* y = ggml_mul_mat(ctx0, W, x);
     return b ? ggml_add(ctx0, y, b) : y;
+}
+
+// §13: whole-word logit bias for confusable English function words.
+// PF_HOTWORDS points to a file with one "<gain> <token>" per line; '#' comments
+// and blank lines are ignored. Token strings must appear verbatim in the GGUF
+// vocab (set/said/two/too/and/in are single tokens; seat/seed/footwell are BPE
+// fragments and are intentionally not biassable this way). Gain is clamped to
+// [0, 5]. Bias is applied to every CIF position; NAR decoding has no
+// autoregressive prefix, so x-asr's head/prefix weighting does not apply.
+// Empty/invalid config leaves hotword_bonus empty => bit-identical baseline.
+static void paraformer_load_hotwords(paraformer_context* ctx) {
+    if (!ctx || ctx->hotword_loaded || ctx->vocab.empty())
+        return;
+    ctx->hotword_loaded = true;
+    const char* path = std::getenv("PF_HOTWORDS");
+    if (!path || !path[0])
+        return;
+
+    std::FILE* f = std::fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "paraformer: cannot open PF_HOTWORDS '%s'\n", path);
+        return;
+    }
+    ctx->hotword_bonus.assign(ctx->vocab.size(), 0.0f);
+
+    auto find_token = [&](const std::string& s) -> int {
+        for (size_t i = 0; i < ctx->vocab.size(); ++i)
+            if (ctx->vocab[i] == s)
+                return (int) i;
+        return -1;
+    };
+
+    char line[512];
+    while (std::fgets(line, sizeof(line), f)) {
+        std::string text(line);
+        const size_t c = text.find('#');
+        if (c != std::string::npos)
+            text.resize(c);
+        float gain = 0.0f;
+        char tokbuf[256] = { 0 };
+        if (std::sscanf(text.c_str(), "%f %255s", &gain, tokbuf) != 2 || tokbuf[0] == '\0')
+            continue;
+        const std::string tok(tokbuf);
+        if (gain <= 0.0f || gain > 5.0f || !std::isfinite(gain)) {
+            fprintf(stderr, "paraformer: hotword gain out of range [0,5]: %s\n", text.c_str());
+            continue;
+        }
+        const int id = find_token(tok);
+        if (id < 0) {
+            fprintf(stderr, "paraformer: hotword token not in vocab: '%s'\n", tok.c_str());
+            continue;
+        }
+        ctx->hotword_bonus[(size_t) id] = std::max(ctx->hotword_bonus[(size_t) id], gain);
+        ++ctx->hotword_count;
+    }
+    std::fclose(f);
+    fprintf(stderr, "paraformer: loaded %d whole-word logit bias tokens from '%s'\n", ctx->hotword_count, path);
+}
+
+// Diagnostic: top-K logits (net of the applied bias) at one CIF position,
+// printed as offsets from the winner. Enabled by PF_DUMP_LOGITS=<positions>;
+// a value of 0 (default) prints nothing. This is how the real Set/said,
+// two/too gaps are measured before choosing a gain — x-asr learned the hard
+// way that a 0.9-logit cap cannot flip a 1.76–6.42 gap.
+static void paraformer_dump_logits(const paraformer_context* ctx, const float* row, int V, int pos, int K) {
+    int top[8] = { 0 };
+    K = std::min(K, 8);
+    for (int k = 0; k < K; ++k) {
+        for (int s = k + 1; s < K; ++s)
+            if (row[top[s]] > row[top[k]])
+                std::swap(top[k], top[s]);
+    }
+    for (int v = K; v < V; ++v) {
+        if (row[v] <= row[top[K - 1]])
+            continue;
+        int k = K - 1;
+        while (k > 0 && row[v] > row[top[k - 1]]) {
+            top[k] = top[k - 1];
+            --k;
+        }
+        top[k] = v;
+    }
+    fprintf(stderr, "PF_LOGIT pos=%d", pos);
+    for (int k = 0; k < K; ++k) {
+        const int id = top[k];
+        const char* tok = (id >= 0 && (size_t) id < ctx->vocab.size()) ? ctx->vocab[(size_t) id].c_str() : "?";
+        fprintf(stderr, " | %d \"%s\" %.2f", id, tok, row[id] - row[top[0]]);
+    }
+    // Watch mode: PF_WATCH_TOKENS="set,two,and" appends the exact gap of named
+    // tokens even when they are outside top-K. This measures the gap a bias
+    // must overcome without inflating K or guessing from noisy top-5 output.
+    const char* watch_env = std::getenv("PF_WATCH_TOKENS");
+    if (watch_env && watch_env[0]) {
+        std::string names(watch_env);
+        size_t start = 0;
+        while (start < names.size()) {
+            const size_t comma = names.find(',', start);
+            std::string name = names.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+            start = (comma == std::string::npos) ? names.size() : comma + 1;
+            for (size_t i = 0; i < ctx->vocab.size(); ++i) {
+                if (ctx->vocab[i] == name) {
+                    fprintf(stderr, " [watch %s %.2f]", name.c_str(), row[i] - row[top[0]]);
+                    break;
+                }
+            }
+        }
+    }
+    fprintf(stderr, "\n");
 }
 
 // ===========================================================================
@@ -658,6 +774,8 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     const auto& hp = ctx->model.hp;
     const int D = (int)hp.d_model;
     paraformer_bench_lap _lap;
+    // §13: load whole-word logit bias once (env PF_HOTWORDS); no-op by default.
+    paraformer_load_hotwords(ctx);
 
     // 1. Feature extraction
     int T_lfr = 0, D_lfr_actual = 0;
@@ -1004,16 +1122,36 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     std::vector<float> logits_data((size_t)V * N_tokens);
     ggml_backend_tensor_get(logits, logits_data.data(), 0, logits_data.size() * sizeof(float));
 
+    // §13: optional diagnostics — how many positions to dump top-K logits at.
+    const char* dump_env = std::getenv("PF_DUMP_LOGITS");
+    const int dump_n = dump_env ? std::atoi(dump_env) : 0;
+    const bool apply_bias = !ctx->hotword_bonus.empty();
+    std::vector<float> biased_row; // only allocated when dumping with bias on
+    if (dump_n > 0 && apply_bias)
+        biased_row.resize(V);
+
     std::string result;
     bool prev_was_bpe_cont = false; // true if previous token ended with @@
     for (int n = 0; n < N_tokens; n++) {
+        const float* row = logits_data.data() + (size_t)n * V;
         int best = 0;
         float best_val = -1e30f;
         for (int v = 0; v < V; v++) {
-            float val = logits_data[(size_t)n * V + v];
+            float val = row[v];
+            if (apply_bias)
+                val += ctx->hotword_bonus[(size_t) v];
             if (val > best_val) {
                 best_val = val;
                 best = v;
+            }
+        }
+        if (dump_n > 0 && n < dump_n) {
+            if (apply_bias) {
+                for (int v = 0; v < V; ++v)
+                    biased_row[(size_t) v] = row[v] + ctx->hotword_bonus[(size_t) v];
+                paraformer_dump_logits(ctx, biased_row.data(), V, n, 5);
+            } else {
+                paraformer_dump_logits(ctx, row, V, n, 5);
             }
         }
         // Skip special tokens: 0=<blank>, 1=<s>, 2=</s>, last=<unk>

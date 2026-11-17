@@ -367,3 +367,51 @@ RECOGNIZE 作为独立任务入队并等 `std::future`；两个 worker（各绑�
 - 未做的"物理单份权重 buffer 共享"有明确机制障碍（§12.1），复活条件：HTP 后端支持从 host buft
   直接执行权重算子（等价于去掉 tiled repack 依赖）或设备提供第二个 HTP session。
 - 剩余方向：第三引擎的可行性（受 CPU 内存限制）、英文识别质量、`Set`→`said` 专项。
+
+## 13. M5 实测：NAR logit 偏置修复英文整词混淆 + 票差诊断（2026-11-17，SM6650）
+
+### 13.1 先测票差，不照搬 x-asr 结论
+补标点后命令字段 68.8% 的残余失败里，8/10 是英文同音/近音词：`said/set`、`two/too`、
+`seat/seed`、`footwell/footwall`、`lights/likes`、`rear vents/reevent`。x-asr 上热词已判死
+（词首 gain 上限 0.9 logit，Set 票差 1.76–6.42），但那是自回归 joiner；Paraformer 是 NAR，
+每个 CIF 位置独立 argmax，整词偏置的可行性必须先量票差再定。
+
+先查词表（GGUF `tokenizer.tokens`，8404）：`set`(7704)/`said`(631)/`two`(4709)/`too`(415)/
+`and`(7776)/`in`(2479) 都是**整词单 token**，可直接偏置；`seat`/`seed`/`footwell`/`rear`
+是 BPE 片段，整词偏置无效——这决定了本批只能覆盖功能词，覆盖不了名词。
+
+新增诊断 `PF_DUMP_LOGITS=<N>` + `PF_WATCH_TOKENS=set,two,...`：打印前 N 个 CIF 位置的 top-5
+及指定 token 相对 argmax 的精确 gap（宿主 CPU，raw logits）：
+
+| 混淆 | clip / 位置 | raw gap | 判定 |
+|---|---|---:|---|
+| `said`→`set` | seat_en03 pos0 / light_en01 pos0 | 2.89 / 3.00 | 可翻，需 gain>3 |
+| `too`→`two` | seat_en01 pos14 | 0.96 | 易翻 |
+| `in`→`and` | hvac_en04 pos10 | 4.16 | **不采用**：gap 大，且 pos9 `on`→`in`(-7.54)/`and`(-8.05) 会被扰动，误触发风险 |
+
+### 13.2 落地：默认关闭的整词 logit 偏置
+- `PF_HOTWORDS=<file>`，每行 `<gain> <token>`；gain 限 [0,5]，token 必须在词表；解析后进
+  `ctx->hotword_bonus[vocab]`，argmax 时 `val = logits[n][v] + bonus[v]`（NAR 无前缀，故无
+  x-asr 的 head/prefix 权重）。CLI `--hotwords FILE` / `--dump-logits N` 为等价开关。
+- 默认 `hotword_bonus` 为空 → 基线**逐字节不变**（已对拍改动前 `run.tsv` 的 32 条转写完全一致）。
+- 最终配置只放两个安全词：`3.2 set` / `1.5 two`；`and` 按上表排除。
+
+### 13.3 结果（宿主 CPU + SM6650 HTP 一致）
+全 32 条仅 3 条转写改变，全是目标修复，零回退、零误触发：
+
+| 指标 | 基线 | 偏置 | 偏置+标点后处理 |
+|---|---:|---:|---:|
+| 命令字段 | 56.2% | 62.5% | **75.0%** |
+| en WER | 12.21% | 9.92% | 9.92% |
+| zh CER | 0.60% | 0.60% | 0.60% |
+
+- 偏置+标点 75.0% **追平 x-asr on-arm 基线 75.0%**（此前 Paraformer 68.8%）。Punctuation 是
+  车控流水线既有的标点层（Paraformer 无标点），本批不改它，只叠加验证。
+- HTP 真机 A/B（warmup 后，4 clip）：`said→set`×2、`too→two`×1 全部生效，正确 clip 不变。
+- 延迟：偏置是 argmax 内一次数组读，base/bias p50 253.9/252.9 ms（噪声内，零开销）。
+
+### 13.4 边界与遗留
+- 只能修整词功能词；`seat→seed` 等 BPE 名词混淆需另一条路（词典式 ITN / 重训），本批不碰。
+- gain 是全局作用于所有 CIF 位置的：`set`=3.2 之所以安全，是因为 `set`/`said` 在句中其他位置
+  的 gap 均 >8（见 13.1 全位置 dump），3.2 不足以误伤。换词表/模型必须重新量全位置 gap。
+- 未做：hardneg/controls 独立包对拍（本夹具 negative_clips=0），上线前应补；第三引擎可行性。

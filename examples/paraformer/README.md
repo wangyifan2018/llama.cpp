@@ -34,6 +34,31 @@ omit it for pure CPU. `--timestamps` also exposes CIF fire frames through
 `paraformer_transcribe_with_timestamps()` (currently only the char count is
 printed by the CLI).
 
+### Whole-word logit bias (off by default)
+
+`--hotwords FILE` applies a fixed logit gain to whole-word tokens in the NAR
+decoder's argmax. File format is `<gain> <token>` per line (`#` comments OK),
+gain in [0,5], token must exist verbatim in the GGUF vocab. Only single-token
+words are biassable (`set`, `said`, `two`, `too`, `and`, `in`); BPE-fragment
+words (`seat`, `footwell`) are not. Without the flag the baseline is bit-identical.
+
+```sh
+cat > hotwords.txt <<'EOF'
+3.2 set
+1.5 two
+EOF
+llama-paraformer MODEL.gguf WAV --hotwords hotwords.txt [--device HTP0:0]
+```
+
+`--dump-logits N` prints the top-5 logits (with gain applied) at the first N CIF
+positions; `PF_WATCH_TOKENS=a,b` (env) appends the exact gap of named tokens.
+Use these to measure the gap a bias must overcome before picking a gain — on
+this model `said→set` is 2.89–3.00 and `too→two` is 0.96, while `in→and` is 4.16
+and also disturbs a neighbouring position, so it is deliberately excluded.
+See design doc §13 for the full A/B: with `3.2 set / 1.5 two` plus the existing
+punctuation layer, the cabin command field goes 68.8% → **75.0%** (matching the
+x-asr baseline), en WER 12.21% → 9.92%, no regressions, zero false triggers.
+
 ## Status (2026-11-17, host CPU, Q8_0)
 
 - Weight: `cstr/paraformer-zh-GGUF`, Q8_0, sha256 `e73232ec…`.

@@ -49,7 +49,8 @@ static bool read_wav(const char * path, std::vector<float> & samples) {
 int main(int argc, char ** argv) {
     if (argc < 3) {
         fprintf(stderr,
-                "usage: %s MODEL.gguf WAV... [--device NAME] [--threads N] [--warmup FILE] [--timestamps] [--quiet]\n",
+                "usage: %s MODEL.gguf WAV... [--device NAME] [--threads N] [--warmup FILE] [--timestamps] [--quiet]\n"
+                "       [--hotwords FILE] [--dump-logits N]\n",
                 argv[0]);
         return 1;
     }
@@ -72,6 +73,10 @@ int main(int argc, char ** argv) {
             timestamps = true;
         } else if (std::strcmp(argv[i], "--quiet") == 0) {
             params.verbosity = 0;
+        } else if (std::strcmp(argv[i], "--hotwords") == 0 && i + 1 < argc) {
+            setenv("PF_HOTWORDS", argv[++i], 1);
+        } else if (std::strcmp(argv[i], "--dump-logits") == 0 && i + 1 < argc) {
+            setenv("PF_DUMP_LOGITS", argv[++i], 1);
         } else {
             waves.push_back(argv[i]);
         }

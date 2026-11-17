@@ -1,0 +1,7 @@
+# Paraformer NAR whole-word logit bias for cabin English commands.
+# Gains measured 2026-11-17 (SM6650 / host CPU) with PF_DUMP_LOGITS; see design
+# doc §13. Only single-token words; BPE-fragment nouns cannot be biased here.
+# said->set gap 2.89-3.00 ; too->two gap 0.96.
+# 'and' (gap 4.16, also perturbs a neighbouring 'on') is intentionally excluded.
+3.2 set
+1.5 two
