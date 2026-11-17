@@ -1,0 +1,120 @@
+#include "paraformer.h"
+
+#include "ggml-backend.h"
+
+#define MINIAUDIO_IMPLEMENTATION
+#define MA_NO_DEVICE_IO
+#define MA_NO_ENCODING
+#define MA_NO_RESOURCE_MANAGER
+#define MA_NO_NODE_GRAPH
+#define MA_NO_ENGINE
+#define MA_NO_GENERATION
+#define MA_API static
+#include "miniaudio/miniaudio.h"
+
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <vector>
+
+using pf_clock = std::chrono::steady_clock;
+
+int main(int argc, char ** argv) {
+    if (argc < 3) {
+        fprintf(stderr,
+                "usage: %s MODEL.gguf WAV... [--device NAME] [--threads N] [--timestamps] [--quiet]\n",
+                argv[0]);
+        return 1;
+    }
+
+    paraformer_context_params params = paraformer_context_default_params();
+    params.use_gpu = false;
+    params.flash_attn = false;
+    bool timestamps = false;
+    std::vector<const char *> waves;
+    for (int i = 2; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
+            setenv("PARAFORMER_DEVICE", argv[++i], 1);
+            setenv("CRISPASR_PARAFORMER_GPU", "1", 1);
+        } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+            params.n_threads = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--timestamps") == 0) {
+            timestamps = true;
+        } else if (std::strcmp(argv[i], "--quiet") == 0) {
+            params.verbosity = 0;
+        } else {
+            waves.push_back(argv[i]);
+        }
+    }
+    if (waves.empty()) {
+        return 1;
+    }
+
+    ggml_backend_load_all();
+    const auto init_begin = pf_clock::now();
+    std::unique_ptr<paraformer_context, decltype(&paraformer_free)> model(
+        paraformer_init_from_file(argv[1], params), paraformer_free);
+    if (!model) {
+        return 2;
+    }
+    const double init_ms =
+        std::chrono::duration<double, std::milli>(pf_clock::now() - init_begin).count();
+    fprintf(stderr, "paraformer: init %.1f ms\n", init_ms);
+
+    for (const char * wave : waves) {
+        ma_decoder decoder;
+        const auto config = ma_decoder_config_init(ma_format_f32, 1, 16000);
+        if (ma_decoder_init_file(wave, &config, &decoder) != MA_SUCCESS) {
+            fprintf(stderr, "paraformer: cannot decode %s\n", wave);
+            return 3;
+        }
+        const std::unique_ptr<ma_decoder, decltype(&ma_decoder_uninit)> audio(&decoder, ma_decoder_uninit);
+        std::vector<float> samples;
+        samples.reserve(16000 * 30);
+        for (;;) {
+            float block[4096];
+            ma_uint64 count = 0;
+            const auto res = ma_decoder_read_pcm_frames(audio.get(), block, 4096, &count);
+            if (res != MA_SUCCESS && res != MA_AT_END) {
+                fprintf(stderr, "paraformer: read error on %s\n", wave);
+                return 4;
+            }
+            samples.insert(samples.end(), block, block + count);
+            if (res == MA_AT_END || count == 0) {
+                break;
+            }
+        }
+        if (samples.empty()) {
+            fprintf(stderr, "paraformer: empty audio %s\n", wave);
+            return 5;
+        }
+
+        const auto begin = pf_clock::now();
+        std::unique_ptr<char, decltype(&std::free)> text(nullptr, &std::free);
+        std::unique_ptr<paraformer_result, decltype(&paraformer_result_free)> result(nullptr, paraformer_result_free);
+        if (timestamps) {
+            result.reset(paraformer_transcribe_with_timestamps(model.get(), samples.data(), (int) samples.size()));
+            if (result) {
+                text.reset(result->text);
+                result->text = nullptr;
+            }
+        } else {
+            text.reset(paraformer_transcribe(model.get(), samples.data(), (int) samples.size()));
+        }
+        const double wall_ms = std::chrono::duration<double, std::milli>(pf_clock::now() - begin).count();
+        if (!text) {
+            fprintf(stderr, "paraformer: inference failed on %s\n", wave);
+            return 6;
+        }
+        const double audio_ms = samples.size() * 1000.0 / 16000.0;
+        printf("%s\taudio_ms=%.3f\twall_ms=%.3f\trtf=%.4f", wave, audio_ms, wall_ms,
+               audio_ms > 0 ? wall_ms / audio_ms : 0.0);
+        if (timestamps && result) {
+            printf("\tn_chars=%d", result->n_chars);
+        }
+        printf("\t%s\n", text.get());
+    }
+    return 0;
+}
