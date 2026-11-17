@@ -110,6 +110,14 @@ python3 examples/paraformer/tools/ws_client.py --url ws://127.0.0.1:8899/v1/real
   p95 = **907 ms**（声纹 110 ms/段 × 4 路抢 CPU 核）。单请求无差异（282–344 ms）。
   生产建议：门控只在有 CPU 余量时启用，或后续改成"先出文本、再补 speaker 事件"。
 
+## 4.2 生产验收（2026-11-18）
+
+`python3 examples/paraformer/tools/smoke_production.py --port 8899 --wav <clip> --expect-gate --expect-vad`
+
+真机（SM6650，门控 + VAD 都开）**18 项全部 PASS**：health 能力位、models、json/text/verbose_json/srt、
+punctuate、响应头（语言/排队/推理/门控）、两类 400、`/asr/segment`、静音空文本、WS 单路（331 ms）与
+四路并发（max 808 ms、转写一致）、`/metrics`。这条命令就是"部署完能不能交付"的判定。
+
 ## 5. 关键脚本
 
 | 脚本 | 用途 |

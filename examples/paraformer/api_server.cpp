@@ -721,6 +721,12 @@ static float pcm_rms(const std::vector<float>& samples) {
     return (float) std::sqrt(acc / (double) samples.size());
 }
 
+// True when the segment carries no detected speech and almost no energy, in
+// which case the model would hallucinate syllables. Both request paths use it.
+static bool is_silent_commit(const std::vector<float>& samples) {
+    return g_vad_enabled && pcm_rms(samples) < g_silence_rms && vad_spans(samples).empty();
+}
+
 // Join piece transcripts: a space only between two ASCII ends/ starts.
 static void append_text(std::string& out, const std::string& add) {
     if (add.empty()) {
@@ -1042,7 +1048,7 @@ static void handle_transcription(const httplib::Request& req, httplib::Response&
         score_future = std::async(std::launch::async, [score_samples] { return spk_score(score_samples); });
     }
     size_t vad_pieces = 0;
-    if (g_vad_enabled && pcm_rms(samples) < g_silence_rms && vad_spans(samples).empty()) {
+    if (is_silent_commit(samples)) {
         res.set_header("X-Vad-Pieces", "0");
         res.set_header("X-Infer-Ms", "0");
         res.set_header("X-Queue-Ms", "0");
@@ -1147,6 +1153,17 @@ static void handle_segment(const httplib::Request& req, httplib::Response& res) 
     std::vector<float> samples(req.body.size() / sizeof(float));
     std::memcpy(samples.data(), req.body.data(), req.body.size());
     const std::string fmt = req.has_param("format") ? req.get_param_value("format") : "json";
+    if (is_silent_commit(samples)) {
+        res.set_header("X-Empty", "silence");
+        res.set_header("X-Infer-Ms", "0");
+        if (fmt == "text") {
+            res.set_content("", "text/plain; charset=utf-8");
+        } else {
+            res.set_content(json{{"text", ""}, {"duration", (double) samples.size() / 16000.0}}.dump(),
+                            "application/json");
+        }
+        return;
+    }
     const SyncReply r = transcribe_sync(samples);
     res.set_header("X-Queue-Ms", std::to_string((int) std::lround(r.queue_ms)));
     res.set_header("X-Infer-Ms", std::to_string((int) std::lround(r.infer_ms)));

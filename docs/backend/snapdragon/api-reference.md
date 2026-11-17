@@ -190,7 +190,24 @@ async def main(path='zh.wav', url='ws://127.0.0.1:8899/v1/realtime'):
 asyncio.run(main())
 ```
 
-## 10. 客户端集成要点
+## 10. 验收脚本
+
+部署后一条命令自检（18 项，全部 PASS 才算通过）：
+
+```sh
+python3 examples/paraformer/tools/smoke_production.py --port 8899 \
+    --wav ~/Library/Caches/qwen3-asr-htp/paraformer-models/tingting/hvac_zh01.wav \
+    --expect-gate --expect-vad
+```
+
+覆盖：`/health` 能力位、`/v1/models`、四种 `response_format`、`punctuate`、响应头
+（语言/排队/推理/门控）、400 错误（不支持的格式、缺 file）、`/asr/segment`、静音返回空文本、
+WS 单路与四路并发（含一致性）、`/metrics`。退出码 0 表示全部通过。
+
+真机参考输出（SM6650，门控 + VAD 都开）：18 项 PASS，json 355 ms、WS 单路 331 ms、
+四路并发 max 808 ms 且转写一致。
+
+## 11. 客户端集成要点
 
 1. **端点即 commit**：前端 VAD 判定说完后，把这一段一次发完再 commit；不需要客户端发送静音尾。
 2. **超时**：单段推理约 0.3 s（2.3 s 音频），队列满会返回 429；建议客户端超时 ≥ 5 s 并重试一次。
