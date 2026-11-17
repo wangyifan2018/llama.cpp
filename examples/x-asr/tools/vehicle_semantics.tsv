@@ -1,0 +1,82 @@
+# What each cabin clip must produce downstream, one line per clip.
+#
+#   id <TAB> clause[; clause...]
+#   clause = device | position | state | value
+#
+# device   window temp ac recirc fan rear_vents seat_heat seat_vent massage
+#          ambient reading dome footwell
+# position fl fr rl rr, or - when the command does not name one. fl/fr are the
+#          front seats: 主驾/驾驶位 and driver mean fl, 副驾/副驾驶 and
+#          passenger mean fr, because this car is left-hand drive.
+# state    on, off, or ? when the reference itself leaves the verb out
+#          ("Only the rear right window.") and only the device is graded.
+# value    - when the command does not set one; otherwise percent for window
+#          and footwell, degrees Celsius for temp, a level for fan and seat
+#          heat/ventilation, and warm_white for ambient colour.
+#
+# `none` means the clip must not become an actionable command at all: no
+# device with a stated on/off state, in either language.
+win_zh01	window|fl|on|50
+win_zh02	window|rr|off|-
+win_zh03	window|rl|off|-; window|rr|on|-
+win_zh04	window|fr|on|33
+hvac_zh01	temp|fl|on|21
+hvac_zh02	temp|fr|on|22
+hvac_zh03	recirc|-|on|-; fan|-|on|3
+hvac_zh04	ac|-|on|-; rear_vents|-|off|-
+seat_zh01	seat_heat|fr|on|2
+seat_zh02	seat_heat|fl|off|-
+seat_zh03	seat_vent|rl|on|1
+seat_zh04	massage|-|off|-; seat_vent|-|on|-
+light_zh01	ambient|-|on|warm_white
+light_zh02	reading|rr|on|-
+light_zh03	ambient|-|on|-; dome|-|off|-
+light_zh04	footwell|-|on|40
+win_en01	window|fl|on|50
+win_en02	window|rr|off|-
+win_en03	window|rl|off|-; window|rr|?|-
+win_en04	window|fr|on|33
+hvac_en01	temp|fl|on|21
+hvac_en02	temp|fr|on|22
+hvac_en03	recirc|-|on|-; fan|-|on|3
+hvac_en04	ac|-|on|-; rear_vents|-|off|-
+seat_en01	seat_heat|fr|on|2
+seat_en02	seat_heat|fl|off|-
+seat_en03	seat_vent|rl|on|1
+seat_en04	massage|-|off|-; seat_vent|-|on|-
+light_en01	ambient|-|on|warm_white
+light_en02	reading|rr|on|-
+light_en03	ambient|-|on|-; dome|-|off|-
+light_en04	footwell|-|on|40
+conf_zh01	none
+conf_zh02	none
+conf_zh03	none
+conf_zh04	none
+conf_zh05	none
+conf_zh06	none
+conf_zh07	window|fl|off|-; window|rr|on|-
+conf_zh08	seat_heat|-|off|-; seat_vent|-|on|-
+conf_en01	none
+conf_en02	none
+conf_en03	none
+conf_en04	none
+conf_en05	none
+conf_en06	none
+conf_en07	window|fr|off|-; window|rl|on|-
+conf_en08	ac|-|off|-; reading|rr|on|-
+neg_zh01	none
+neg_zh02	none
+neg_zh03	none
+neg_zh04	none
+neg_zh05	none
+neg_zh06	none
+neg_zh07	none
+neg_zh08	none
+neg_en01	none
+neg_en02	none
+neg_en03	none
+neg_en04	none
+neg_en05	none
+neg_en06	none
+neg_en07	none
+neg_en08	none
