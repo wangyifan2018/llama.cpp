@@ -56,5 +56,21 @@ printed by the CLI).
 - Paraformer fixes `Set the driver temperature...` in one clip, but still emits
   `said` in two English seat/light clips; English remains the open risk.
 
+## Profiling
+
+Capture a per-op HTP profile (one warmup + one measured utterance) and
+aggregate it into an encoder/decoder cost table:
+
+```sh
+GGML_HEXAGON_PROFILE=1 GGML_LOG_LEVEL=debug \
+  llama-paraformer MODEL.gguf WAV --device HTP0:0 --warmup WAV > prof.log 2>&1
+python3 tools/profile_ops.py prof.log
+```
+
+The M2 measurement on SM6650: encoder is kernel-bound (62.7% MUL_MAT+ADD,
+11% FSMN CONV_2D_DW, 6% CONT copies), scaling linearly with LFR frames;
+dispatch is only ~7%. See design doc §10 for the full breakdown and why this
+rules out cheap runtime-level encoder optimizations on the Q8_0 weights.
+
 See `docs/backend/snapdragon/paraformer-htp-adaptation-design.md` for the
 stage-split, length-bucket, overlap/stitch and bilingual plan.

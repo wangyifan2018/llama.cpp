@@ -233,3 +233,39 @@ A 档已经满足“runtime 根据语音长度自行 padding”和“计算图�
 
 **下一批**：① 首包剩下的 185 ms 里 enc compute 129 ms 是主项，按 operator profile 拆 ConvNeXt/attention；
 ② 标点后处理 + 英文 `said/too/reevent` 专项；③ overlap/stitch 与长语音；④ 常驻服务化后测真实并发 P95。
+
+## 10. M2 实测：encoder compute 的算子级分解（2026-11-17，SM6650）
+
+**问题**：M1 后首包 185 ms 里 encoder compute 129 ms 是主项。拆开看是 HTP dispatch 地板
+（像 x-asr 那样）还是 DSP kernel，判断 encoder 还值不值得在 runtime 层投入。
+
+**方法**：`GGML_HEXAGON_PROFILE=1 GGML_LOG_LEVEL=debug` 抓 HTP 每 op 的 usec，用
+`examples/paraformer/tools/profile_ops.py` 按 OPBATCH（enc/dec）和 op 类型聚合。
+数据：`tingting/prof1.log`（短句 win_en02，T_lfr≈24）、`prof_long.log`（win_zh03，T_lfr≈59）。
+
+**结果（短句，encoder 1405 op / 133.3 ms）**：
+
+| op | 次数 | usec | 占比 | avg |
+|---|---:|---:|---:|---:|
+| MUL_MAT+ADD | 200 | 82702 | **62.7%** | 413 us |
+| CONV_2D_DW (FSMN) | 50 | 14869 | 11.3% | 297 us |
+| MUL_MAT (attn scores/ctx) | 100 | 14270 | 10.8% | 143 us |
+| CONT (permute/view 拷贝) | 500 | 7985 | 6.1% | 16 us |
+| 其余（RELU/ADD/SOFT_MAX/NORM/MUL…） | — | ~12000 | 9% | — |
+
+- 200 次 MUL_MAT+ADD = 50 层 × 4 个投影。按权重分类：**FFN l1+l2 = 52.6 ms（占 matmul 的 63%）**，
+  每个 512×2048 投影 ~530–544 us；QKV 19.8 ms（403 us）；out proj 7.5 ms（152 us）；entry block 1.5 ms。
+- 权重已是 q8_0，HTP 走 `hvx-tiled` 原生 int8 路径（profile 显示 `q8_0 x f32 → f32`）。
+- **是 kernel-bound，不是 dispatch-bound**：1405 op × x-asr 测得的 ~7 us dispatch ≈ 10 ms，仅占 7%；
+  单 op usec 高达数百 us 是 DSP 矩阵运算本身。这与 x-asr（2449 op 中 dispatch 地板 17 ms/77 ms）
+  完全相反，不要套用 x-asr 的 dispatch 优化经验。
+- **随帧数线性**：长句 T_lfr≈59 时 matmul avg 413→969 us（2.35×），encoder 133→309 ms（2.32×），
+  与帧数 24→59（2.46×）一致。确认 compute-bound，没有可摊薄的固定项。
+
+**结论与复活条件**：encoder 已接近该权重/该芯片的算力天花板，runtime 层没有低风险优化杠杆。
+CONT（6%）这类搬运优化上限太低，不值得动图结构；把 FSMN conv 从 f32 cast 改成低精度有对拍风险、
+上限仅 11%。**只有两类改动能动 40% 的 FFN GEMM 主体**：① 更激进量化（FFN 权重 int4 / 混合精度），
+必须先过 CER/逐层对拍；② 改模型结构（缩小 FFN dim）并重训，那是另一个模型，不再是适配工作。
+在本权重下，继续优化 encoder 的投入应转向服务化后测真实并发 P95、以及识别质量（标点/英文）。
+
+**工程交付**：`tools/profile_ops.py` 固化了 enc/dec 分段 + op 聚合方法，后续任何图改动都能复用同一口径。
