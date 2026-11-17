@@ -157,7 +157,11 @@ curl -sS -X POST localhost:8080/asr/segment --data-binary @segment.f32
 ```
 
 `response_format` accepts `json`, `text`, `verbose_json` and `srt`; anything else is
-400. Errors use the OpenAI envelope `{"error": {...}}`. Every reply carries
+400. `verbose_json` carries `words` and pause-split `segments` from the CIF token
+times, and `srt` emits one block per pause. `punctuate=true` inserts a comma
+where the silence between two words crosses `--punct-gap-ms` (600 ms default):
+that is acoustic evidence, and it takes the cabin command field from 71.9 to
+78.1 percent where the earlier keyword restorer regressed to 46.9. Errors use the OpenAI envelope `{"error": {...}}`. Every reply carries
 `X-Queue-Ms` and `X-Infer-Ms` so the tail can be split into queueing and
 inference. Overload returns 429 and a queue timeout returns 503. Input must be
 16 kHz mono 16-bit PCM WAV; other formats are rejected rather than resampled.
