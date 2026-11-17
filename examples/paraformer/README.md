@@ -138,6 +138,32 @@ Q4_K halves resident memory (252 to 146 MB) and is 17 percent slower on both HTP
 and CPU, with transcripts inside quantization noise, so Q8_0 stays the default.
 Q5_K/Q6_K use the same tool. See design doc section 24.
 
+## OpenAI-compatible API
+
+`llama-paraformer-api` serves the engine over HTTP with the OpenAI audio shape.
+The front end already commits one segment at the VAD endpoint, so a whole
+utterance per request maps directly onto the engine.
+
+```sh
+build-x-asr/bin/llama-paraformer-api MODEL.gguf --device HTP0:0 --port 8080 \
+    --engines 2 --threads 2 --queue 64 --timeout-ms 30000 --model-id paraformer-zh-q8_0 \
+    --warmup hvac_en01.wav
+
+curl -sS localhost:8080/health
+curl -sS localhost:8080/v1/models
+curl -sS -X POST localhost:8080/v1/audio/transcriptions -F file=@a.wav
+curl -sS -X POST localhost:8080/v1/audio/transcriptions -F file=@a.wav -F response_format=verbose_json
+curl -sS -X POST localhost:8080/asr/segment --data-binary @segment.f32
+```
+
+`response_format` accepts `json`, `text`, `verbose_json` and `srt`; anything else is
+400. Errors use the OpenAI envelope `{"error": {...}}`. Every reply carries
+`X-Queue-Ms` and `X-Infer-Ms` so the tail can be split into queueing and
+inference. Overload returns 429 and a queue timeout returns 503. Input must be
+16 kHz mono 16-bit PCM WAV; other formats are rejected rather than resampled.
+See docs/backend/snapdragon/asr-server-api-design.md for the full surface,
+including the Realtime WebSocket mapping and what a general ASR server needs.
+
 ## Profiling
 
 Capture a per-op HTP profile (one warmup + one measured utterance) and
