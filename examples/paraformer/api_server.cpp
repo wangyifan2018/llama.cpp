@@ -452,6 +452,19 @@ static std::string g_enroll_dir;
 static float g_speaker_threshold = 0.55f;
 static bool g_speaker_enabled = false;
 
+// Server-side VAD. Conservative by design: a client that already cut at its own
+// VAD endpoint sends almost no tail silence, so the gate must never require a
+// closed segment. The audio is only reshaped when the commit is longer than
+// --vad-split-s; everything else is transcribed untouched.
+static std::string g_vad_model;
+static float g_vad_split_s = 18.0f;   // only split commits longer than this
+static float g_vad_piece_s = 15.0f;    // and never make a piece longer than this
+static float g_silence_rms = 0.004f;   // below this, "no speech" means empty text
+static float g_vad_threshold = 0.5f;
+static float g_vad_min_silence = 0.15f;
+static float g_vad_min_speech = 0.20f;
+static bool g_vad_enabled = false;
+
 #ifdef XASR_SPEAKER
 static const SherpaOnnxSpeakerEmbeddingExtractor* g_extractor = nullptr;
 static std::vector<float> g_voiceprint;
@@ -580,6 +593,60 @@ static float spk_score(const std::vector<float>& samples) {
     }
     return spk_cosine(spk_embed(samples), g_voiceprint);
 }
+
+// ---- server-side VAD ----
+
+static bool vad_init() {
+    if (g_vad_model.empty()) {
+        return false;
+    }
+    g_vad_enabled = true;
+    std::fprintf(stderr,
+                 "pf-api: server VAD on (%s), split above %.1f s, threshold %.2f, min_silence %.2f s, "
+                 "min_speech %.2f s\n",
+                 g_vad_model.c_str(), g_vad_split_s, g_vad_threshold, g_vad_min_silence, g_vad_min_speech);
+    return true;
+}
+
+// Speech spans (in samples) for one committed segment. An empty result means "no
+// confident speech": the caller then transcribes the whole segment anyway,
+// because a client that already cut at its own VAD endpoint can send a segment
+// whose tail silence is too short for the detector to close.
+static std::vector<std::pair<int, int>> vad_spans(const std::vector<float>& samples) {
+    std::vector<std::pair<int, int>> spans;
+    if (!g_vad_enabled || samples.empty()) {
+        return spans;
+    }
+    SherpaOnnxVadModelConfig cfg;
+    std::memset(&cfg, 0, sizeof(cfg));
+    cfg.silero_vad.model = g_vad_model.c_str();
+    cfg.silero_vad.threshold = g_vad_threshold;
+    cfg.silero_vad.min_silence_duration = g_vad_min_silence;
+    cfg.silero_vad.min_speech_duration = g_vad_min_speech;
+    cfg.silero_vad.window_size = 512;
+    cfg.silero_vad.max_speech_duration = g_vad_split_s;
+    cfg.sample_rate = 16000;
+    cfg.num_threads = 1;
+    cfg.provider = "cpu";
+    const SherpaOnnxVoiceActivityDetector* vad = SherpaOnnxCreateVoiceActivityDetector(&cfg, 30.0f);
+    if (!vad) {
+        return spans;
+    }
+    for (size_t i = 0; i < samples.size(); i += 512) {
+        const size_t n = std::min<size_t>(512, samples.size() - i);
+        SherpaOnnxVoiceActivityDetectorAcceptWaveform(vad, samples.data() + i, (int32_t) n);
+    }
+    SherpaOnnxVoiceActivityDetectorFlush(vad);
+    while (!SherpaOnnxVoiceActivityDetectorEmpty(vad)) {
+        const SherpaOnnxSpeechSegment* seg = SherpaOnnxVoiceActivityDetectorFront(vad);
+        spans.push_back({seg->start, seg->start + seg->n});
+        SherpaOnnxDestroySpeechSegment(seg);
+        SherpaOnnxVoiceActivityDetectorPop(vad);
+    }
+    SherpaOnnxDestroyVoiceActivityDetector(vad);
+    std::sort(spans.begin(), spans.end());
+    return spans;
+}
 #else
 static bool spk_init() {
     return false;
@@ -587,7 +654,88 @@ static bool spk_init() {
 static float spk_score(const std::vector<float>&) {
     return -1.0f;
 }
+static bool vad_init() {
+    return false;
+}
+static std::vector<std::pair<int, int>> vad_spans(const std::vector<float>&) {
+    return {};
+}
 #endif
+
+// Pieces to transcribe for one committed segment. Normal cabin commits (already
+// cut at the client's VAD) stay a single piece; only over-long audio is split, so
+// a client with its own VAD and little tail silence is never re-cut.
+static std::vector<std::pair<size_t, size_t>> plan_pieces(const std::vector<float>& samples, size_t* vad_pieces) {
+    std::vector<std::pair<size_t, size_t>> pieces;
+    if (vad_pieces) {
+        *vad_pieces = 0;
+    }
+    const size_t max_len = (size_t) (g_vad_split_s * 16000.0f);
+    if (g_vad_enabled && samples.size() > max_len) {
+        const std::vector<std::pair<int, int>> spans = vad_spans(samples);
+        if (vad_pieces) {
+            *vad_pieces = spans.size();
+        }
+        // Group consecutive speech spans into chunks of at most g_vad_piece_s.
+        // One piece per span would cut a sentence at every comma-level pause and
+        // pay the per-call overhead each time (measured: 7 pieces for 13.9 s).
+        const size_t piece_len = (size_t) (g_vad_piece_s * 16000.0f);
+        size_t cur_a = 0, cur_b = 0;
+        bool open = false;
+        for (const auto& sp : spans) {
+            const size_t a = (size_t) std::max(0, sp.first);
+            const size_t b = std::min(samples.size(), (size_t) std::max(0, sp.second));
+            if (b <= a + 1600) { // ignore slivers under 100 ms
+                continue;
+            }
+            if (!open) {
+                cur_a = a;
+                cur_b = b;
+                open = true;
+            } else if (b - cur_a <= piece_len) {
+                cur_b = b;
+            } else {
+                pieces.push_back({cur_a, cur_b});
+                cur_a = a;
+                cur_b = b;
+            }
+        }
+        if (open) {
+            pieces.push_back({cur_a, cur_b});
+        }
+    }
+    if (pieces.empty()) {
+        pieces.push_back({0, samples.size()});
+    }
+    return pieces;
+}
+
+// Pure silence makes the model hallucinate syllables, so a commit with no
+// detected speech and very low energy returns an empty transcript instead.
+static float pcm_rms(const std::vector<float>& samples) {
+    if (samples.empty()) {
+        return 0.0f;
+    }
+    double acc = 0;
+    for (float v : samples) acc += (double) v * v;
+    return (float) std::sqrt(acc / (double) samples.size());
+}
+
+// Join piece transcripts: a space only between two ASCII ends/ starts.
+static void append_text(std::string& out, const std::string& add) {
+    if (add.empty()) {
+        return;
+    }
+    if (!out.empty()) {
+        const unsigned char a = (unsigned char) out.back();
+        const unsigned char b = (unsigned char) add.front();
+        const bool latin = a < 0x80 && b < 0x80;
+        if (latin && a != ' ') {
+            out += ' ';
+        }
+    }
+    out += add;
+}
 
 // ---- base64 ----
 
@@ -893,8 +1041,46 @@ static void handle_transcription(const httplib::Request& req, httplib::Response&
         std::vector<float> score_samples = samples; // the ASR task takes ownership
         score_future = std::async(std::launch::async, [score_samples] { return spk_score(score_samples); });
     }
-    const SyncReply r = transcribe_sync(samples, want_tokens);
+    size_t vad_pieces = 0;
+    if (g_vad_enabled && pcm_rms(samples) < g_silence_rms && vad_spans(samples).empty()) {
+        res.set_header("X-Vad-Pieces", "0");
+        res.set_header("X-Infer-Ms", "0");
+        res.set_header("X-Queue-Ms", "0");
+        res.set_header("X-Empty", "silence");
+        res.set_content(json{{"text", ""}}.dump(), "application/json");
+        return;
+    }
+    const std::vector<std::pair<size_t, size_t>> pieces = plan_pieces(samples, &vad_pieces);
+    std::string joined;
+    TokensPtr last_tokens;
+    if (pieces.size() == 1) {
+        const SyncReply one = transcribe_sync(samples, want_tokens);
+        if (one.status != 200) {
+            reply_error(res, one.status, one.text, one.status == 429 ? "rate_limit_error" : "server_error");
+            return;
+        }
+        joined = one.text;
+        last_tokens = one.tokens;
+        res.set_header("X-Queue-Ms", std::to_string((int) std::lround(one.queue_ms)));
+        res.set_header("X-Infer-Ms", std::to_string((int) std::lround(one.infer_ms)));
+    } else {
+        double infer_ms = 0;
+        for (const auto& pc : pieces) {
+            std::vector<float> piece(samples.begin() + (long) pc.first, samples.begin() + (long) pc.second);
+            const SyncReply one = transcribe_sync(piece, false);
+            if (one.status != 200) {
+                reply_error(res, one.status, one.text, one.status == 429 ? "rate_limit_error" : "server_error");
+                return;
+            }
+            append_text(joined, one.text);
+            infer_ms += one.infer_ms;
+        }
+        res.set_header("X-Queue-Ms", "0");
+        res.set_header("X-Infer-Ms", std::to_string((int) std::lround(infer_ms)));
+    }
+    res.set_header("X-Vad-Pieces", std::to_string(pieces.size()));
     const float speaker_score = score_future.valid() ? score_future.get() : -1.0f;
+    const SyncReply r = [&] { SyncReply x; x.status = 200; x.text = joined; x.tokens = last_tokens; return x; }();
     res.set_header("X-Queue-Ms", std::to_string((int) std::lround(r.queue_ms)));
     res.set_header("X-Infer-Ms", std::to_string((int) std::lround(r.infer_ms)));
     if (r.status != 200) {
@@ -982,7 +1168,9 @@ int main(int argc, char** argv) {
                      "[--bind ADDR] [--queue N] [--timeout-ms N] [--model-id ID] [--warmup WAV] "
                      "[--partial-ms N] [--partial-interval-ms N] [--partial-max-s N] [--no-partials] "
                      "[--seg-gap-ms N] [--punct-gap-ms N] "
-                     "[--web-dir DIR] [--speaker-model FILE] [--enroll-dir DIR] [--speaker-threshold F]\n",
+                     "[--web-dir DIR] [--speaker-model FILE] [--enroll-dir DIR] [--speaker-threshold F] "
+                     "[--vad-model FILE] [--vad-split-s S] [--vad-threshold F] [--vad-min-silence S] "
+                     "[--vad-min-speech S]\n",
                      argv[0]);
         return 1;
     }
@@ -1031,6 +1219,20 @@ int main(int argc, char** argv) {
             g_enroll_dir = argv[++i];
         } else if (std::strcmp(argv[i], "--speaker-threshold") == 0 && i + 1 < argc) {
             g_speaker_threshold = (float) std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--vad-model") == 0 && i + 1 < argc) {
+            g_vad_model = argv[++i];
+        } else if (std::strcmp(argv[i], "--vad-split-s") == 0 && i + 1 < argc) {
+            g_vad_split_s = (float) std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--vad-piece-s") == 0 && i + 1 < argc) {
+            g_vad_piece_s = (float) std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--silence-rms") == 0 && i + 1 < argc) {
+            g_silence_rms = (float) std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--vad-threshold") == 0 && i + 1 < argc) {
+            g_vad_threshold = (float) std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--vad-min-silence") == 0 && i + 1 < argc) {
+            g_vad_min_silence = (float) std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--vad-min-speech") == 0 && i + 1 < argc) {
+            g_vad_min_speech = (float) std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--seg-gap-ms") == 0 && i + 1 < argc) {
             g_seg_gap_ms = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--punct-gap-ms") == 0 && i + 1 < argc) {
@@ -1095,10 +1297,16 @@ int main(int argc, char** argv) {
     srv.set_payload_max_length(64u * 1024u * 1024u);
 
     spk_init();
+    vad_init();
 
     srv.Get("/health", [](const httplib::Request&, httplib::Response& res) {
-        json j = {{"status", "ok"}, {"engines", g_engines.size()}, {"queue", g_queue.size()},
-                  {"speaker_gate", g_speaker_enabled}};
+        json j = {{"status", "ok"},
+                  {"engines", g_engines.size()},
+                  {"queue", g_queue.size()},
+                  {"speaker_gate", g_speaker_enabled},
+                  {"server_vad", g_vad_enabled},
+                  {"partials", g_partials},
+                  {"model", g_model_id}};
         res.set_content(j.dump(), "application/json");
     });
 
