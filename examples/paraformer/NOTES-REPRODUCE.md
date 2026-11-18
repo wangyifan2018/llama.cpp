@@ -27,12 +27,14 @@ export PF_MODELS=~/models/paraformer PF_RUN=~/pf-runs/paraformer PF_CACHE=~/pf-c
 | Binaries | `./reproduce.sh build` | cmake, a C++17 compiler |
 | Loops / mixin logic | `tools/eval_mixed.py`, `tools/eval_vehicle.py` | python3 only |
 | Latency shape | `--warmup FILE` then repeated runs | a real device for HTP |
-| Relative gain of the hotword profile | `./reproduce.sh eval` on **your** fixtures | a TTS that can render 47 clips |
+| Relative gain of the hotword profile | `./reproduce.sh eval` on **your** fixtures | a TTS that can render 84+47 clips |
 
 ## What is not
 
-The fixtures. They are 47 clips of synthetic speech: 32 cabin commands in
-Mandarin and English, 15 mixed-script sentences. In the recorded runs they were
+The fixtures. They are 131 clips of synthetic speech: 32 cabin commands in
+Mandarin and English, 15 mixed-script sentences, and 84 clips across the seven
+cabin domains added in §33 (lights, HVAC modes, seats, roof, navigation,
+ordering, media). In the recorded runs they were
 rendered with macOS `say` using the **Tingting** (zh_CN) voice, then trimmed and
 converted to 16 kHz mono PCM16 by `tools/gen_voice_fixtures.py`.
 
