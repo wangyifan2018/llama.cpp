@@ -21,6 +21,7 @@ required before any release threshold.
 import argparse
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import wave
@@ -36,6 +37,32 @@ def read_manifest(path):
             raise SystemExit(f"bad manifest row: {line!r}")
         rows.append((fields[0], fields[1], fields[2]))
     return rows
+
+
+def require_say():
+    """Fail with a sentence instead of a traceback when `say` is absent.
+
+    The macOS voice engine is not a dependency this repository can ship or
+    stub: every TTS renders the same sentence differently, so substituting
+    espeak-ng or Piper would produce fixtures that measure a different voice
+    and silently invalidate every rate in README.md. Better to stop.
+    """
+    if not shutil.which("say"):
+        raise SystemExit(
+            "gen_voice_fixtures.py needs macOS `say` (and `afconvert` for the PCM\n"
+            "conversion). It is not available here.\n"
+            "\n"
+            "These fixtures cannot be substituted: every TTS renders the same text\n"
+            "differently, so clips from another engine measure that engine's voice\n"
+            "rather than this one, and the rates in README.md stop being comparable.\n"
+            "\n"
+            "Options: run this step on macOS, or bring a fixture directory produced\n"
+            "on macOS and point PF_MODELS/PF_RUN at it. Both paths are described in\n"
+            "../NOTES-REPRODUCE.md.")
+    if not shutil.which("afconvert"):
+        raise SystemExit(
+            "gen_voice_fixtures.py needs `afconvert` (ships with macOS) to rewrite\n"
+            "`say`'s IEEE-float WAV as 16 kHz mono PCM16. See ../NOTES-REPRODUCE.md.")
 
 
 def list_voices():
@@ -151,6 +178,10 @@ def main():
     ap.add_argument("--rate", type=int, default=0, help="words per minute, 0 keeps the voice default")
     ap.add_argument("--limit", type=int, default=0, help="render only the first N rows")
     args = ap.parse_args()
+
+    # Check the dependency before doing anything, so a non-macOS run stops with
+    # an explanation rather than a FileNotFoundError halfway through a render.
+    require_say()
 
     if args.manifest:
         rows = read_manifest(args.manifest)

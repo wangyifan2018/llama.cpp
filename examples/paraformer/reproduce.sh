@@ -62,7 +62,7 @@ ZH_MODEL=$PF_MODELS/paraformer-zh-q8_0.gguf
 BIN=$BUILD/bin/llama-paraformer
 
 # ---------------------------------------------------------------- 小工具
-say()  { printf '%s\n' "$*"; }
+info()  { printf '%s\n' "$*"; }
 note() { printf '  %s\n' "$*"; }
 die()  { printf '\nFAIL: %s\n' "$*" >&2; exit 1; }
 
@@ -73,7 +73,7 @@ need_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing command: $1"; }
 
 # ---------------------------------------------------------------- check
 do_check() {
-    say "== check"
+    info "== check"
     local bad=0
     for c in cmake git "$PYTHON"; do
         if command -v "$c" >/dev/null 2>&1; then
@@ -129,20 +129,20 @@ do_check() {
         note "WARN    no 'say': fixtures must be copied in, see NOTES-REPRODUCE"
     fi
 
-    [ "$bad" = 0 ] && say "== check passed" || say "== check found problems (see above)"
+    [ "$bad" = 0 ] && info "== check passed" || info "== check found problems (see above)"
     return "$bad"
 }
 
 # ---------------------------------------------------------------- models
 do_models() {
-    say "== models -> $PF_MODELS"
+    info "== models -> $PF_MODELS"
     mkdir -p "$PF_MODELS"
     "$PYTHON" "$HERE/tools/fetch_models.py" --out "$PF_MODELS"
 }
 
 # ---------------------------------------------------------------- build
 do_build() {
-    say "== build -> $BUILD"
+    info "== build -> $BUILD"
     cmake -S "$REPO" -B "$BUILD" -DLLAMA_BUILD_EXAMPLES=ON -DCMAKE_BUILD_TYPE=Release >/dev/null
     cmake --build "$BUILD" --target llama-paraformer llama-paraformer-requant -j
     [ -x "$BIN" ] || die "build did not produce $BIN"
@@ -150,8 +150,15 @@ do_build() {
 
 # ---------------------------------------------------------------- fixtures
 do_fixtures() {
-    say "== fixtures"
-    need_cmd say
+    info "== fixtures"
+    # Explicit check rather than letting the generator fail: the message belongs
+    # at this level, where the reader is deciding what to do next.
+    command -v say >/dev/null 2>&1 || die "no macOS \`say\`: fixtures cannot be rendered here.
+       Every TTS produces a different waveform, so substituting one would
+       invalidate the rates rather than reproduce them. Either run this step on
+       macOS or copy in a fixture directory and set PF_MODELS/PF_RUN.
+       See NOTES-REPRODUCE.md."
+    command -v afconvert >/dev/null 2>&1 || die "no \`afconvert\` (ships with macOS); needed to rewrite say's float WAV as PCM16"
     mkdir -p "$PF_RUN"
 
     # cabin 32 条：这是文档里所有 cabin 数字的分母。
@@ -179,7 +186,7 @@ do_fixtures() {
 # 打分逻辑不在这里重写：eval_vehicle.py 是 x-asr 和 paraformer 共用的解析器，
 # 复制一份就会漂移，两个引擎的数字就不再可比。
 do_eval() {
-    say "== eval"
+    info "== eval"
     [ -x "$BIN" ] || die "no binary at $BIN (run: ./reproduce.sh build)"
     [ -f "$ZH_MODEL" ] || die "no weights at $ZH_MODEL (run: ./reproduce.sh models)"
     [ -f "$PF_MODELS/tingting/manifest.tsv" ] || die "no fixtures (run: ./reproduce.sh fixtures)"
@@ -254,9 +261,9 @@ PY
     mixed_base_pct=$(sed -n 2p <<<"$got")
     [ -n "$mixed_hot_pct" ] && [ -n "$mixed_base_pct" ] || die "could not parse mixed rates from $PF_RUN/mixed-grade.txt"
 
-    say ""
-    say "  metric                          shipped    gate    baseline"
-    say "  ------------------------------------------------------------------"
+    info ""
+    info "  metric                          shipped    gate    baseline"
+    info "  ------------------------------------------------------------------"
     printf '  %-30s %7s%% %7s%% %10s%%\n' "32-clip cabin command"  "$hot_cabin" "$GATE_CABIN" "$base_cabin"
     printf '  %-30s %7s%% %7s%% %10s%%\n' "15-clip mixed command"  "$mixed_hot_pct" "$GATE_MIXED" "$mixed_base_pct"
     printf '  %-30s %7s%% %7s%% %10s%%\n' "Mandarin CER"           "$hot_zh" "$GATE_ZH_CER" "$base_zh"
@@ -273,18 +280,18 @@ PY
 
     # 两臂一起掉 = 夹具不同源，不是 profile 退化。分开报，否则下一个人会去调热词。
     if ! ge "$base_cabin" "$BASE_CABIN" 1.0 && ! ge "$hot_cabin" "$GATE_CABIN" "$TOL"; then
-        say ""
-        say "  NOTE both arms are below their reference ($base_cabin% vs $BASE_CABIN% without a"
-        say "       profile). That points at the fixtures, not at hotwords_vehicle.txt: they"
-        say "       were rendered by a different TTS than the recorded set. Re-render with"
-        say "       macOS 'say' + Tingting, or copy in the recorded clips. See NOTES-REPRODUCE."
+        info ""
+        info "  NOTE both arms are below their reference ($base_cabin% vs $BASE_CABIN% without a"
+        info "       profile). That points at the fixtures, not at hotwords_vehicle.txt: they"
+        info "       were rendered by a different TTS than the recorded set. Re-render with"
+        info "       macOS 'say' + Tingting, or copy in the recorded clips. See NOTES-REPRODUCE."
     fi
 
     if [ "$fail" = 0 ]; then
-        say ""
-        say "== eval passed (run dir: $PF_RUN)"
+        info ""
+        info "== eval passed (run dir: $PF_RUN)"
     else
-        say ""
+        info ""
         die "eval gate failed; run dir: $PF_RUN"
     fi
 }
@@ -293,7 +300,7 @@ PY
 # 真机那一档不是重新定门槛，是验证「主机上的数就是设备上的数」。
 # 判据是转写逐字节相同，不是延迟接近：延迟受热与调度影响，转写不受。
 do_device() {
-    say "== device cross-check"
+    info "== device cross-check"
     command -v "$ADB" >/dev/null 2>&1 || die "no adb at $ADB (set ADB=...)"
     [ -x "$BIN" ] || die "no host binary to compare against"
 
@@ -302,25 +309,25 @@ do_device() {
     [ -n "$serial" ] || die "no adb device; check the cable and 'adb devices'"
 
     local vdir=/data/local/tmp/pf-reproduce
-    say "  device $serial -> $vdir"
+    info "  device $serial -> $vdir"
     "$ADB" -s "$serial" shell "rm -rf $vdir && mkdir -p $vdir" </dev/null
 
     # CPU 与 HTP 各跑一遍，先各一条做冒烟，再把 32 条整批跑。
     # 这个顺序就是那个踩过的坑：判「设备坏了」之前先交叉跑三个 device 形式。
     for dev in CPU "$DEVICE"; do
-        say "  [$dev] transcribe 32 clips on device"
+        info "  [$dev] transcribe 32 clips on device"
     done
-    say ""
-    say "  The Android binary is not built by this script (it needs the docker"
-    say "  arm64 toolchain and the device push step). Build it with the Snapdragon"
-    say "  driver, then run:"
-    say ""
-    say "      $BIN  ->  on device:  llama-paraformer MODEL.gguf *.wav --device $DEVICE"
-    say "      $BIN  ->  on device:  llama-paraformer MODEL.gguf *.wav --device CPU"
-    say "      diff <(cut -f1,3 host.tsv) <(cut -f1,3 device.tsv)   # expect empty"
-    say ""
-    say "  Host-side numbers are the gate; the device run must match them byte for"
-    say "  byte on the transcript field. See PRODUCTION.md for the recorded run."
+    info ""
+    info "  The Android binary is not built by this script (it needs the docker"
+    info "  arm64 toolchain and the device push step). Build it with the Snapdragon"
+    info "  driver, then run:"
+    info ""
+    info "      $BIN  ->  on device:  llama-paraformer MODEL.gguf *.wav --device $DEVICE"
+    info "      $BIN  ->  on device:  llama-paraformer MODEL.gguf *.wav --device CPU"
+    info "      diff <(cut -f1,3 host.tsv) <(cut -f1,3 device.tsv)   # expect empty"
+    info ""
+    info "  Host-side numbers are the gate; the device run must match them byte for"
+    info "  byte on the transcript field. See PRODUCTION.md for the recorded run."
 }
 
 # ---------------------------------------------------------------- main
@@ -348,8 +355,8 @@ case "$cmd" in
         do_build
         do_fixtures
         do_eval
-        say ""
-        say "All four gates passed. Run './reproduce.sh device' for the SM6650 match."
+        info ""
+        info "All four gates passed. Run './reproduce.sh device' for the SM6650 match."
         ;;
     -h|--help|help)
         sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
