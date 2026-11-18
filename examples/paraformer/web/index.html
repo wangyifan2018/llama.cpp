@@ -343,6 +343,7 @@
         if (t === 'x.pf.partial') {
           lastPartial = m.text || '';
           $('partial').textContent = lastPartial;
+          if (m.segment) log('partial', m.segment);
         } else if (t.endsWith('delta')) {
           lastPartial += m.delta;
           $('partial').textContent = lastPartial;
@@ -365,8 +366,12 @@
             $('segments').scrollTop = $('segments').scrollHeight;
           }
           $('final').classList.toggle('empty', !text);
-          $('partial').textContent = '';
-          lastPartial = '';
+          if (!$('chkVad').checked) {
+            // Streaming mode keeps the running transcript visible in the partial
+            // line; one-shot mode has nothing left to preview.
+            $('partial').textContent = '';
+            lastPartial = '';
+          }
           segments += 1;
           $('mSegs').textContent = segments;
           if (ms) { history.push(ms); $('mE2E').innerHTML = ms + '<small>ms</small>'; updatePct(); }

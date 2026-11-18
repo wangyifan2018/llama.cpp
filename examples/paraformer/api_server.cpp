@@ -1184,6 +1184,7 @@ struct WsSession {
     const void* vad = nullptr;
     bool stream_vad = false;
     uint64_t stream_items = 0;
+    std::string stream_text;      // running transcript across closed segments
     std::string language = "zh";
     std::string partial_text;
     uint64_t gen = 0;             // invalidates previews on commit or clear
@@ -1234,6 +1235,22 @@ static json session_object(const WsSession& s) {
 // by its transcript, exactly as it would after an explicit commit.
 static void ws_emit_segment(const std::shared_ptr<WsSession>& s, const std::string& item, const SegmentReply& reply,
                             double duration) {
+    // Streaming sessions get the running transcript as a partial as well, so a
+    // client can render one growing line while each closed segment stays a
+    // terminal result of its own.
+    if (s->stream_vad && !reply.text.empty()) {
+        if (!s->stream_text.empty()) {
+            const unsigned char a = (unsigned char) s->stream_text.back();
+            const unsigned char b = (unsigned char) reply.text.front();
+            if (a < 0x80 && b < 0x80) {
+                s->stream_text += ' ';
+            }
+        }
+        s->stream_text += reply.text;
+        ws_queue_event(*s, "x.pf.partial",
+                       {{"item_id", item}, {"content_index", 0}, {"text", s->stream_text},
+                        {"segment", reply.text}, {"final", false}});
+    }
     json body = {{"item_id", item},
                  {"content_index", 0},
                  {"transcript", reply.text},
@@ -1440,6 +1457,7 @@ static void ws_handle_text(const std::shared_ptr<WsSession>& s, const std::strin
                     s->vad = SherpaOnnxCreateVoiceActivityDetector(&cfg, 60.0f);
                     s->stream_vad = s->vad != nullptr;
                     s->stream_items = 0;
+                    s->stream_text.clear();
                     s->pcm.clear();
                     enabled = s->stream_vad;
                 } else {
