@@ -406,3 +406,210 @@ WS 单路与四路并发（含一致性）、空提交、连续提交后清空�
 3. **不要并发超限**：并发数 = `--engines`；超过会排队，`X-Queue-Ms` 会体现。
 4. **语言**：用 `X-Language` 而不是请求里的 `language`（后者只是提示）。
 5. **门控**：如果要用司机声纹，需按行程注册（同麦、同增益），阈值上线前用真实录音标定。
+
+## 12. 完整示例（真机实测输出）
+
+下面每段都是 SM6650 上当前部署的真实返回，可直接复制。
+
+### 12.0 探活
+
+```sh
+curl -sS http://127.0.0.1:8899/health
+```
+
+```json
+{"backends":[{"actual":"HTP0:0","decoder_device_ops":639,"decoder_total_ops":639,
+  "encoder_device_ops":1704,"encoder_total_ops":1704,"flash_attn":false,
+  "requested":"HTP0:0","requests":29,"watchdog_ms":0},
+  {"actual":"CPU","decoder_device_ops":575,"decoder_total_ops":575,
+   "encoder_device_ops":1504,"encoder_total_ops":1504,"flash_attn":true,
+   "requested":"CPU","requests":0,"watchdog_ms":0}],
+ "engines":2,"htp_engines":1,"model":"paraformer-zh","partials":false,"queue":0,
+ "routing":"prefer_idle_htp","server_vad":true,"speaker_gate":false,"status":"ok"}
+```
+
+判读：`htp_engines >= 1` 表示真的在 DSP 上跑（没有 HTP 引擎时服务根本不会启动）；
+`routing: prefer_idle_htp` 表示单路请求固定走 HTP；`requests` 是各引擎累计处理数。
+
+### 12.1 一次转写（OpenAI 形状）
+
+```sh
+curl -sS -X POST http://127.0.0.1:8899/v1/audio/transcriptions \
+     -F file=@hvac_zh01.wav
+```
+
+```json
+{"text":"把主驾空调调到二十一度"}
+```
+
+同样的请求加标点：
+
+```sh
+curl -sS -X POST http://127.0.0.1:8899/v1/audio/transcriptions \
+     -F file=@hvac_zh01.wav -F punctuate=true
+```
+
+```json
+{"text":"把主驾空调调到二十一度。"}
+```
+
+响应头（`-D -` 可看）：`X-Infer-Ms: 289`、`X-Queue-Ms: 0`、`X-Language: zh`、
+`X-Vad-Pieces: 1`、`X-Tail: hot`。
+
+### 12.2 时间戳与字幕
+
+```sh
+curl -sS -X POST http://127.0.0.1:8899/v1/audio/transcriptions \
+     -F file=@hvac_zh01.wav -F response_format=verbose_json
+```
+
+```json
+{
+  "duration": 2.322,
+  "language": "zh",
+  "segments": [{"end": 2.1, "id": 0, "language": "zh", "start": 0.0,
+                "text": "把主驾空调调到二十一度"}],
+  "speaker_status": "disabled",
+  "task": "transcribe",
+  "text": "把主驾空调调到二十一度",
+  "words": [{"end": 0.0,  "start": 0.0,  "word": "把"},
+            {"end": 0.18, "start": 0.18, "word": "主"},
+            {"end": 0.42, "start": 0.42, "word": "驾"},
+            {"end": 0.84, "start": 0.84, "word": "空"}]
+}
+```
+
+`-F response_format=srt`：
+
+```text
+1
+00:00:00,000 --> 00:00:02,100
+把主驾空调调到二十一度
+```
+
+### 12.3 原始 PCM（省掉 WAV 封装）
+
+```python
+import array, urllib.request
+
+pcm16 = array.array('h'); pcm16.frombytes(open('hvac_zh01.wav', 'rb').read()[44:])
+f32 = array.array('f', [v / 32768.0 for v in pcm16])
+req = urllib.request.Request('http://127.0.0.1:8899/asr/segment', data=f32.tobytes(),
+                             headers={'Content-Type': 'application/octet-stream'})
+print(urllib.request.urlopen(req).read().decode())
+```
+
+```json
+{"text":"把主驾空调调到二十一度","duration":2.322}
+```
+
+### 12.4 实时：客户端自己切段
+
+```python
+import asyncio, base64, json, wave
+import websockets
+
+async def main(path='hvac_zh01.wav', url='ws://127.0.0.1:8899/v1/realtime'):
+    with wave.open(path, 'rb') as f:
+        pcm = f.readframes(f.getnframes())
+    async with websockets.connect(url) as ws:
+        await ws.recv()                                  # session.created
+        for i in range(0, len(pcm), 640):                # 20 ms 一片
+            await ws.send(json.dumps({'type': 'input_audio_buffer.append',
+                                      'audio': base64.b64encode(pcm[i:i+640]).decode()}))
+            await asyncio.sleep(0.02)
+        await ws.send(json.dumps({'type': 'input_audio_buffer.commit'}))
+        while True:
+            m = json.loads(await ws.recv())
+            if m['type'].endswith('completed'):
+                print(m['transcript'], m.get('usage'))
+                break
+
+asyncio.run(main())
+```
+
+```text
+把主驾空调调到二十一度 {'type': 'duration', 'seconds': 2.32}
+```
+
+### 12.5 实时：服务端断句（推荐）
+
+客户端只推音频，服务端在停顿处断句；每段先给 partial（累积 + 本段），再给 committed/completed。
+
+```python
+import asyncio, base64, json, wave
+import websockets
+
+async def main(path='two_gap.wav', url='ws://127.0.0.1:8899/v1/realtime'):
+    with wave.open(path, 'rb') as f:
+        pcm = f.readframes(f.getnframes())
+    async with websockets.connect(url) as ws:
+        await ws.recv()
+        await ws.send(json.dumps({'type': 'session.update', 'session': {
+            'turn_detection': {'type': 'server_vad', 'silence_duration_ms': 300,
+                               'min_speech_duration_ms': 200, 'threshold': 0.5}}}))
+        while json.loads(await ws.recv()).get('type') != 'session.updated':
+            pass
+        for i in range(0, len(pcm), 640):
+            await ws.send(json.dumps({'type': 'input_audio_buffer.append',
+                                      'audio': base64.b64encode(pcm[i:i+640]).decode()}))
+            await asyncio.sleep(0.02)
+            while True:                                   # 边推边收
+                try:
+                    m = json.loads(await asyncio.wait_for(ws.recv(), timeout=0.001))
+                except asyncio.TimeoutError:
+                    break
+                if m['type'] == 'x.pf.partial':
+                    print('partial  :', m['text'], '| 本段:', m['segment'])
+                elif m['type'].endswith('completed'):
+                    print('completed:', m['transcript'])
+                elif m['type'] == 'x.pf.metrics':
+                    print('metrics  : tail=%.0fms infer=%.0fms backend=%s' % (
+                        m.get('tail_ms', -1), m['infer_ms'], m.get('backend')))
+
+asyncio.run(main())
+```
+
+```text
+partial  : 把主驾空调调到二十一度 | 本段: 把主驾空调调到二十一度
+completed: 把主驾空调调到二十一度
+metrics  : tail=593ms infer=293ms backend=HTP0:0
+partial  : 把主驾空调调到二十一度别关氛围灯把顶灯关掉 | 本段: 别关氛围灯把顶灯关掉
+completed: 别关氛围灯把顶灯关掉
+metrics  : tail=619ms infer=318ms backend=HTP0:0
+```
+
+要点：**不需要 commit**；点停止时才发 `input_audio_buffer.commit`，服务端把剩余音频冲出，
+该段 `tail_ms` 不含 300 ms 停顿（实测 267 ms 对 265 ms 推理）。
+
+### 12.6 错误
+
+```sh
+curl -sS -X POST http://127.0.0.1:8899/v1/audio/transcriptions \
+     -F file=@hvac_zh01.wav -F response_format=xml
+```
+
+```json
+{"error":{"code":null,"message":"unsupported response_format 'xml'",
+          "param":"response_format","type":"invalid_request_error"}}
+```
+
+| 场景 | 状态码 |
+|---|---|
+| 缺 `file`、非 16 kHz/单声道/16-bit WAV、未知 `response_format` | 400 |
+| 队列满 | 429 |
+| 排队超过 `--timeout-ms` | 503 |
+
+### 12.7 声纹（默认关闭）
+
+```sh
+curl -sS http://127.0.0.1:8899/v1/speaker
+# {"enabled":false,"clips":0,"self_cosine":0.0,"threshold":0.55,"dim":0,"persisted":false}
+
+# 启用后（--speaker-model + --enroll-dir）可车端注册：
+curl -sS -X POST http://127.0.0.1:8899/v1/speaker/enroll \
+     -F file=@me1.wav -F file=@me2.wav
+# {"clips":2,"dim":192,"self_cosine":0.97,"threshold":0.55}
+```
+
+关闭时转写响应只有 `X-Speaker-Status: disabled`；启用并评分后才有 `X-Speaker-Score`/`X-Speaker-Ok`。
