@@ -185,6 +185,12 @@ static bool g_stop = false;
 static std::vector<Engine*> g_engines;
 static Engine* g_preferred_engine = nullptr;
 static bool g_preferred_busy = false;
+// Length-aware routing. Off by default while it is measured; see
+// --route-by-length in PRODUCTION.md.
+static bool g_length_route = false;
+static int g_length_route_ms = 1500;
+
+static bool is_accelerator(const std::string& name) { return name.rfind("HTP", 0) == 0; }
 static size_t g_queue_limit = 64;
 static size_t g_queue_bytes_limit = 8 * 1024 * 1024;
 static size_t g_queue_bytes = 0;
@@ -416,9 +422,25 @@ static std::string srt_time(double seconds) {
 // ---- engine pool ----
 
 // Commit tasks jump the queue so a partial decode never delays an endpoint.
-static std::unique_ptr<PoolTask> pop_task() {
+//
+// With length routing on, an accelerator worker skips past utterances short
+// enough that CPU is the faster arm (they cross near 1.5 s on SM6650) and a CPU
+// worker skips past the long ones. Skipping is a preference, never a filter: if
+// no task matches, the worker takes whatever is at the head, so a queue of one
+// length cannot idle the other worker. Priority still wins over length.
+static std::unique_ptr<PoolTask> pop_task(const Engine* eng = nullptr) {
     auto pos = std::find_if(g_queue.begin(), g_queue.end(), [](const auto& task) { return task->priority > 0; });
-    if (pos == g_queue.end()) pos = g_queue.begin();
+    if (pos == g_queue.end()) {
+        pos = g_queue.begin();
+        if (eng && g_length_route) {
+            const bool want_short = !is_accelerator(eng->name);
+            auto match = std::find_if(g_queue.begin(), g_queue.end(), [&](const auto& task) {
+                const bool short_task = task->samples.size() < (size_t) (g_length_route_ms * 16.0f);
+                return short_task == want_short;
+            });
+            if (match != g_queue.end()) pos = match;
+        }
+    }
     auto t = std::move(*pos);
     g_queue_bytes -= t->samples.capacity() * sizeof(float);
     g_queue.erase(pos);
@@ -454,7 +476,7 @@ static void worker_loop(Engine* eng) {
                 }
                 continue;
             }
-            task = pop_task();
+            task = pop_task(eng);
             if (eng == g_preferred_engine) g_preferred_busy = true;
             g_inflight.fetch_add(1);
         }
@@ -1711,7 +1733,7 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
                      "usage: %s MODEL.gguf [--device HTP0:0] [--port N] [--engines N] [--threads N] "
-                     "[--htp-flash-attn | --no-htp-flash-attn] [--prefer-idle-htp] [--htp-watchdog-ms N] [--htp-warmup-ms N] "
+                     "[--htp-flash-attn | --no-htp-flash-attn] [--prefer-idle-htp] [--route-by-length | --route-by-length-ms N] [--htp-watchdog-ms N] [--htp-warmup-ms N] "
                      "[--bind ADDR] [--queue N] [--queue-mib N] [--timeout-ms N] [--deadline-ms N] "
                      "[--model-id ID] [--warmup WAV] [--allow-cpu-fallback] [--recover-on-cpu] "
                      "[--partial-ms N] [--partial-interval-ms N] [--partial-max-s N] [--no-partials] "
@@ -1791,6 +1813,21 @@ int main(int argc, char** argv) {
             htp_flash_attn = true;
         } else if (std::strcmp(argv[i], "--prefer-idle-htp") == 0) {
             prefer_idle_htp = true;
+        } else if (std::strcmp(argv[i], "--route-by-length") == 0) {
+            g_length_route = true;
+        } else if (std::strcmp(argv[i], "--route-by-length-ms") == 0) {
+            char* end = nullptr;
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "pf-api: --route-by-length-ms needs a value\n");
+                return 1;
+            }
+            const long v = std::strtol(argv[++i], &end, 10);
+            if (end == argv[i] || v <= 0 || v > 60000) {
+                std::fprintf(stderr, "pf-api: --route-by-length-ms wants 1..60000, got '%s'\n", argv[i]);
+                return 1;
+            }
+            g_length_route_ms = (int) v;
+            g_length_route = true;
         } else if (std::strcmp(argv[i], "--htp-watchdog-ms") == 0) {
             char* end = nullptr;
             if (i + 1 >= argc) {
@@ -2022,7 +2059,8 @@ int main(int argc, char** argv) {
         json j = {{"status", g_degraded ? "degraded" : "ok"},
                   {"engines", g_engines.size()},
                   {"backends", std::move(backends)},
-                  {"routing", g_preferred_engine ? "prefer_idle_htp" : "shared_queue"},
+                  {"routing", g_preferred_engine ? "prefer_idle_htp" : (g_length_route ? "by_length" : "shared_queue")},
+                  {"route_by_length_ms", g_length_route ? g_length_route_ms : 0},
                   {"queue", queue_depth()},
                   {"speaker_gate", g_speaker_enabled},
                   {"server_vad", g_vad_enabled},

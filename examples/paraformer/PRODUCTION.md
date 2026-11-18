@@ -144,6 +144,28 @@ Decomposition wins at one lane and at four, and is level at two. The four-lane p
 
 The client-visible gain is larger than the inference-time gain because the fused graph's 66 off-device ops are serial round trips that sit in front of the first token.
 
+## Backend choice depends on utterance length
+
+HTP does not win on short commands. It pays a fixed cost per call -- session scheduling plus the FastRPC round trips for the graph edges -- that only amortises once the utterance is long enough. Measured one engine at a time on SM6650, one warmup then five requests per length, rising `X-Infer-Ms` medians:
+
+| Audio | CPU (2 threads) | HTP0 | Faster |
+|---:|---:|---:|---|
+| 0.3 s | **54 ms** | 115 ms | CPU, 2.1x |
+| 0.7 s | **114 ms** | 152 ms | CPU, 33% |
+| 1.2 s | **161 ms** | 198 ms | CPU, 19% |
+| 1.8 s | 276 ms | **262 ms** | HTP, 5% |
+| 2.3 s | 344 ms | **329 ms** | HTP, 4% |
+
+Fitting each arm linearly gives roughly `11 + 143x` ms for CPU and `83 + 106x` ms for HTP, so HTP carries about 72 ms more fixed cost per request and saves about 37 ms per second of audio. They cross near 1.5-1.9 s. A cabin command of one or two seconds sits on or before that crossing, where the accelerator is the slower choice.
+
+This is why the default `shared_queue` routing measures best: both workers pull from one queue, so a short command that arrives while HTP is busy simply runs on CPU, and a long one lands on whichever is free. It is not that the split is clever, it is that the two arms are complementary at the lengths the product sees.
+
+Consequences worth knowing before tuning:
+
+- `--prefer-idle-htp` sends every request to HTP while it is free (`/health` then shows `CPU req=0`). On the same 0.3 s clip that measured 111 ms against 87 ms under `shared_queue`, because `shared_queue` was letting CPU take half of them. Do not use it to "keep work on the NPU"; on short commands it picks the slower worker by construction.
+- Raising CPU threads does not help. Four threads on the same lengths measured no faster and far less stable (0.3 s: 73-109 ms; 2.3 s: 289-530 ms, against 341-346 ms at two threads). Two threads is the practical ceiling here, which matches the earlier x-asr finding that more threads contend on memory rather than compute.
+- The natural next step looked like routing by input duration rather than by arrival order: send under about 1.5 s to CPU and the rest to HTP. It is implemented as `--route-by-length` and **it did not earn a default**. With only one task queued there is nothing to choose between, so the policy degenerates -- eight sequential 0.3 s requests still split 4/4 across the workers exactly as before. With a real choice available (two short plus two long in flight) the short medians were 80 ms against 84 ms for `shared_queue`, a 4 ms difference across six samples each. That is inside the noise of these two configurations, so the flag stays off and this stays a measured negative rather than a hoped-for win. The mechanism is worth keeping in mind for a later attempt: the value only appears when the queue holds a mix of lengths, so any future version has to be judged on a mixed workload at the p95, not on single-request medians.
+
 The earlier WebSocket experiment covered in the table below reached the same placement counts but reported 293.5 ms (flash) against 288.5 ms (decomposed) and concluded the two were equivalent, so it kept flash as the default. That measurement used paced 20 ms WebSocket packets and four-request arms; the difference is inside its noise, which is why the placement counts -- not the latency delta -- are what carried over. Both measurements agree on the reason to prefer decomposition once it is measured at the queue, where the 66 round trips stop being amortised by pacing.
 
 | HTP attention | Encoder ops on HTP | Decoder ops on HTP | zh CER | en WER | Median inference, 32 HTP requests |
