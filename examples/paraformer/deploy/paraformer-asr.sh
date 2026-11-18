@@ -136,6 +136,9 @@ if [ -n "${PF_TEXT_RULES:-}" ] && [ -r "$PF_TEXT_RULES" ]; then
 fi
 if [ -n "${PF_SPEAKER_MODEL:-}" ] && [ -r "$PF_SPEAKER_MODEL" ] && [ -n "${PF_ENROLL_DIR:-}" ] && [ -d "$PF_ENROLL_DIR" ]; then
     set -- "$@" --speaker-model "$PF_SPEAKER_MODEL" --enroll-dir "$PF_ENROLL_DIR"
+    # A voiceprint registered in the car wins over the factory directory, so it
+    # has to survive a restart.
+    set -- "$@" --voiceprint-file "${PF_VOICEPRINT_FILE:-$PF_WORKDIR/voiceprint.bin}"
 fi
 if [ -n "${PF_VAD_MODEL:-}" ] && [ -r "$PF_VAD_MODEL" ]; then
     set -- "$@" --vad-model "$PF_VAD_MODEL"

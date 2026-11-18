@@ -283,7 +283,30 @@ partial 的节流：新增音频 ≥ `--partial-ms`（默认 800 ms）且距上�
 
 ## 7. 说话人门控（可选）
 
-评分默认关闭。启用时需要 `-DXASR_SPEAKER=ON`，同时提供 `--speaker-model` 和 `--enroll-dir`。请求启用但模型或注册目录不可用时，服务启动失败。注册目录存放司机的 16 kHz WAV，服务在启动时建立质心声纹。`/health` 的 `speaker_gate` 表示评分是否启用。
+评分默认关闭。启用时需要 `-DXASR_SPEAKER=ON`，并提供 `--speaker-model`；声纹来源有两级：
+
+1. **`--voiceprint-file`（优先）**：车端注册后持久化的质心，重启后继续生效；
+2. **`--enroll-dir`**：出厂/首次启动用的 16 kHz WAV 目录。
+
+出厂夹具（TTS）不能代替真实司机：合成音色的声纹在真人身上会给出"非司机"。真实流程是司机在车里调一次
+`POST /v1/speaker/enroll`（见下），之后由文件接管。`/health` 的 `speaker_gate` 表示评分是否启用。
+
+### 7.1 注册与查询
+
+```sh
+# 注册（multipart；可一次传多段，取质心）
+curl -sS -X POST localhost:8899/v1/speaker/enroll \
+     -F file=@me1.wav -F file=@me2.wav -F file=@me3.wav
+# {"clips":3,"dim":192,"self_cosine":0.94,"threshold":0.55}
+
+curl -sS localhost:8899/v1/speaker
+# {"enabled":true,"clips":3,"self_cosine":0.94,"threshold":0.55,"dim":192,"persisted":true}
+```
+
+注册整体**替换**旧声纹并写入 `PF_VOICEPRINT_FILE`；建议 3 段、每段 2–3 秒、与日常使用同麦同增益。
+`self_cosine` 是各段与质心的平均相似度，低于 0.8 说明录制太短、噪声太大或几段不是同一个人。
+
+实测（同一部署）：注册 TTS 音色后，该音色 0.912/放行，另一音色 0.328/拒绝。
 
 评分使用一个独立 CPU 线程，最多处理一个声纹任务。ASR 有排队或运行中的请求时，后来的请求跳过评分。评分只复制音频前 `--speaker-max-s` 秒，默认 1.5 秒。ASR 完成时立即读取已就绪的评分。阈值 `--speaker-threshold` 默认为 0.55，由调用方根据业务条件决定如何使用结果。
 

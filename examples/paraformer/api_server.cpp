@@ -747,10 +747,17 @@ static float g_vad_min_speech = 0.20f;
 static int g_vad_silence_ms = 300;
 static bool g_vad_enabled = false;
 
+// The enrollment state is visible to the argument parser and to /health even in a
+// build without sherpa, so only the extractor handle is guarded below.
+static std::vector<float> g_voiceprint;
+static std::mutex g_voiceprint_mutex;
+static int g_voiceprint_clips = 0;
+static float g_voiceprint_self = 0.0f;
+static std::string g_voiceprint_file;
+
 #ifdef XASR_SPEAKER
 static std::unique_ptr<const SherpaOnnxSpeakerEmbeddingExtractor, decltype(&SherpaOnnxDestroySpeakerEmbeddingExtractor)>
     g_extractor{nullptr, &SherpaOnnxDestroySpeakerEmbeddingExtractor};
-static std::vector<float> g_voiceprint;
 
 static bool spk_read_wav(const std::string& path, std::vector<float>& out) {
     FILE* f = std::fopen(path.c_str(), "rb");
@@ -809,11 +816,84 @@ static std::optional<float> spk_cosine(const std::vector<float>& a, const std::v
     return (float) std::clamp(dot / norm, -1.0, 1.0);
 }
 
+// Replace the enrolled voiceprint with the centroid of these recordings. Used by
+// the startup directory and by the enrollment endpoint, so a driver can register
+// in the car instead of at the factory.
+static bool spk_install_voiceprint(const std::vector<std::vector<float>>& clips, int* used_out, float* self_out) {
+    std::vector<std::vector<float>> embs;
+    for (const auto& samples : clips) {
+        if (samples.empty()) continue;
+        std::vector<float> e = spk_embed(samples);
+        if (e.empty()) continue;
+        double nrm = 0;
+        for (float v : e) nrm += (double) v * v;
+        nrm = std::sqrt(nrm);
+        if (!std::isfinite(nrm) || nrm <= 0.0) continue;
+        for (float& v : e) v = (float) (v / nrm);
+        embs.push_back(std::move(e));
+    }
+    if (embs.empty()) return false;
+    std::vector<float> acc(embs.front().size(), 0.0f);
+    for (const auto& e : embs) {
+        for (size_t i = 0; i < acc.size(); ++i) acc[i] += e[i];
+    }
+    double nrm = 0;
+    for (float v : acc) nrm += (double) v * v;
+    nrm = std::sqrt(nrm);
+    if (!std::isfinite(nrm) || nrm <= 0.0) return false;
+    for (float& v : acc) v = (float) (v / nrm);
+    float self = 0.0f;
+    for (const auto& e : embs) self += spk_cosine(e, acc).value_or(0.0f);
+    self /= (float) embs.size();
+    {
+        std::lock_guard<std::mutex> lock(g_voiceprint_mutex);
+        g_voiceprint = acc;
+        g_voiceprint_clips = (int) embs.size();
+        g_voiceprint_self = self;
+    }
+    if (!g_voiceprint_file.empty()) {
+        FILE* f = std::fopen(g_voiceprint_file.c_str(), "wb");
+        if (f) {
+            const int32_t dim = (int32_t) acc.size();
+            std::fwrite("PFVP", 1, 4, f);
+            std::fwrite(&dim, sizeof(dim), 1, f);
+            std::fwrite(acc.data(), sizeof(float), acc.size(), f);
+            std::fclose(f);
+        }
+    }
+    if (used_out) *used_out = (int) embs.size();
+    if (self_out) *self_out = self;
+    return true;
+}
+
+static bool spk_load_voiceprint_file() {
+    if (g_voiceprint_file.empty()) return false;
+    FILE* f = std::fopen(g_voiceprint_file.c_str(), "rb");
+    if (!f) return false;
+    char magic[4] = {0};
+    int32_t dim = 0;
+    bool ok = std::fread(magic, 1, 4, f) == 4 && std::memcmp(magic, "PFVP", 4) == 0 &&
+              std::fread(&dim, sizeof(dim), 1, f) == 1 && dim > 0 && dim <= 4096;
+    std::vector<float> v;
+    if (ok) {
+        v.resize((size_t) dim);
+        ok = std::fread(v.data(), sizeof(float), v.size(), f) == v.size();
+    }
+    std::fclose(f);
+    if (!ok) return false;
+    std::lock_guard<std::mutex> lock(g_voiceprint_mutex);
+    g_voiceprint = std::move(v);
+    g_voiceprint_clips = -1;
+    g_voiceprint_self = 0.0f;
+    std::fprintf(stderr, "pf-api: voiceprint loaded from %s (dim %d)\n", g_voiceprint_file.c_str(), dim);
+    return true;
+}
+
 static bool spk_init() {
-    if (g_speaker_model.empty() && g_enroll_dir.empty()) return true;
+    if (g_speaker_model.empty()) return true;
     std::error_code ec;
-    if (!std::filesystem::is_regular_file(g_speaker_model, ec) || !std::filesystem::is_directory(g_enroll_dir, ec)) {
-        std::fprintf(stderr, "pf-api: speaker scoring needs a model file and enrollment directory\n");
+    if (!std::filesystem::is_regular_file(g_speaker_model, ec)) {
+        std::fprintf(stderr, "pf-api: speaker scoring needs a model file\n");
         return false;
     }
     SherpaOnnxSpeakerEmbeddingExtractorConfig cfg;
@@ -830,6 +910,16 @@ static bool spk_init() {
     const int32_t dim = SherpaOnnxSpeakerEmbeddingExtractorDim(g_extractor.get());
     std::fprintf(stderr, "pf-api: speaker model %s, dim=%d\n", g_speaker_model.c_str(), dim);
     if (dim <= 0) return false;
+    // A persisted voiceprint wins: it is the driver who registered in the car,
+    // not the factory clips.
+    if (spk_load_voiceprint_file()) {
+        g_speaker_enabled = true;
+        return true;
+    }
+    if (g_enroll_dir.empty() || !std::filesystem::is_directory(g_enroll_dir, ec)) {
+        std::fprintf(stderr, "pf-api: no voiceprint file and no enrollment directory; gate stays off\n");
+        return true;
+    }
     std::vector<std::string> files;
     for (const auto& entry : std::filesystem::directory_iterator(g_enroll_dir)) {
         const std::string p = entry.path().string();
@@ -838,40 +928,21 @@ static bool spk_init() {
         }
     }
     std::sort(files.begin(), files.end());
-    std::vector<float> acc((size_t) dim, 0.0f);
-    int used = 0;
-    double self_cos = 0;
-    std::vector<std::vector<float>> embs;
+    std::vector<std::vector<float>> clips;
     for (const auto& p : files) {
         std::vector<float> samples;
-        if (!spk_read_wav(p, samples) || samples.empty()) {
-            continue;
+        if (spk_read_wav(p, samples) && !samples.empty()) {
+            clips.push_back(std::move(samples));
         }
-        std::vector<float> e = spk_embed(samples);
-        if (e.size() != (size_t) dim) {
-            continue;
-        }
-        double nrm = 0;
-        for (float v : e) nrm += (double) v * v;
-        nrm = std::sqrt(nrm);
-        if (!std::isfinite(nrm) || nrm <= 0.0) continue;
-        for (size_t i = 0; i < e.size(); ++i) acc[i] += (float) (e[i] / nrm);
-        embs.push_back(e);
-        ++used;
     }
-    if (used == 0) {
+    int used = 0;
+    float self_cos = 0.0f;
+    if (!spk_install_voiceprint(clips, &used, &self_cos)) {
         std::fprintf(stderr, "pf-api: no usable enrollment wavs in %s\n", g_enroll_dir.c_str());
         return false;
     }
-    double nrm = 0;
-    for (float v : acc) nrm += (double) v * v;
-    nrm = std::sqrt(nrm);
-    if (!std::isfinite(nrm) || nrm <= 0.0) return false;
-    for (float& v : acc) v = (float) (v / nrm);
-    g_voiceprint = acc;
-    for (const auto& e : embs) self_cos += spk_cosine(e, g_voiceprint).value_or(0.0f);
     std::fprintf(stderr, "pf-api: speaker gate on, enrolled %d clips, mean self-cosine %.3f, threshold %.2f\n", used,
-                 self_cos / used, g_speaker_threshold);
+                 self_cos, g_speaker_threshold);
     g_speaker_enabled = true;
     return true;
 }
@@ -916,6 +987,7 @@ private:
                 samples.swap(head);
             }
             try {
+                std::lock_guard<std::mutex> vp(g_voiceprint_mutex);
                 ticket->score = spk_cosine(spk_embed(samples), g_voiceprint);
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "pf-api: speaker scoring failed: %s\n", e.what());
@@ -1263,9 +1335,13 @@ static void ws_emit_segment(const std::shared_ptr<WsSession>& s, const std::stri
     set_speaker_json(body, reply.speaker);
     ws_queue_event(*s, "input_audio_buffer.committed", {{"item_id", item}, {"previous_item_id", nullptr}});
     ws_queue_event(*s, "conversation.item.input_audio_transcription.completed", std::move(body));
+    // Tail latency is what a driver feels: from the last syllable to the text on
+    // screen. In streaming mode the detector waits g_vad_silence_ms before it can
+    // know the utterance ended, so that wait belongs to the number.
+    const double tail = (s->stream_vad ? (double) g_vad_silence_ms : 0.0) + reply.queue_ms + reply.infer_ms;
     ws_queue_event(*s, "x.pf.metrics", {{"item_id", item}, {"queue_ms", reply.queue_ms},
                                        {"infer_ms", reply.infer_ms}, {"vad_ms", reply.vad_ms},
-                                       {"backend", reply.backend}});
+                                       {"tail_ms", tail}, {"backend", reply.backend}});
 }
 
 #ifdef XASR_SPEAKER
@@ -1731,6 +1807,59 @@ struct AcceptedGuard {
     AcceptedGuard& operator=(const AcceptedGuard&) = delete;
 };
 
+// Enroll or replace the driver voiceprint from uploaded 16 kHz WAVs. In the car
+// this runs per trip: the factory clips cannot cover a real channel or a new
+// driver, and a wrong voiceprint rejects the actual driver instead of passengers.
+static void handle_speaker_enroll(const httplib::Request& req, httplib::Response& res) {
+#ifndef XASR_SPEAKER
+    reply_error(res, 501, "this build has no speaker support", "invalid_request_error");
+    (void) req;
+#else
+    if (!g_speaker_enabled) {
+        reply_error(res, 409, "speaker scoring is disabled; start with --speaker-model", "invalid_request_error");
+        return;
+    }
+    if (!req.form.has_file("file")) {
+        reply_error(res, 400, "missing form field 'file'", "invalid_request_error", "file");
+        return;
+    }
+    std::vector<std::vector<float>> clips;
+    for (const auto& f : req.form.get_files("file")) {
+        std::vector<float> samples;
+        std::string err;
+        if (parse_wav(f.content, samples, err) && !samples.empty()) {
+            clips.push_back(std::move(samples));
+        }
+    }
+    if (clips.empty()) {
+        reply_error(res, 400, "no usable 16 kHz mono PCM wav in the request", "invalid_request_error", "file");
+        return;
+    }
+    int used = 0;
+    float self = 0.0f;
+    if (!spk_install_voiceprint(clips, &used, &self)) {
+        reply_error(res, 500, "could not compute an embedding from the uploads", "server_error");
+        return;
+    }
+    const size_t dim = g_voiceprint.size();
+    std::fprintf(stderr, "pf-api: voiceprint replaced, %d clips, self-cosine %.3f\n", used, self);
+    res.set_content(json{{"clips", used}, {"self_cosine", self}, {"threshold", g_speaker_threshold},
+                         {"dim", (int) dim}}.dump(),
+                    "application/json");
+#endif
+}
+
+static void handle_speaker_status(const httplib::Request&, httplib::Response& res) {
+    std::lock_guard<std::mutex> lock(g_voiceprint_mutex);
+    res.set_content(json{{"enabled", g_speaker_enabled},
+                         {"clips", g_voiceprint_clips},
+                         {"self_cosine", g_voiceprint_self},
+                         {"threshold", g_speaker_threshold},
+                         {"dim", (int) g_voiceprint.size()},
+                         {"persisted", !g_voiceprint_file.empty()}}.dump(),
+                    "application/json");
+}
+
 static void handle_transcription(const httplib::Request& req, httplib::Response& res) {
     AcceptedGuard accepted;
     if (!req.form.has_file("file")) {
@@ -1986,7 +2115,7 @@ int main(int argc, char** argv) {
                      "[--model-id ID] [--warmup WAV] [--allow-cpu-fallback] [--recover-on-cpu] "
                      "[--partial-ms N] [--partial-interval-ms N] [--partial-min-s S] [--partial-max-s S] [--no-partials] "
                      "[--seg-gap-ms N] [--punct-gap-ms N] "
-                     "[--web-dir DIR] [--speaker-model FILE] [--enroll-dir DIR] [--speaker-threshold F] [--speaker-max-s S] "
+                     "[--web-dir DIR] [--speaker-model FILE] [--enroll-dir DIR] [--voiceprint-file FILE] [--speaker-threshold F] [--speaker-max-s S] "
                      "[--vad-model FILE] [--vad-split-s S] [--vad-threshold F] [--vad-min-silence S] [--vad-silence-ms N] "
                      "[--vad-min-speech S] [--api-key TOKEN | PF_API_KEY] [--shutdown-grace-ms N]\n",
                      argv[0]);
@@ -2126,6 +2255,8 @@ int main(int argc, char** argv) {
             g_speaker_model = argv[++i];
         } else if (std::strcmp(argv[i], "--enroll-dir") == 0 && i + 1 < argc) {
             g_enroll_dir = argv[++i];
+        } else if (std::strcmp(argv[i], "--voiceprint-file") == 0 && i + 1 < argc) {
+            g_voiceprint_file = argv[++i];
         } else if (std::strcmp(argv[i], "--speaker-threshold") == 0 && i + 1 < argc) {
             g_speaker_threshold = (float) std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--vad-model") == 0 && i + 1 < argc) {
@@ -2412,6 +2543,8 @@ int main(int argc, char** argv) {
     });
 
     srv.Post("/v1/audio/transcriptions", handle_transcription);
+    srv.Post("/v1/speaker/enroll", handle_speaker_enroll);
+    srv.Get("/v1/speaker", handle_speaker_status);
     srv.Post("/asr/segment", handle_segment);
 
     // Test console: static page at /, served from --web-dir when present.
