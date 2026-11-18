@@ -155,4 +155,26 @@ and `R notanumber fo@@+t => fo@@+g` makes it report all three and exit 1.
 One caveat on the dump: `PF_DUMP_VOCAB=` (empty string) means *all* tokens,
 while `PF_DUMP_VOCAB=<substring>` filters. The CLI also requires at least one
 WAV argument, so the check borrows any fixture just to trigger the dump; the
-audio is irrelevant, the output is the token table.
+audio is irrelevant, the output is the token table.## Running the gate on a change
+
+`tools/ci.sh` chains the host-only arms so a change is judged by the same gates a
+release is:
+
+```sh
+examples/paraformer/tools/ci.sh check    # tooling, pinned weights, fixture trees
+examples/paraformer/tools/ci.sh build    # the three binaries
+examples/paraformer/tools/ci.sh eval     # fixtures (if absent) + the five accuracy gates
+examples/paraformer/tools/ci.sh all      # all of the above
+```
+
+It takes the same `PF_MODELS` / `PF_RUN` layout as `reproduce.sh` and keeps the run
+directory, so a failure can be opened afterwards. Exit code is the gate result.
+
+[.github/workflows/paraformer-ci.yml](../../.github/workflows/paraformer-ci.yml)
+runs `build` and `eval` on a macOS runner for changes under `examples/paraformer`
+(macOS because the fixtures are rendered with `say`; the weights are cached by
+`tools/model_manifest.txt`). A Linux runner cannot render the fixtures, so it would
+only exercise the build arm - that is why the workflow is pinned to macOS.
+
+The device arm stays manual: `reproduce.sh device` needs a phone with the models
+pushed. Its recorded results live in [PRODUCTION.md](PRODUCTION.md).

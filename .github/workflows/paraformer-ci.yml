@@ -1,0 +1,72 @@
+name: CI (paraformer)
+
+# The host-only gate from examples/paraformer/tools/ci.sh. It needs macOS for the
+# `say` fixtures, CMake for the binaries, and the pinned weights from
+# tools/fetch_models.py. A change under examples/paraformer is judged by the
+# accuracy gates, not by whether it compiles.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+      - 'codex/**'
+    paths:
+      - '.github/workflows/paraformer-ci.yml'
+      - 'examples/paraformer/**'
+      - 'ggml/src/ggml-hexagon/**'
+
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/paraformer-ci.yml'
+      - 'examples/paraformer/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-gate:
+    runs-on: macos-14
+    timeout-minutes: 90
+    env:
+      PF_MODELS: ${{ github.workspace }}/models
+      PF_CACHE: ${{ github.workspace }}/.pf-cache
+      PF_RUN: ${{ github.workspace }}/.pf-runs/ci
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build-x-asr -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_TESTS=OFF
+
+      - name: Cache weights and fixtures
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.PF_MODELS }}
+            ${{ env.PF_RUN }}
+          key: pf-models-${{ hashFiles('examples/paraformer/tools/model_manifest.txt') }}
+
+      - name: Weights
+        run: |
+          if [ ! -f "$PF_MODELS/paraformer-zh-q8_0.gguf" ]; then
+            mkdir -p "$PF_MODELS"
+            python3 examples/paraformer/tools/fetch_models.py --dest "$PF_MODELS"
+          fi
+
+      - name: Build
+        run: examples/paraformer/tools/ci.sh build
+
+      - name: Accuracy gates
+        run: examples/paraformer/tools/ci.sh eval
+
+      - name: Upload run directory
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pf-run
+          path: ${{ env.PF_RUN }}
+          if-no-files-found: ignore
