@@ -227,7 +227,10 @@ static std::atomic<uint64_t> g_failed{0};
 static std::atomic<uint64_t> g_deadline_expired{0};
 static std::atomic<uint64_t> g_cancelled_queued{0};
 static std::atomic<size_t> g_ws_sessions{0};
-static constexpr size_t max_ws_sessions = 4;
+// Realtime sessions are cheap (one detector each) but each can hold a commit in
+// the queue, so the cap bounds memory and queue pressure together. Eight leaves
+// room for four cabin streams plus a console and a health probe.
+static size_t max_ws_sessions = 8;
 static constexpr size_t max_ws_pending = 4;
 static bool g_degraded = false;
 static std::atomic<uint64_t> g_event_seq{0};
@@ -1978,7 +1981,7 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
                      "usage: %s MODEL.gguf [--device HTP0:0] [--port N] [--engines N] [--threads N] "
-                     "[--htp-flash-attn | --no-htp-flash-attn] [--prefer-idle-htp] [--route-by-length | --route-by-length-ms N] [--htp-watchdog-ms N] [--htp-warmup-ms N] "
+                     "[--htp-flash-attn | --no-htp-flash-attn] [--prefer-idle-htp] [--max-ws-sessions N] [--route-by-length | --route-by-length-ms N] [--htp-watchdog-ms N] [--htp-warmup-ms N] "
                      "[--bind ADDR] [--queue N] [--queue-mib N] [--timeout-ms N] [--deadline-ms N] "
                      "[--model-id ID] [--warmup WAV] [--allow-cpu-fallback] [--recover-on-cpu] "
                      "[--partial-ms N] [--partial-interval-ms N] [--partial-min-s S] [--partial-max-s S] [--no-partials] "
@@ -2064,6 +2067,9 @@ int main(int argc, char** argv) {
             htp_flash_attn = true;
         } else if (std::strcmp(argv[i], "--prefer-idle-htp") == 0) {
             prefer_idle_htp = true;
+        } else if (std::strcmp(argv[i], "--max-ws-sessions") == 0 && i + 1 < argc) {
+            const int n = std::atoi(argv[++i]);
+            max_ws_sessions = (size_t) std::max(1, std::min(n, 64));
 
         } else if (std::strcmp(argv[i], "--route-by-length") == 0) {
             g_length_route = true;

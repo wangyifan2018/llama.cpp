@@ -14,6 +14,31 @@ CPU 引擎与声纹/VAD 是可选件。
   可直接核对。`PF_DEVICE=auto` 保留二进制探测，供宿主使用。
 - 精度档：热词规则 + 文本规则 + 标点，**属于服务的一部分**，不是可选优化
 
+## 0. 冻结的默认方案（v1，2026-11-19）
+
+以下十条是**生产默认**，改动需要重新过 §3 的验收并更新本节。依据都是本文件与
+`PRODUCTION.md` 里记录的实测。
+
+| # | 决定 | 依据 |
+|---|---|---|
+| 1 | 对外形态：OpenAI 音频接口（`/v1/audio/transcriptions`、`/v1/models`） | 调用方零学习成本；`response_format` 覆盖 json/text/verbose_json/srt |
+| 2 | 后端：**HTP 强制**（`PF_DEVICE=HTP0:0`），无 HTP 引擎拒绝启动（退出码 3） | 曾出现"悄悄跑在 CPU 上"，单请求 512 ms 对 264–289 ms |
+| 3 | 调度：`--prefer-idle-htp`，CPU worker 只作第二路溢出 | 共享队列让单路每隔一次落 CPU，P95 抖动 |
+| 4 | 引擎数 2、线程 4（`PF_ENGINES=2 PF_THREADS=4`） | 4 线程比 2 线程快 35 ms，RSS 只差 1 MB |
+| 5 | 实时：**服务端 VAD 断句**为默认，`silence_duration_ms=300` | 客户端自切端点会丢末字（16 条里 15 条）；250 ms 会把一句切成两段（11 段 vs 8 段） |
+| 6 | 段落事件：每段先 `x.pf.partial`（累积+本段），再 `committed`+`completed` | 一行不断变长的字幕 + 每段可独立计分 |
+| 7 | 段尾静音裁到 150 ms 再推理（不 padding、不补齐整块） | 静音纯解码开销（约 7 ms/60 ms）；补齐不提升精度 |
+| 8 | 精度档随服务部署：`PF_HOTWORDS` + `PF_TEXT_RULES` + 标点 | 同接口无档 65.6%，带档 87.5% |
+| 9 | 声纹：**默认关闭**，只上报 `speaker_score/ok`，不拦截 | TTS 声纹不足以决定拦截；开启后 4 路 P95 +200 ms |
+| 10 | 进程管理：`/vendor` + init.rc（root）或 `/data/local/tmp` + supervisor（无 root） | 同一 launcher；`kill -9` 后约 10 s 恢复 |
+
+明确不在本方案内（避免误读）：
+
+- 真实座舱录音的精度结论。所有数字来自 TTS 夹具，换音色 CER 可从 0.6% 掉到 34%。
+- 英文专有名词的模型级修复。当前靠 `cabin_text_rules.tsv` 的字面重写覆盖已知模板/店名。
+- 逐帧文本预览（`--partials`）。默认关闭，它不是断句结果。
+- 声纹拦截、说话人分离、单通道降噪（见 `denoise-options.md`）。
+
 ## 1. 两种落地形态
 
 | 形态 | 适用 | 组成 |

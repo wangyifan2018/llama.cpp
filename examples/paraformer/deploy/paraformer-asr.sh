@@ -97,8 +97,22 @@ export GGML_HEXAGON_DEVICES=${GGML_HEXAGON_DEVICES:-HTP0:0}
 export GGML_HEXAGON_OPPOLL=${GGML_HEXAGON_OPPOLL:-1}
 
 # ---- optional arguments ----------------------------------------------------
+# The device is explicit by default. "auto" keeps the binary's probe, which is
+# what a host wants; a device that forgets to pass anything would otherwise fall
+# back to CPU silently, and the server refuses to start on CPU without
+# --allow-cpu-only anyway.
+PF_DEVICE=${PF_DEVICE:-HTP0:0}
 set -- "$PF_MODEL" --port "$PF_PORT" --bind "$PF_BIND" \
     --engines "$PF_ENGINES" --threads "$PF_THREADS"
+if [ "$PF_DEVICE" != "auto" ]; then
+    set -- "$@" --device "$PF_DEVICE"
+fi
+if [ -n "${PF_MAX_WS_SESSIONS:-}" ]; then
+    set -- "$@" --max-ws-sessions "$PF_MAX_WS_SESSIONS"
+fi
+if [ "${PF_ALLOW_CPU_FALLBACK:-0}" = "1" ]; then
+    set -- "$@" --allow-cpu-fallback
+fi
 
 # A warmup file is optional on purpose. A missing one must not keep the service
 # down; the server falls back to silence and logs it. Only pass the flag when
