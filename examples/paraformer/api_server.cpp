@@ -738,6 +738,10 @@ static std::atomic<uint64_t> g_speaker_assessed{0};
 static float g_vad_threshold = 0.5f;
 static float g_vad_min_silence = 0.15f;
 static float g_vad_min_speech = 0.20f;
+// How much silence the streaming detector needs before it closes a segment. Short
+// on purpose: a cabin command should produce its result soon after the speaker
+// stops. Set --vad-silence-ms to trade latency against over-segmentation.
+static int g_vad_silence_ms = 300;
 static bool g_vad_enabled = false;
 
 #ifdef XASR_SPEAKER
@@ -1423,7 +1427,7 @@ static void ws_handle_text(const std::shared_ptr<WsSession>& s, const std::strin
                     std::memset(&cfg, 0, sizeof(cfg));
                     cfg.silero_vad.model = g_vad_model.c_str();
                     cfg.silero_vad.threshold = (float) td.value("threshold", 0.5);
-                    cfg.silero_vad.min_silence_duration = (float) td.value("silence_duration_ms", 500) / 1000.0f;
+                    cfg.silero_vad.min_silence_duration = (float) td.value("silence_duration_ms", g_vad_silence_ms) / 1000.0f;
                     cfg.silero_vad.min_speech_duration = (float) td.value("min_speech_duration_ms", 200) / 1000.0f;
                     cfg.silero_vad.window_size = 512;
                     cfg.silero_vad.max_speech_duration = (float) g_vad_split_s;
@@ -1944,7 +1948,7 @@ int main(int argc, char** argv) {
                      "[--partial-ms N] [--partial-interval-ms N] [--partial-min-s S] [--partial-max-s S] [--no-partials] "
                      "[--seg-gap-ms N] [--punct-gap-ms N] "
                      "[--web-dir DIR] [--speaker-model FILE] [--enroll-dir DIR] [--speaker-threshold F] [--speaker-max-s S] "
-                     "[--vad-model FILE] [--vad-split-s S] [--vad-threshold F] [--vad-min-silence S] "
+                     "[--vad-model FILE] [--vad-split-s S] [--vad-threshold F] [--vad-min-silence S] [--vad-silence-ms N] "
                      "[--vad-min-speech S] [--api-key TOKEN | PF_API_KEY] [--shutdown-grace-ms N]\n",
                      argv[0]);
         return 1;
@@ -2097,6 +2101,8 @@ int main(int argc, char** argv) {
             g_vad_min_silence = (float) std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--vad-min-speech") == 0 && i + 1 < argc) {
             g_vad_min_speech = (float) std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--vad-silence-ms") == 0 && i + 1 < argc) {
+            g_vad_silence_ms = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--seg-gap-ms") == 0 && i + 1 < argc) {
             g_seg_gap_ms = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--punct-gap-ms") == 0 && i + 1 < argc) {

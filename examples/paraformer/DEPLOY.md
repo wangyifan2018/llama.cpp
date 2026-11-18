@@ -144,8 +144,15 @@ device/state/value 90.5/90.5/100%，zh CER 0.60%，en WER 6.87%，wrong=0。
 **a) 连续流 + 服务端断句**（`session.update` 带 `turn_detection.type = "server_vad"`）：
 客户端只推 `input_audio_buffer.append`，服务端 VAD 判定声学停顿后，每次发一对
 `input_audio_buffer.committed` + `...transcription.completed`。结果延迟 = 停顿阈值
-（默认 500 ms）+ 推理（约 280 ms）。段落音频含尾部静音，因此不会出现客户端切太早导致的末尾丢字。
-停顿时长可配（`silence_duration_ms`），短于阈值的停顿不断句。
+（默认 **300 ms**，`--vad-silence-ms` 或 `silence_duration_ms` 可配）+ 推理（约 280 ms）。
+段落音频含尾部静音，因此不会出现客户端切太早导致的末尾丢字。
+
+阈值与真实停顿的对应关系（实测，数字静音间隔）：250 ms 不断句，**400 ms 断句**，600 ms 断句。
+检测器自身有窗口平滑，所以"配 300 ms" 的实际分界落在 250–400 ms 之间；想让 250 ms 也断，
+把阈值降到 150–200 ms 再测。无停顿的长音频由检测器在 18 s 处强制断开。
+
+会话结束时（`commit` 或断开）剩余音频**直接推理、不补齐**：图是按精确形状构建的，
+补齐只会多花算力并扰动 CIF 统计。
 
 **b) 客户端自己切段**：`append` 到切点后 `commit`，服务端返回该段终稿。适合前端 VAD 已经可靠的场景。
 
