@@ -275,6 +275,35 @@ Real Mandarin replay used 36 non-overlapping conversational clips from six speak
 
 The same six-speaker sample exercised the actual Android CAM++ path, with two disjoint enrollment clips per profile and four test clips per speaker. All 144 comparisons returned scores. At the shipping example threshold of 0.55, 5/24 genuine trials rejected (20.8%) and 30/120 impostor trials accepted (25%). At 0.65 those counts were 8/24 and 12/120. Results from shared sessions and clips are correlated and the cohort is small. The scores support retaining speaker assessment as advisory data while the control path is unqualified.
 
+### Voice sweep with synthesized speakers
+
+The second voice set was one speaker. A wider sweep separates "one unlucky voice" from "the model only works for the voice it was tuned on", and needs no recordings.
+
+[`tools/gen_voice_fixtures.py`](tools/gen_voice_fixtures.py) renders the same 32 cabin texts through the macOS voice engine, one output per voice, always 16 kHz mono PCM16. It picks the language variant per row: `say -v Eddy` alone resolves to the English variant, which renders Mandarin as 5 KB of digital silence and still exits 0. [`tools/score_voice.py`](tools/score_voice.py) posts a directory to a running server and reports the same CER and WER the table above uses.
+
+Tingting was re-rendered through the same script as a control. It reproduced the recorded set exactly - 0.60% zh and 13.74% en against 0.60% and 12.98% - so the pipeline is equivalent to the original fixtures and differences between rows are the voice.
+
+| Voice | Median F0 | zh CER | en WER |
+|---|---:|---:|---:|
+| Tingting (control) | 241 Hz | 0.60% | 13.74% |
+| Sandy | 250 Hz | 26.51% | 48.85% |
+| Shelley | 167 Hz | 35.54% | 41.98% |
+| Eddy | 122 Hz | 33.13% | 35.11% |
+| Rocko | 99 Hz | 35.54% | 33.59% |
+
+Every non-tuning voice lands at 26-36% zh CER, 44-59 times the control, which matches the independent Flo and Daniel result of 34.34% and confirms the effect is systemic rather than one bad voice. Pitch does not explain it: Sandy is within 10 Hz of Tingting and still misses 26.51%, so the damage is a general shift in timbre, not a gender or register offset.
+
+TTS bounds what this measures. There is no far field, no road noise, no microphone colouration and no accent, so these numbers are a floor on speaker sensitivity, not a ceiling on deployment error. They say the model does not generalise across speakers; they do not say how it fails in a cabin. Real recorded speech is still required for a release threshold.
+
+The fallback is unchanged: decoding-time bias cannot repair this. Hotwords and span rewrites act on tokens the model already produced, and 26-36% character error is the acoustic model choosing wrong characters, not a formatting problem. The paths are in-domain fine-tuning, or a speaker-adaptive front end.
+
+Fixtures and scores are reproducible with:
+
+```sh
+python3 examples/paraformer/tools/gen_voice_fixtures.py --voice Sandy --out /tmp/voice-sandy
+python3 examples/paraformer/tools/score_voice.py --dir /tmp/voice-sandy --out /tmp/voice-sandy.json
+```
+
 The fixture generator, package versions, checkpoint and clip hashes, transcript and per-clip grades, score trials and launchers are archived in `$HOME/Library/Caches/qwen3-asr-htp/paraformer-production/quality-funasr.7dHKEX`. Replay the upstream model with [`tools/run_funasr_reference.py`](tools/run_funasr_reference.py) and the exact dependency versions in `pip-freeze.txt`. To reproduce AISHELL-5 slicing from a local Dev archive, extract sessions 016, 017 and 018, then run the commands below with the same run directory. The corpus is publicly sourced and is kept outside the repository.
 
 ```sh

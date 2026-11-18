@@ -242,5 +242,23 @@ The M2 measurement on SM6650: encoder is kernel-bound (62.7% MUL_MAT+ADD,
 dispatch is only ~7%. See design doc §10 for the full breakdown and why this
 rules out cheap runtime-level encoder optimizations on the Q8_0 weights.
 
+## Voice fixtures
+
+`tools/cabin_commands.tsv` holds the 32 cabin texts, and
+`tools/gen_voice_fixtures.py` renders them in any macOS voice as 16 kHz mono
+PCM16. It selects the language variant per row, because `say -v Eddy` resolves
+to the English one and renders Mandarin as digital silence while exiting 0.
+
+```sh
+python3 tools/gen_voice_fixtures.py --voice Sandy --out /tmp/voice-sandy
+python3 tools/score_voice.py --dir /tmp/voice-sandy --url http://127.0.0.1:8899
+```
+
+`score_voice.py` reports the same zh CER and en WER used in
+[PRODUCTION.md](PRODUCTION.md). Five voices measured there put every
+non-tuning voice at 26-36% zh CER against 0.60% for Tingting, with pitch
+not explaining the spread. These are TTS clips: speaker variety without
+channel variety.
+
 See `docs/backend/snapdragon/paraformer-htp-adaptation-design.md` for the
 stage-split, length-bucket, overlap/stitch and bilingual plan.
