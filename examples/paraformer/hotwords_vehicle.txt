@@ -52,3 +52,21 @@
 # span; a rule on `we+are+right` alone matches any English sentence that
 # happens to contain those words.
 R 2.6 we+are+right => re@@+ar+right
+
+# --- §15 span rewrites for the two nouns no bias can reach -------------------
+# `footwell` and `lights` are wrong in the token COUNT, not the token: the model
+# emits `f@@ oo@@ t@@ w@@ all` (five) for footwell and `li@@ kes` (two) for
+# lights. A gain cannot add or drop a token, and `t@@>well` only helps when the
+# model has already stopped at `t@@` -- which it does in mixed utterances but
+# not on every English clip. A rewrite does not care about the count: it fires
+# after argmax when the wrong span is present and the right span is within
+# <margin> of it.
+#
+# These two were carried in `hotwords_vehicle_replace.txt` for a while and were
+# dropped by mistake during the §15 retune; restoring them is worth 6.3 points
+# of cabin command (65.6% -> 71.9%) and 1.5 points of en WER (8.40% -> 6.87%)
+# with mixed command and Mandarin unchanged. A margin of 5.0 is high on purpose:
+# these spans are long and specific, so the false-positive risk is in a short
+# span, not here. See design doc §32.
+R 5.0 f@@+oo@@+t@@+w@@+all => f@@+oo@@+t@@+well
+R 5.0 li@@+kes => li@@+gh@@+ts
