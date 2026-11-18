@@ -2248,8 +2248,40 @@ static bool paraformer_use_long(const pf_long_cfg& cfg, int n_samples) {
     return total_ms >= cfg.min_ms;
 }
 
+// Trailing digital silence makes this model hallucinate. Measured on the host
+// CPU with 10.9 s of cabin commands followed by digital silence: exact up to
+// 4 s, then "没有" appears and grows - 3 tokens at 5 s, four at 6 s, six at
+// 7 s, and six plus "证据" at 8 s. A single 3 s clip with 6 s of silence is
+// clean, so the trigger is speech length times silence length rather than
+// silence alone: the CIF has already emitted enough tokens to be confident about
+// the pattern and keeps going.
+//
+// The trim lives here rather than in the HTTP layer so that the CLI, the token
+// path and the server all stop at the same place. Putting it in api_server.cpp
+// was the first attempt, and the long-audio check failed because it drives the
+// CLI - the fix would have looked effective in production and stayed broken in
+// every benchmark.
+static constexpr double k_tail_silence_rms = 0.002;  // below speech, above dither
+static constexpr double k_tail_keep_s = 2.0;         // context the decoder expects after speech
+
+static int trim_trailing_silence(const float* pcm, int n_samples) {
+    const int win = 160;  // 10 ms
+    if (n_samples < win * 4) return n_samples;
+    int last_voiced = 0;
+    for (int start = 0; start + win <= n_samples; start += win) {
+        double sum = 0.0;
+        for (int i = start; i < start + win; ++i) sum += (double) pcm[i] * pcm[i];
+        if (std::sqrt(sum / win) >= k_tail_silence_rms) last_voiced = start + win;
+    }
+    if (last_voiced == 0) return n_samples;  // all silence: leave it to the empty-text path
+    const int keep = (int) (k_tail_keep_s * 16000.0);
+    if (last_voiced + keep <= last_voiced) return n_samples;
+    return std::min(n_samples, last_voiced + keep);
+}
+
 static std::optional<std::string> paraformer_run(paraformer_context* ctx, const float* pcm, int n_samples,
                                                 std::vector<pf_token>* tokens = nullptr) {
+    n_samples = trim_trailing_silence(pcm, n_samples);
     const pf_long_cfg lc = paraformer_long_cfg();
     if (paraformer_use_long(lc, n_samples))
         return paraformer_transcribe_long(ctx, pcm, n_samples, lc, tokens);
