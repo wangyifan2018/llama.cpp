@@ -1915,7 +1915,35 @@ int main(int argc, char** argv) {
             g_punct_gap_ms = std::atof(argv[++i]);
         }
     }
-    if (recover_on_cpu && (!device_set || std::strncmp(device, "HTP", 3) != 0)) {
+    // Pick HTP when the backend is present and the user did not choose. A phone
+    // run should not need the flag, and a host run must not fail because the
+    // backend is absent, so the choice is made from the registered devices and
+    // printed either way. This has to run before anything reads `device`: the
+    // first version lived after setenv("PARAFORMER_DEVICE"), so an auto-selected
+    // run printed "using HTP0:0" and then brought the engine up on CPU.
+    if (!device_set) {
+        ggml_backend_load_all();
+        const bool have_htp = [] {
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                const char* name = ggml_backend_dev_name(ggml_backend_dev_get(i));
+                if (name && std::strstr(name, "HTP")) {
+                    return true;
+                }
+            }
+            return false;
+        }();
+        if (have_htp && !recover_on_cpu) {
+            device = "HTP0:0";
+            std::fprintf(stderr, "pf-api: --device not given, using HTP0:0 (pass --device CPU to force CPU)\n");
+        } else {
+            std::fprintf(stderr, "pf-api: --device not given, using CPU\n");
+        }
+    }
+    // From here on `device` is the single source of truth: whether it came from
+    // --device or from the probe above, "not CPU" means an accelerator engine.
+    const bool device_accel = std::strcmp(device, "CPU") != 0;
+
+    if (recover_on_cpu && !device_accel) {
         std::fprintf(stderr, "pf-api: --recover-on-cpu requires an HTP --device\n");
         return 1;
     }
@@ -1930,7 +1958,7 @@ int main(int argc, char** argv) {
 
     install_shutdown_handlers();
     g_degraded = recover_on_cpu;
-    if (device_set && std::strcmp(device, "CPU") != 0) {
+    if (device_accel) {
         setenv("PARAFORMER_DEVICE", device, 1);
     }
     if (!g_vad_model.empty()) {
@@ -1946,6 +1974,7 @@ int main(int argc, char** argv) {
         }
         g_vad_enabled = true;
     }
+
     std::unique_ptr<HtpWatchdog> watchdog;
     if (!recover_on_cpu) {
         if (std::strncmp(device, "HTP", 3) == 0 && htp_watchdog_limit.count() > 0) {
@@ -2001,7 +2030,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < n_engines; ++i) {
         paraformer_context_params params = paraformer_context_default_params();
         params.n_threads = threads;
-        const bool wants_accelerator = i == 0 && device_set && std::strcmp(device, "CPU") != 0;
+        const bool wants_accelerator = i == 0 && device_accel;
         params.use_gpu = wants_accelerator && !recover_on_cpu;
         params.verbosity = 0;
         if (params.use_gpu && std::strncmp(device, "HTP", 3) == 0) params.flash_attn = htp_flash_attn;

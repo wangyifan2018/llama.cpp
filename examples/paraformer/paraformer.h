@@ -57,6 +57,11 @@ void paraformer_free(paraformer_context* ctx);
 // The caller frees the returned string.
 char* paraformer_transcribe(paraformer_context* ctx, const float* samples, int n_samples);
 
+// Literal phrase rewrites applied to the final transcript (TSV: from <TAB> to).
+// A rule fires only on an exact case-insensitive match, so it cannot invent a
+// rewrite on unrelated text. Returns the number of rules loaded.
+int paraformer_set_text_rules(paraformer_context* ctx, const char* path);
+
 // Warm up the runtime outside the measured path: creates the HTP session and
 // registers the encoder/decoder graphs once, so the first real request does not
 // pay the one-time DSP graph-dispatch cost (~1 s on SM6650). Samples should be

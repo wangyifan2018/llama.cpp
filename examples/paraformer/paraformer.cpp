@@ -185,6 +185,7 @@ struct paraformer_context {
     bool flash_attn = true;
     int verbosity = 0;
     std::vector<std::string> vocab; // token strings
+    std::vector<std::pair<std::string, std::string>> text_rules; // literal phrase rewrites
     // §14.5: which sub-word convention this checkpoint's vocab uses. Detected
     // from the vocab itself so a new checkpoint needs no flag.
     int word_marker = 0; // 0 = trailing @@ (zh), 1 = leading U+2581 (en)
@@ -1493,6 +1494,46 @@ static void pf_append_token(std::string& out, const std::string& tok, bool prev_
     out += text;
 }
 
+// Case-insensitive literal replace, once per rule, left to right. Spaces are
+// inserted at a boundary where an ASCII word would otherwise touch another.
+static void pf_apply_text_rules(paraformer_context* ctx, std::string& text) {
+    if (ctx->text_rules.empty() || text.empty()) {
+        return;
+    }
+    auto is_ascii_letter = [](unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); };
+    for (const auto& rule : ctx->text_rules) {
+        const std::string& src = rule.first;
+        const std::string& dst = rule.second;
+        if (src.empty()) {
+            continue;
+        }
+        std::string lower = text;
+        for (char& c : lower) c = (char) std::tolower((unsigned char) c);
+        std::string lsrc = src;
+        for (char& c : lsrc) c = (char) std::tolower((unsigned char) c);
+        size_t pos = 0;
+        while ((pos = lower.find(lsrc, pos)) != std::string::npos) {
+            std::string out;
+            out.reserve(text.size() + 8);
+            out.append(text, 0, pos);
+            if (!out.empty() && is_ascii_letter((unsigned char) out.back()) && is_ascii_letter((unsigned char) dst.front())) {
+                out += ' ';
+            }
+            out += dst;
+            size_t after = pos + src.size();
+            if (after < text.size() && is_ascii_letter((unsigned char) text[after]) &&
+                is_ascii_letter((unsigned char) dst.back())) {
+                out += ' ';
+            }
+            out.append(text, after, std::string::npos);
+            text = std::move(out);
+            lower = text;
+            for (char& c : lower) c = (char) std::tolower((unsigned char) c);
+            pos += dst.size();
+        }
+    }
+}
+
 static std::optional<std::string> paraformer_transcribe_impl(paraformer_context* ctx, const float* pcm, int n_samples,
                                               std::vector<float>* staged_out = nullptr, const char* stage = nullptr,
                                               std::vector<pf_token>* out_tokens = nullptr,
@@ -1503,6 +1544,11 @@ static std::optional<std::string> paraformer_transcribe_impl(paraformer_context*
     // §13: load whole-word logit bias once (env PF_HOTWORDS); no-op by default.
     paraformer_load_hotwords(ctx);
     paraformer_load_context(ctx);
+    if (ctx->text_rules.empty()) {
+        if (const char* tr = std::getenv("PF_TEXT_RULES")) {
+            paraformer_set_text_rules(ctx, tr);
+        }
+    }
 
     // 1. Feature extraction
     int T_lfr = 0, D_lfr_actual = 0;
@@ -2509,7 +2555,8 @@ char* paraformer_transcribe(paraformer_context* ctx, const float* samples, int n
         return nullptr;
     auto result = paraformer_run(ctx, samples, n_samples);
     if (!result) return nullptr;
-    const auto& s = *result;
+    std::string s = *result;
+    pf_apply_text_rules(ctx, s);
     char* buf = (char*)std::malloc(s.size() + 1);
     if (buf) {
         std::memcpy(buf, s.data(), s.size());
@@ -2518,13 +2565,44 @@ char* paraformer_transcribe(paraformer_context* ctx, const float* samples, int n
     return buf;
 }
 
+int paraformer_set_text_rules(paraformer_context* ctx, const char* path) {
+    if (!ctx || !path) {
+        return 0;
+    }
+    FILE* f = std::fopen(path, "r");
+    if (!f) {
+        std::fprintf(stderr, "pf: cannot open text rules %s\n", path);
+        return 0;
+    }
+    ctx->text_rules.clear();
+    char line[1024];
+    while (std::fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\0') {
+            continue;
+        }
+        std::string s(line);
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+        const size_t tab = s.find('\t');
+        if (tab == std::string::npos || tab == 0) {
+            continue;
+        }
+        ctx->text_rules.emplace_back(s.substr(0, tab), s.substr(tab + 1));
+    }
+    std::fclose(f);
+    if (ctx->verbosity > 0) {
+        std::fprintf(stderr, "pf: %zu text rules from %s\n", ctx->text_rules.size(), path);
+    }
+    return (int) ctx->text_rules.size();
+}
+
 paraformer_result* paraformer_transcribe_with_timestamps(paraformer_context* ctx, const float* samples, int n_samples) {
     if (!ctx || !samples || n_samples <= 0)
         return nullptr;
     std::vector<pf_token> tokens;
     auto result = paraformer_run(ctx, samples, n_samples, &tokens);
     if (!result) return nullptr;
-    const auto& s = *result;
+    std::string s = *result;
+    pf_apply_text_rules(ctx, s);
 
     auto* r = (paraformer_result*)std::malloc(sizeof(paraformer_result));
     if (!r)

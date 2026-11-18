@@ -1,0 +1,26 @@
+# Literal phrase rules for the shipped profile. Columns: from <TAB> to
+#
+# These exist because the zh checkpoint renders some English templates and names
+# as near-homophones (navigate -> "never get to", Luckin -> "locking"). A rule
+# fires only on an exact case-insensitive phrase match, so it cannot invent a
+# match on unrelated text; the cost is that it is a fixed list.
+#
+# Checked by tools/check_text_rules.py against the 84-clip set: every rule fires
+# on at least one shipped hypothesis and on no reference transcript.
+never good to	Navigate to
+never get too	Navigate to
+never get to	Navigate to
+naviget to	Navigate to
+北京capital airport	Beijing Capital Airport
+shinnamon square	Tiananmen Square
+locking coffee	Luckin Coffee
+locking cocannot let	Luckin coconut latte
+locking let	Luckin latte
+上海hunkill	Shanghai Hongqiao
+one fuging	Wangfujing
+or there a	Order a
+order in	Order an
+emy cananel	Americano
+emery canel	Americano
+j true	Jay Chou
+airpal refire	air purifier

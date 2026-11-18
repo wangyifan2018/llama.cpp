@@ -51,7 +51,7 @@ int main(int argc, char ** argv) {
     if (argc < 3) {
         fprintf(stderr,
                 "usage: %s MODEL.gguf WAV... [--device NAME] [--threads N] [--warmup FILE] [--timestamps] [--quiet]\n"
-                "       [--hotwords FILE] [--dump-logits N] [--bench-encoder-pair REPS]\n",
+                "       [--hotwords FILE] [--text-rules FILE] [--dump-logits N] [--bench-encoder-pair REPS]\n",
                 argv[0]);
         return 1;
     }
@@ -82,6 +82,8 @@ int main(int argc, char ** argv) {
             params.verbosity = 1;
         } else if (std::strcmp(argv[i], "--hotwords") == 0 && i + 1 < argc) {
             setenv("PF_HOTWORDS", argv[++i], 1);
+        } else if (std::strcmp(argv[i], "--text-rules") == 0 && i + 1 < argc) {
+            setenv("PF_TEXT_RULES", argv[++i], 1);
         } else if (std::strcmp(argv[i], "--dump-logits") == 0 && i + 1 < argc) {
             setenv("PF_DUMP_LOGITS", argv[++i], 1);
         } else if (std::strcmp(argv[i], "--bench-encoder-pair") == 0 && i + 1 < argc) {
