@@ -18,7 +18,17 @@ PORT="${1:-8899}"
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 PF_MODELS="${PF_MODELS:-$HOME/models/paraformer}"
-ADB="${ADB:-adb}"
+# adb is not always on PATH (it ships inside the Android SDK), so look in the usual
+# place before giving up.
+if [ -z "${ADB:-}" ]; then
+    if command -v adb >/dev/null 2>&1; then
+        ADB=adb
+    elif [ -x "$HOME/Library/Android/sdk/platform-tools/adb" ]; then
+        ADB="$HOME/Library/Android/sdk/platform-tools/adb"
+    else
+        ADB=adb
+    fi
+fi
 RUN="${PF_RUN:-/tmp/pf-reproduce}"
 
 say() { printf '\n== %s\n' "$*"; }
@@ -26,7 +36,15 @@ die() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
 [ -f "$PF_MODELS/paraformer-zh-q8_0.gguf" ] || die "missing $PF_MODELS/paraformer-zh-q8_0.gguf (run tools/fetch_models.py)"
 command -v docker >/dev/null 2>&1 || die "docker is required for the Android build"
-"$ADB" get-state >/dev/null 2>&1 || die "no device: adb get-state failed"
+# adb reports "device" only once the server has settled; retry instead of failing
+# on a transient state while another adb client is reconnecting.
+i=0
+while [ $i -lt 10 ]; do
+    [ "$("$ADB" get-state 2>/dev/null || true)" = "device" ] && break
+    i=$((i + 1))
+    sleep 2
+done
+[ "$("$ADB" get-state 2>/dev/null || true)" = "device" ] || die "no device: adb get-state failed"
 
 say "host build"
 cmake --build "$REPO/build-x-asr" --target llama-paraformer llama-paraformer-api -j 8

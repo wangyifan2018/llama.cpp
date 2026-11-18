@@ -227,3 +227,27 @@ R 3.0 储+物 => 除+雾
 # Conditional on 吹 rather than global -- 角 is a real word elsewhere (角度), so
 # a bare `5.0 脚` would fire on every utterance that mentions an angle.
 5.0 吹>脚
+# --- §34 Chinese cabin words -------------------------------------------------
+# The Chinese side of this vocabulary is one character per token, so a word like
+# 车窗 is two positions and only the conditional form can reach it: after 车 the
+# competitor is 门/道, after 空 it is 洞/间. Gains stay small because a Chinese
+# character carries a whole syllable and a large gain at every position rewrites
+# unrelated sentences (measured: a 3x context gain destroyed every transcript).
+# These fire on the previous token, so they are inert elsewhere.
+1.8 车>窗
+1.6 空>调
+1.5 关>闭
+1.4 打>开
+1.3 天>窗
+1.2 座>椅
+1.2 氛>围
+# Positions are deliberately NOT boosted. 左前/左后 and 右前/右后 both exist, so a
+# gain on 左>后 turns "把左前车窗打开" into "左后", which is a reversed action and
+# the worst kind of error. The model already gets the side right on the fixtures
+# (0 direction errors); if a real cabin shows side confusion, the fix is a
+# context-aware rule (the noun after the position), not a bigram gain.
+#
+# All of the rules above are conditional on the previous character, so they are
+# inert in any other context. The TTS fixtures do not exercise them: the whole
+# block changes no transcript on the 32- and 84-clip sets (measured), so their
+# value has to be shown on real recordings, not here.
