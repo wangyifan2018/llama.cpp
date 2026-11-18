@@ -59,11 +59,15 @@ public:
     }
 
     struct Guard {
-        Guard(HtpWatchdog* watchdog, const char* stage) : watchdog(watchdog) {
-            if (watchdog) watchdog->set(pf_clock::now() + watchdog->limit, stage);
+        Guard(HtpWatchdog* watchdog, const char* stage) : Guard(watchdog, stage, std::chrono::milliseconds(0)) {}
+        Guard(HtpWatchdog* watchdog, const char* stage, std::chrono::milliseconds limit) : watchdog(watchdog) {
+            if (watchdog) {
+                const auto span = limit.count() > 0 ? limit : watchdog->limit;
+                watchdog->set(pf_clock::now() + span, stage, span);
+            }
         }
         ~Guard() {
-            if (watchdog) watchdog->set(pf_clock::time_point::max(), nullptr);
+            if (watchdog) watchdog->set(pf_clock::time_point::max(), nullptr, std::chrono::milliseconds(0));
         }
         Guard(const Guard&) = delete;
         Guard& operator=(const Guard&) = delete;
@@ -73,10 +77,11 @@ public:
     };
 
 private:
-    void set(pf_clock::time_point when, const char* stage) {
+    void set(pf_clock::time_point when, const char* stage, std::chrono::milliseconds span) {
         std::lock_guard<std::mutex> lock(mutex);
         deadline = when;
         phase = stage;
+        active_limit = span;
         changed.notify_one();
     }
 
@@ -88,7 +93,7 @@ private:
             const auto when = deadline;
             if (!changed.wait_until(lock, when, [this, when] { return stopping || deadline != when; })) {
                 std::fprintf(stderr, "pf-api: HTP watchdog expired during %s after %lld ms\n", phase,
-                             (long long) limit.count());
+                             (long long) active_limit.count());
                 // The backend may be waiting on FastRPC. Skip its teardown.
                 std::_Exit(75);
             }
@@ -100,6 +105,7 @@ private:
     std::condition_variable changed;
     pf_clock::time_point deadline = pf_clock::time_point::max();
     const char* phase = nullptr;
+    std::chrono::milliseconds active_limit{0};
     bool stopping = false;
     std::thread thread;
 };
@@ -1458,7 +1464,7 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
                      "usage: %s MODEL.gguf [--device HTP0:0] [--port N] [--engines N] [--threads N] "
-                     "[--no-htp-flash-attn] [--prefer-idle-htp] [--htp-watchdog-ms N] "
+                     "[--no-htp-flash-attn] [--prefer-idle-htp] [--htp-watchdog-ms N] [--htp-warmup-ms N] "
                      "[--bind ADDR] [--queue N] [--queue-mib N] [--timeout-ms N] [--deadline-ms N] "
                      "[--model-id ID] [--warmup WAV] [--allow-cpu-fallback] [--recover-on-cpu] "
                      "[--partial-ms N] [--partial-interval-ms N] [--partial-max-s N] [--no-partials] "
@@ -1483,6 +1489,7 @@ int main(int argc, char** argv) {
     bool htp_flash_attn = true;
     bool prefer_idle_htp = false;
     std::chrono::milliseconds htp_watchdog_limit{0};
+    std::chrono::milliseconds htp_warmup_limit{0};
     for (int i = 2; i < argc; ++i) {
         if (std::strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
             device = argv[++i];
@@ -1539,6 +1546,18 @@ int main(int argc, char** argv) {
                 return 1;
             }
             htp_watchdog_limit = std::chrono::milliseconds(ms);
+        } else if (std::strcmp(argv[i], "--htp-warmup-ms") == 0) {
+            char* end = nullptr;
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "pf-api: --htp-warmup-ms requires a value\n");
+                return 1;
+            }
+            const long ms = std::strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end || ms < 100 || ms > 600000) {
+                std::fprintf(stderr, "pf-api: --htp-warmup-ms must be an integer from 100 to 600000\n");
+                return 1;
+            }
+            htp_warmup_limit = std::chrono::milliseconds(ms);
         } else if (std::strcmp(argv[i], "--web-dir") == 0 && i + 1 < argc) {
             web_dir = argv[++i];
         } else if (std::strcmp(argv[i], "--partial-ms") == 0 && i + 1 < argc) {
@@ -1603,7 +1622,8 @@ int main(int argc, char** argv) {
         if (std::strncmp(device, "HTP", 3) == 0 && htp_watchdog_limit.count() > 0) {
             watchdog = std::make_unique<HtpWatchdog>(htp_watchdog_limit);
         }
-        HtpWatchdog::Guard guard(watchdog.get(), "backend discovery");
+        HtpWatchdog::Guard guard(watchdog.get(), "backend discovery",
+                                 htp_warmup_limit.count() > 0 ? htp_warmup_limit : htp_watchdog_limit * 20);
         ggml_backend_load_all();
     }
 
@@ -1649,7 +1669,13 @@ int main(int argc, char** argv) {
         eng->requested = wants_accelerator ? device : "CPU";
         const double t0 = now_ms();
         {
-            HtpWatchdog::Guard guard(params.use_gpu ? watchdog.get() : nullptr, "engine warmup");
+            // Warmup covers engine init, weight materialisation and the first
+            // graph allocation, which is 1.2 s on SM6650 against 0.3-1.5 s for
+            // one inference. Reusing the inference limit here kills the process
+            // during start-up whenever the limit is tighter than a warmup, so
+            // warmup gets its own, wider bound.
+            HtpWatchdog::Guard guard(params.use_gpu ? watchdog.get() : nullptr, "engine warmup",
+                                     htp_warmup_limit.count() > 0 ? htp_warmup_limit : htp_watchdog_limit * 20);
             eng->ctx = paraformer_start_engine(w.get(), params, warm);
         }
         if (!eng->ctx && params.use_gpu && allow_cpu_fallback) {

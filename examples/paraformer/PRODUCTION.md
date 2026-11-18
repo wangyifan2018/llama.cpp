@@ -236,6 +236,16 @@ sh tools/supervise_api.sh ./bin/llama-paraformer-api paraformer-zh-q8_0.gguf HTP
 
 On SM6650, sending SIGKILL to the isolated HTP child after an acknowledged WS COMMIT closed that connection. Health returned `degraded` with two CPU engines on the same port after 1.57 s. The client opened a new socket, resent audio and received a correctly timed CPU result. The recovered child passed 21/21 smoke checks. The injection tests process death, the supervisor transition and client recovery. DSP faults and hangs require separate injection. A process that hangs needs the service manager's watchdog. Recovering an interrupted WS commit requires the client to retain and resubmit its audio after reconnect. The hashes, injection script, event output and supervisor log are in `$HOME/Library/Caches/qwen3-asr-htp/paraformer-production/admission.iALkbe`.
 
+Repeated on SM6650 with `SIGKILL` on the api child: the supervisor logged `exited mode=htp status=137`, started `mode=cpu`, and the new child reported `requested=HTP0:0 actual=CPU` with a full 1504/1504 encoder and 575/575 decoder placement in 329 ms. `/health` returned `degraded` and a plain `POST /v1/audio/transcriptions` still returned the correct text.
+
+### Watchdog scope
+
+`--htp-watchdog-ms` exits the process when a single backend call runs past the limit. It covers backend discovery, engine warmup and one inference, and it exits with status 75 rather than unwinding, because the backend may be parked in FastRPC.
+
+Warmup and discovery take longer than one inference: 1.3 s against 0.52-0.56 s on SM6650 with Q8_0. Using the inference limit there killed the process during start-up, so a limit below about 1.4 s could never start the service at all. Warmup and discovery now use `--htp-warmup-ms`, defaulting to twenty times the inference limit, so the same 400 ms inference limit now starts in 1332 ms and still exits during inference when a single call overruns.
+
+The limit must stay above the slowest single inference at the deployed audio length. A 400 ms limit on a 13.9 s clip exits as designed, because that clip needs about 1.4 s. Warmup does not close the gap: the first inference after warmup took 560 ms against 522 ms steady, so size the limit from steady-state inference plus margin, not from the warmup figure.
+
 ## Cabin command accuracy and FunASR
 
 The 96-clip regression uses 32 command texts across window, climate, seat and cabin light functions, synthesized in two voice sets. A further 16 confusable clips include four commands and 12 controls. Another 16 clips mention cabin devices without issuing a command. The shared offline evaluator re-parsed all 96 annotations before scoring. `device` includes the required position and `value` includes the annotated level, number, percentage or color. The command metric requires every annotated clause to match. Potential false activation is output that the offline evaluator maps to an actionable clause. Ship decisions require an evaluation of the actual downstream command parser and extra actions as well.
