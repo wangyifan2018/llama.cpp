@@ -185,6 +185,9 @@ struct paraformer_context {
     bool flash_attn = true;
     int verbosity = 0;
     std::vector<std::string> vocab; // token strings
+    // §14.5: which sub-word convention this checkpoint's vocab uses. Detected
+    // from the vocab itself so a new checkpoint needs no flag.
+    int word_marker = 0; // 0 = trailing @@ (zh), 1 = leading U+2581 (en)
     std::vector<char> compute_meta;
 
     // §13: NAR logit bias for confusable whole-word tokens. Loaded once from
@@ -1366,6 +1369,134 @@ bool paraformer_bench_encoder_pair(paraformer_context* ctx, const float* pcm_a, 
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// §14.5 Token text assembly, shared by the single-utterance and long-audio paths.
+//
+// The two Paraformer checkpoints use opposite conventions for "this token does
+// not start a word", and getting it wrong is invisible on Chinese:
+//
+//   paraformer-zh (vocab  8404)  trailing "@@"   ->  win@@ | do@@ | w
+//   paraformer-en (vocab 10020)  leading U+2581  ->  "▁recirculation"
+//
+// In the zh vocab "▁" appears zero times and in the en vocab "@@" appears zero
+// times, so the convention is a property of the checkpoint, not a guess: scan
+// the vocab once at load and record which marker it uses.
+//
+// The two conventions invert the meaning of an unmarked token:
+//   @@ vocab: no trailing @@  ->  the token ends a word
+//   ▁  vocab: no leading  ▁   ->  the token *continues* a word ("rec" "ir")
+// Reading the en vocab with zh rules splits "rec ir rc ulation" into four words
+// and scores four errors where there was one; reading it correctly is the
+// difference between 35.9% and 41.2% WER on the same audio.
+// ---------------------------------------------------------------------------
+
+enum pf_word_marker {
+    PF_MARK_ATAT = 0, // paraformer-zh: trailing "@@" marks continuation
+    PF_MARK_SPM  = 1, // paraformer-en: leading U+2581 marks a word start
+};
+
+static const char PF_SPM_MARK[] = "\xe2\x96\x81"; // U+2581 LOWER ONE EIGHTH BLOCK
+
+// Decide which convention a vocab follows by counting markers over the whole
+// table. Counts, not a single probe: "▁" may also appear inside a few zh tokens
+// by accident, and one stray "@@" in an en vocab would flip a first-match test.
+// The real tables are 0-vs-thousands, so the majority wins unambiguously.
+static pf_word_marker pf_detect_word_marker(const std::vector<std::string>& vocab) {
+    size_t spm = 0, atat = 0;
+    for (const auto& t : vocab) {
+        if (t.compare(0, 3, PF_SPM_MARK) == 0) {
+            ++spm;
+        }
+        if (t.size() >= 2 && t.substr(t.size() - 2) == "@@") {
+            ++atat;
+        }
+    }
+    return spm > atat ? PF_MARK_SPM : PF_MARK_ATAT;
+}
+
+// Read tokenizer.tokens out of the GGUF and set the marker convention. Both
+// init paths need this and they used to do it inline, so a change to one
+// silently skipped the other (that is how the English vocab ended up scored
+// with zh stitching rules).
+static void pf_load_vocab(paraformer_context* ctx) {
+    if (gguf_context* gctx = core_gguf::open_metadata(ctx->model_path.c_str())) {
+        const int idx = gguf_find_key(gctx, "tokenizer.tokens");
+        if (idx >= 0) {
+            const int n = gguf_get_arr_n(gctx, idx);
+            ctx->vocab.resize((size_t) n);
+            for (int i = 0; i < n; i++) {
+                ctx->vocab[(size_t) i] = gguf_get_arr_str(gctx, idx, i);
+            }
+        }
+        core_gguf::free_metadata(gctx);
+    }
+    ctx->word_marker = (int) pf_detect_word_marker(ctx->vocab);
+}
+
+// True when tok leaves the current word open (a following token continues it).
+static bool pf_token_continues(const std::string& tok, pf_word_marker mark) {
+    if (tok.empty()) {
+        return false;
+    }
+    if (mark == PF_MARK_SPM) {
+        if (tok.size() >= 2 && tok[0] == '<' && tok.back() == '>') {
+            return false; // <blank>/<s>/</s> are dropped, never spliced
+        }
+        // SentencePiece: the word-start marker is what opens a word; its
+        // absence means this piece continues the previous one.
+        return tok.compare(0, 3, PF_SPM_MARK) != 0;
+    }
+    return tok.size() >= 2 && tok.substr(tok.size() - 2) == "@@";
+}
+
+// Append one decoded token to out, inserting a space only at a real word
+// boundary. prev_continues is pf_token_continues() of the previous token.
+static void pf_append_token(std::string& out, const std::string& tok, bool prev_continues, pf_word_marker mark) {
+    if (tok.empty()) {
+        return;
+    }
+    if (tok.size() >= 2 && tok[0] == '<' && tok.back() == '>') {
+        return; // <blank>/<s>/</s>
+    }
+    std::string text = tok;
+    bool starts_word = false;
+    if (text.compare(0, 3, PF_SPM_MARK) == 0) {
+        text.erase(0, 3);
+        starts_word = true;
+    }
+    if (text.empty()) {
+        return;
+    }
+    const bool is_cont = mark == PF_MARK_ATAT && text.size() >= 2 &&
+                         text.substr(text.size() - 2) == "@@";
+    if (is_cont) {
+        text.resize(text.size() - 2);
+    }
+    if (!text.empty() && !out.empty()) {
+        const unsigned char first_byte = (unsigned char) text[0];
+        const unsigned char last_byte  = (unsigned char) out.back();
+        const bool cur_latin  = (first_byte >= 'a' && first_byte <= 'z') ||
+                                (first_byte >= 'A' && first_byte <= 'Z');
+        const bool prev_latin = (last_byte >= 'a' && last_byte <= 'z') ||
+                                (last_byte >= 'A' && last_byte <= 'Z');
+        bool space = false;
+        if (mark == PF_MARK_SPM) {
+            // The ▁ prefix *is* the word boundary; nothing else is. "▁a | f |
+            // way" is the word "afway", so continuity must not depend on
+            // whether the previous token happened to open a word.
+            space = starts_word && cur_latin;
+        } else {
+            // @@ vocab: a space separates two Latin runs unless the previous
+            // token ended in @@ and therefore continues the same word.
+            space = cur_latin && prev_latin && !prev_continues;
+        }
+        if (space) {
+            out += ' ';
+        }
+    }
+    out += text;
+}
+
 static std::optional<std::string> paraformer_transcribe_impl(paraformer_context* ctx, const float* pcm, int n_samples,
                                               std::vector<float>* staged_out = nullptr, const char* stage = nullptr,
                                               std::vector<pf_token>* out_tokens = nullptr,
@@ -1721,7 +1852,8 @@ static std::optional<std::string> paraformer_transcribe_impl(paraformer_context*
     std::vector<std::pair<int, float>> ctx_here;
 
     std::string result;
-    bool prev_was_bpe_cont = false; // true if previous token ended with @@
+    const pf_word_marker mark = (pf_word_marker) ctx->word_marker;
+    bool prev_was_bpe_cont = false; // true if previous token left the word open
     int prev_token = -1;            // §13: token chosen at n-1, for seq rules
     // Choose first, rewrite spans, then render. Without replacement rules the
     // output is byte-identical to the single-pass version.
@@ -1888,27 +2020,8 @@ static std::optional<std::string> paraformer_transcribe_impl(paraformer_context*
         if (best < 0 || best <= 2 || best == V - 1 || (size_t) best >= ctx->vocab.size())
             continue;
         const std::string& tok = ctx->vocab[best];
-        const bool is_bpe_cont = (tok.size() >= 2 && tok.substr(tok.size() - 2) == "@@");
-        // Insert space before Latin-script tokens that start a new word.
-        // Paraformer-zh uses character-level Chinese + word-level English
-        // with @@ BPE continuation markers. Space is needed between
-        // consecutive English words (tokens without @@ on either side).
-        if (!result.empty() && !prev_was_bpe_cont) {
-            unsigned char first_byte = (unsigned char)tok[0];
-            unsigned char last_byte = (unsigned char)result.back();
-            bool cur_is_latin =
-                (first_byte >= 'a' && first_byte <= 'z') || (first_byte >= 'A' && first_byte <= 'Z');
-            bool prev_is_latin = (last_byte >= 'a' && last_byte <= 'z') || (last_byte >= 'A' && last_byte <= 'Z');
-            if (cur_is_latin && prev_is_latin) {
-                result += ' ';
-            }
-        }
-        if (is_bpe_cont) {
-            result += tok.substr(0, tok.size() - 2);
-        } else {
-            result += tok;
-        }
-        prev_was_bpe_cont = is_bpe_cont;
+        pf_append_token(result, tok, prev_was_bpe_cont, mark);
+        prev_was_bpe_cont = pf_token_continues(tok, mark);
     }
 
     ggml_free(ctx0);
@@ -1960,22 +2073,6 @@ static pf_long_cfg paraformer_long_cfg() {
     return c;
 }
 
-// Join token texts into a string, applying the same Latin-space rule as the
-// single-utterance path (space between two English words, none after @@).
-static void pf_append_token(std::string& out, const std::string& tok, bool prev_cont) {
-    if (tok.empty())
-        return;
-    bool is_cont = (tok.size() >= 2 && tok.substr(tok.size() - 2) == "@@");
-    if (!out.empty() && !prev_cont) {
-        const unsigned char fb = (unsigned char) tok[0];
-        const unsigned char lb = (unsigned char) out.back();
-        const bool cur_latin = (fb >= 'a' && fb <= 'z') || (fb >= 'A' && fb <= 'Z');
-        const bool prev_latin = (lb >= 'a' && lb <= 'z') || (lb >= 'A' && lb <= 'Z');
-        if (cur_latin && prev_latin)
-            out += ' ';
-    }
-    out += is_cont ? tok.substr(0, tok.size() - 2) : tok;
-}
 
 // Decode a long utterance window-by-window and stitch the transcripts. Returns
 // the joined text; `out_tokens` (optional) receives the merged token stream.
@@ -1997,6 +2094,7 @@ static void pf_append_token(std::string& out, const std::string& tok, bool prev_
 // is the documented cost of context windows, not a stitch bug.
 static std::optional<std::string> paraformer_transcribe_long(paraformer_context* ctx, const float* pcm, int n_samples,
                                                             const pf_long_cfg& cfg, std::vector<pf_token>* out_tokens) {
+    const pf_word_marker mark = (pf_word_marker) ctx->word_marker;
     const int sr = 16000;
     const int64_t total_ms = (int64_t) n_samples * 1000 / sr;
     const int64_t win = cfg.win_ms, ov = cfg.overlap_ms;
@@ -2045,8 +2143,8 @@ static std::optional<std::string> paraformer_transcribe_long(paraformer_context*
                 std::string all;
                 bool pc = false;
                 for (const auto& t : toks) {
-                    pf_append_token(all, t.text, pc);
-                    pc = t.text.size() >= 2 && t.text.substr(t.text.size() - 2) == "@@";
+                    pf_append_token(all, t.text, pc, mark);
+                    pc = pf_token_continues(t.text, mark);
                 }
                 fprintf(stderr, "paraformer:   win%zu raw (%zu tok): %s\n", wi + 1, toks.size(), all.c_str());
             }
@@ -2131,8 +2229,8 @@ static std::optional<std::string> paraformer_transcribe_long(paraformer_context*
     std::string out;
     bool prev_cont = false;
     for (const auto& t : keep) {
-        pf_append_token(out, t.text, prev_cont);
-        prev_cont = (t.text.size() >= 2 && t.text.substr(t.text.size() - 2) == "@@");
+        pf_append_token(out, t.text, prev_cont, mark);
+        prev_cont = pf_token_continues(t.text, mark);
     }
     if (out_tokens)
         *out_tokens = std::move(keep);
@@ -2241,6 +2339,11 @@ paraformer_context* paraformer_init_shared(paraformer_weights* w, paraformer_con
         return nullptr;
     }
     ctx->vocab = w->vocab; // cheap: ~8404 short strings copied once at init
+    ctx->word_marker = (int) pf_detect_word_marker(ctx->vocab);
+    if (ctx->verbosity >= 1)
+        fprintf(stderr, "paraformer: word marker = %s (vocab %zu)\n",
+                ctx->word_marker == (int) PF_MARK_SPM ? "leading-U+2581" : "trailing-@@",
+                ctx->vocab.size());
     return ctx;
 }
 
@@ -2302,23 +2405,13 @@ paraformer_context* paraformer_init_from_file(const char* path, paraformer_conte
         return nullptr;
     }
 
-    // Load vocabulary from GGUF KV (tokenizer.tokens)
-    if (gguf_context* gctx = core_gguf::open_metadata(ctx->model_path.c_str())) {
-        int idx = gguf_find_key(gctx, "tokenizer.tokens");
-        if (idx >= 0) {
-            int n = gguf_get_arr_n(gctx, idx);
-            ctx->vocab.resize(n);
-            for (int i = 0; i < n; i++) {
-                ctx->vocab[i] = gguf_get_arr_str(gctx, idx, i);
-            }
-        }
-        core_gguf::free_metadata(gctx);
-    }
+    pf_load_vocab(ctx);
 
     if (ctx->verbosity >= 1) {
-        fprintf(stderr, "paraformer: loaded %zu tensors, vocab %zu, enc %u+%u blocks, dec %u blocks\n",
-                ctx->wl.tensors.size(), ctx->vocab.size(), ctx->model.hp.n_enc_blocks0, ctx->model.hp.n_enc_blocks,
-                ctx->model.hp.n_dec_blocks);
+        fprintf(stderr, "paraformer: loaded %zu tensors, vocab %zu (%s), enc %u+%u blocks, dec %u blocks\n",
+                ctx->wl.tensors.size(), ctx->vocab.size(),
+                ctx->word_marker == (int) PF_MARK_SPM ? "leading-U+2581" : "trailing-@@",
+                ctx->model.hp.n_enc_blocks0, ctx->model.hp.n_enc_blocks, ctx->model.hp.n_dec_blocks);
     }
 
     return ctx;
