@@ -93,7 +93,9 @@ async def ws_session(url, pcm, results, idx, sessions, start_at):
                 if m.get("type") == "conversation.item.input_audio_transcription.completed":
                     results[idx] = {"ms": (time.monotonic() - endpoint) * 1000.0,
                                     "text": m.get("transcript", ""),
-                                    "score": m.get("speaker_score")}
+                                    "score": m.get("speaker_score"),
+                                    "speaker_status": m.get("speaker_status"),
+                                    "speaker_reason": m.get("speaker_reason")}
                     return
                 if m.get("type") == "error":
                     results[idx] = {"error": m}
@@ -109,6 +111,35 @@ async def ws_bench(url, pcm, sessions):
     return results
 
 
+async def ws_commit_lifecycle(url, pcm):
+    import websockets
+
+    async with websockets.connect(url) as ws:
+        await asyncio.wait_for(ws.recv(), timeout=5)
+        await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        bad = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+        check("empty WS commit returns a request error", bad.get("error", {}).get("type") == "invalid_request_error")
+
+        for _ in range(2):
+            await ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": base64.b64encode(pcm).decode()}))
+            await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        await ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+        ack = []
+        final = []
+        drained = False
+        while len(final) < 2 or not drained:
+            m = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+            if m["type"] == "input_audio_buffer.committed":
+                ack.append(m["item_id"])
+            elif m["type"] == "conversation.item.input_audio_transcription.completed":
+                final.append((m["item_id"], bool(m["transcript"]) and m["usage"]["seconds"] > 0))
+            elif m["type"] == "input_audio_buffer.cleared":
+                drained = True
+            elif m["type"] == "error":
+                raise RuntimeError(m)
+        check("back-to-back WS commits survive clear", len(set(ack)) == 2 and sorted(final) == sorted((item, True) for item in ack))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
@@ -116,6 +147,8 @@ def main():
     ap.add_argument("--wav", required=True)
     ap.add_argument("--expect-gate", action="store_true", help="fail unless /health reports speaker_gate")
     ap.add_argument("--expect-vad", action="store_true", help="fail unless /health reports server_vad")
+    ap.add_argument("--expect-backend", help="require this actual backend on the first engine")
+    ap.add_argument("--expect-degraded", action="store_true", help="expect explicit CPU fallback")
     args = ap.parse_args()
 
     base = "http://%s:%d" % (args.host, args.port)
@@ -125,7 +158,13 @@ def main():
     # 1. health and capabilities
     status, _, body = http_json(base + "/health")
     health = json.loads(body)
-    check("health", status == 200 and health.get("status") == "ok", json.dumps(health))
+    expected_status = "degraded" if args.expect_degraded else "ok"
+    check("health", status == 200 and health.get("status") == expected_status, json.dumps(health))
+    if args.expect_backend:
+        backend = next(iter(health.get("backends", [])), {})
+        check("actual backend and warmup placement",
+              backend.get("actual") == args.expect_backend and backend.get("encoder_device_ops", 0) > 0 and
+              backend.get("decoder_device_ops", 0) > 0, json.dumps(backend))
     if args.expect_gate:
         check("health reports speaker_gate", health.get("speaker_gate") is True)
     if args.expect_vad:
@@ -161,7 +200,10 @@ def main():
 
     if args.expect_gate:
         score = hdr.get("X-Speaker-Score")
-        check("speaker headers present", score is not None, "score=%s ok=%s" % (score, hdr.get("X-Speaker-Ok")))
+        state = hdr.get("X-Speaker-Status")
+        check("speaker response state", (state == "assessed" and score is not None) or
+              (state == "not_assessed" and score is None and hdr.get("X-Speaker-Reason")),
+              "state=%s score=%s" % (state, score))
 
     # 4. error handling
     st, _, body = post_multipart(base + "/v1/audio/transcriptions", args.wav, {"response_format": "weird"})
@@ -187,13 +229,23 @@ def main():
     f32 = array.array("f", [v / 32768.0 for v in a])
     st, hdr, body = post_raw(base + "/asr/segment", f32.tobytes())
     check("/asr/segment", st == 200 and json.loads(body).get("text", "") != "")
+    if args.expect_gate:
+        state = json.loads(body).get("speaker_status")
+        check("raw exposes speaker state", state in ("assessed", "not_assessed") and state == hdr.get("X-Speaker-Status"))
+    st, _, _ = post_raw(base + "/asr/segment", struct.pack("<f", float("nan")))
+    check("raw rejects non-finite PCM", st == 400)
+    st, _, _ = post_raw(base + "/asr/segment", b"\x00" * (4 * (16000 * 30 + 1)))
+    check("raw rejects segments over 30 s", st == 413)
+    st, _, body = post_raw(base + "/asr/segment", struct.pack("<f", 0.0))
+    check("valid sub-frame PCM returns empty text", st == 200 and json.loads(body).get("text") == "")
 
-    # 6. silence guard (only meaningful with server VAD)
-    silence = b"\x00\x00" * 32000
+    # 6. digital silence is short-circuited with or without server VAD.
     st, hdr, body = post_raw(base + "/asr/segment", array.array("f", [0.0] * 32000).tobytes())
-    if args.expect_vad:
-        check("silence returns empty text", st == 200 and json.loads(body).get("text", "") == "",
-              "X-Empty=%s" % hdr.get("X-Empty", ""))
+    check("silence returns empty text", st == 200 and json.loads(body).get("text") == "" and hdr.get("X-Empty") == "silence",
+          "X-Empty=%s" % hdr.get("X-Empty", ""))
+    if args.expect_gate:
+        check("silence never carries a speaker score", hdr.get("X-Speaker-Status") == "not_assessed" and
+              hdr.get("X-Speaker-Reason") == "silence" and "X-Speaker-Score" not in hdr)
 
     # 7. realtime, single and four concurrent
     res = asyncio.run(ws_bench(ws_url, pcm, 1))
@@ -204,6 +256,13 @@ def main():
     texts = set(r["text"] for r in res if r and "text" in r)
     check("ws four concurrent", ok and len(texts) == 1,
           "max %.0f ms, consistent=%s" % (max(r["ms"] for r in res if r and "ms" in r), len(texts) == 1))
+    if args.expect_gate:
+        check("ws overlapping commits expose speaker state",
+              all(r.get("speaker_status") == "assessed" and r.get("score") is not None or
+                  r.get("speaker_status") == "not_assessed" and r.get("score") is None and r.get("speaker_reason")
+                  for r in res if r and "error" not in r) and
+              any(r and r.get("speaker_reason") == "busy" for r in res))
+    asyncio.run(ws_commit_lifecycle(ws_url, pcm))
 
     # 8. queue accounting
     status, _, body = http_json(base + "/metrics")
