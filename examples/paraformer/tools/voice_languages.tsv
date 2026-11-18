@@ -1,0 +1,44 @@
+﻿# Which voices may be used for which language, and why.
+#
+# A voice is only usable for a language if it is a native voice for that
+# language. The multilingual novelty voices synthesise Mandarin badly enough
+# that every recogniser fails on the audio itself, so they cannot measure an ASR
+# engine at all: whisper small scores 46-69% zh CER on those clips while scoring
+# 3.4% WER on the English clips from the same eight voices. Their English is
+# native, so they remain valid for English.
+#
+#   voice      zh  en  note
+#   Tingting   yes -   Mandarin voice; no English variant, accented English
+#   Meijia     yes -   Mandarin voice
+#   Sinji      no  -   Cantonese voice reading Mandarin; 65.7% zh CER because
+#                      the audio itself is accented, so it measures the voice
+#   Sandy      -   yes multilingual novelty voice, Mandarin damaged
+#   Eddy       -   yes
+#   Rocko      -   yes
+#   Shelley    -   yes
+#   Reed       -   yes
+#   Grandma    -   yes
+#   Grandpa    -   yes
+#   Flo        -   yes
+#
+# Excluding a clip does not mean dropping it from the sweep: it means not
+# scoring it. A voice that is wrong for the language produces a number that
+# looks like an engine defect and is not one, which is exactly how the first
+# English baseline came out at 39.5% for reasons that had nothing to do with
+# English.
+#
+# readers: tools/compare_checkpoints.py (--dir sweep), tools/score_voice.py,
+# tools/check_audio_quality.py
+
+voice	zh	en
+Tingting	yes	no
+Meijia	yes	no
+Sinji	no	no
+Sandy	no	yes
+Eddy	no	yes
+Rocko	no	yes
+Shelley	no	yes
+Reed	no	yes
+Grandma	no	yes
+Grandpa	no	yes
+Flo	no	yes
