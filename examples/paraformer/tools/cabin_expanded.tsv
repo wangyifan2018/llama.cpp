@@ -1,0 +1,115 @@
+# Cabin command expansion: lights beyond ambient, HVAC modes, seat modes,
+# navigation landmarks, ordering and media. Each row is
+#   id <TAB> lang <TAB> reference text
+# Grader fields for these live in vehicle_semantics_expanded.tsv once measured;
+# this file is the text source so a new voice can be rendered from it.
+#
+# Coverage rules this set is built around, from the product requirements:
+#   - position words: 主驾 / 副驾 / 左后 / 右后 and the English driver/passenger
+#     forms, because getting these backwards is the worst failure in a cabin
+#   - control verbs: 调到 (set to an absolute value) against 调高/调低 (relative)
+#     must both appear, since they take different downstream actions
+#   - every device family named in the requirements gets at least two clips so a
+#     single misrecognition does not look like a domain-wide gap
+
+# --- lights: every lamp a car actually exposes, not just ambient ----------
+lt2_zh01.wav	zh	打开前雾灯
+lt2_zh02.wav	zh	关闭后雾灯
+lt2_zh03.wav	zh	把大灯调到自动
+lt2_zh04.wav	zh	打开双闪
+lt2_zh05.wav	zh	把阅读灯调到最亮
+lt2_zh06.wav	zh	关掉顶灯和脚窝灯
+lt2_zh07.wav	zh	把氛围灯调成冰蓝色
+lt2_zh08.wav	zh	打开后备箱灯
+lt2_en01.wav	en	Turn on the front fog lights
+lt2_en02.wav	en	Turn off the rear fog lights
+lt2_en03.wav	en	Set the headlights to auto
+lt2_en04.wav	en	Turn on the hazard lights
+lt2_en05.wav	en	Turn the reading light to the brightest
+lt2_en06.wav	en	Turn off the dome light and the footwell lights
+lt2_en07.wav	en	Set the ambient lights to ice blue
+lt2_en08.wav	en	Turn on the trunk light
+
+# --- HVAC: modes, not just a temperature --------------------------------
+# 调到 vs 调高 is the pair that matters: same device, opposite downstream act.
+hvac2_zh01.wav	zh	把主驾温度调高两度
+hvac2_zh02.wav	zh	把空调调到二十四度
+hvac2_zh03.wav	zh	打开前风挡除霜
+hvac2_zh04.wav	zh	打开后风挡除雾
+hvac2_zh05.wav	zh	切换到吹脚模式
+hvac2_zh06.wav	zh	空调调到自动模式
+hvac2_zh07.wav	zh	把副驾温度调低一度
+hvac2_zh08.wav	zh	打开空气净化
+hvac2_en01.wav	en	Raise the driver temperature by two degrees
+hvac2_en02.wav	en	Set the air conditioning to twenty four degrees
+hvac2_en03.wav	en	Turn on the front windshield defrost
+hvac2_en04.wav	en	Turn on the rear window defog
+hvac2_en05.wav	en	Switch to the footwell airflow mode
+hvac2_en06.wav	en	Set the climate to automatic mode
+hvac2_en07.wav	en	Lower the passenger temperature by one degree
+hvac2_en08.wav	en	Turn on the air purifier
+
+# --- seats: position, heating, ventilation, massage, memory -------------
+seat2_zh01.wav	zh	把主驾座椅往后调
+seat2_zh02.wav	zh	把副驾座椅靠背放倒
+seat2_zh03.wav	zh	打开主驾座椅按摩
+seat2_zh04.wav	zh	把右后座椅加热调到三档
+seat2_zh05.wav	zh	保存当前座椅位置
+seat2_zh06.wav	zh	打开座椅通风最强档
+seat2_en01.wav	en	Move the driver seat back
+seat2_en02.wav	en	Recline the passenger seat backrest
+seat2_en03.wav	en	Turn on the driver seat massage
+seat2_en04.wav	en	Set the rear right seat heater to level three
+seat2_en05.wav	en	Save the current seat position
+seat2_en06.wav	en	Turn the seat ventilation to the highest level
+
+# --- windows and roof: the ambiguous phrasing the requirements call out --
+# `降下来三指` and `开一条缝` are the vague ones: no number, no percent.
+win2_zh01.wav	zh	把主驾车窗降下来三指
+win2_zh02.wav	zh	副驾车窗开一条缝
+win2_zh03.wav	zh	打开天窗
+win2_zh04.wav	zh	关闭遮阳帘
+win2_en01.wav	en	Roll the driver window down three fingers
+win2_en02.wav	en	Open the passenger window a crack
+win2_en03.wav	en	Open the sunroof
+win2_en04.wav	en	Close the sunshade
+
+# --- navigation: landmarks and place names -------------------------------
+# Mixed script on purpose: a Chinese sentence with a Latin place name is the
+# normal case for a cabin, and it is the boundary where `rear right` broke.
+nav_zh01.wav	zh	导航到北京首都机场
+nav_zh02.wav	zh	导航到最近的充电站
+nav_zh03.wav	zh	导航到天安门广场
+nav_zh04.wav	zh	导航到瑞幸咖啡
+nav_zh05.wav	zh	导航到上海虹桥火车站
+nav_zh06.wav	zh	导航到王府井
+nav_en01.wav	en	Navigate to Beijing Capital Airport
+nav_en02.wav	en	Navigate to the nearest charging station
+nav_en03.wav	en	Navigate to Tiananmen Square
+nav_en04.wav	en	Navigate to Luckin Coffee
+nav_en05.wav	en	Navigate to Shanghai Hongqiao railway station
+nav_en06.wav	en	Navigate to Wangfujing
+
+# --- ordering: the coffee case the requirements name ---------------------
+ord_zh01.wav	zh	帮我点一杯瑞幸拿铁
+ord_zh02.wav	zh	点一杯美式咖啡
+ord_zh03.wav	zh	来一杯瑞幸的生椰拿铁
+ord_zh04.wav	zh	点一杯星巴克的美式
+ord_en01.wav	en	Order a Luckin latte
+ord_en02.wav	en	Order an Americano
+ord_en03.wav	en	Get me a Luckin coconut latte
+ord_en04.wav	en	Order an Americano from Starbucks
+
+# --- media: playback control, not just "play something" ------------------
+med_zh01.wav	zh	播放周杰伦的歌
+med_zh02.wav	zh	暂停播放
+med_zh03.wav	zh	下一首
+med_zh04.wav	zh	把音量调大一点
+med_zh05.wav	zh	打开收音机
+med_zh06.wav	zh	播放我的收藏歌单
+med_en01.wav	en	Play some Jay Chou
+med_en02.wav	en	Pause the music
+med_en03.wav	en	Next track
+med_en04.wav	en	Turn the volume up a little
+med_en05.wav	en	Turn on the radio
+med_en06.wav	en	Play my favourites playlist

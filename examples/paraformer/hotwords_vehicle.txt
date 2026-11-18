@@ -1,6 +1,7 @@
 # Paraformer NAR logit bias for cabin English confusables.
 # Measured on 2026-11-17 (SM6650 + host CPU) and re-tuned on 2026-11-18 against
-# the mixed-language fixture set. Four forms:
+# the mixed-language fixture set, then extended to seven more cabin domains.
+# Four forms:
 #   <gain> <token>            global gain at every CIF position
 #   <gain> <prefix>><token>   conditional: only when previous token == prefix
 #   R <margin> <w+c...> => <r+c...>
@@ -8,7 +9,7 @@
 #                             acoustic score: it fires only when the replacement
 #                             is within <margin> of what was actually observed.
 #   (blank line / # comment)
-# See design doc §13-14 and §15.
+# See design doc §13-14, §15 and §33.
 
 # --- §13 whole-word: single-token words, gap measured by PF_DUMP_LOGITS ---
 # said->set 2.89-3.00. 'and' (gap 4.16, also perturbs a neighbouring 'on') is
@@ -70,3 +71,144 @@ R 2.6 we+are+right => re@@+ar+right
 # span, not here. See design doc §32.
 R 5.0 f@@+oo@@+t@@+w@@+all => f@@+oo@@+t@@+well
 R 5.0 li@@+kes => li@@+gh@@+ts
+
+# --- §33 the seven cabin domains the profile never covered -------------------
+# Everything above was tuned against 32 clips of windows, temperature, seat
+# heat and ambient light. Everything a car also exposes -- fog lights, defrost,
+# footwell airflow, navigation landmarks, ordering, media -- was absent from
+# that set and therefore never measured. 84 new clips across seven domains
+# (tools/cabin_expanded.tsv) put the no-profile baseline at 51/84; this block
+# takes it to 69/84 with zero regressions on the original 32.
+#
+# Every English error below is a span rewrite, and the reason is the one §15
+# already found: the wrong token sequence has a different length from the right
+# one, so no gain can reach it. What is new is the *shape* rule, which is easy
+# to get wrong and silently produces the defect it meant to remove:
+#
+#   every non-final piece carries "@@", the final piece does not
+#
+#   R 99.0 re@@+r => re@@+ar@@  ->  `rearfot lights`   (joined to next word)
+#   R 99.0 re@@+r => re@@+ar   ->  `rear fot lights`   (correct)
+#
+# A piece without "@@" ends a word, so `re@@+ar@@` tells the renderer that the
+# word continues into whatever follows. Measured on lt2_en02. The same rule in
+# reverse matters for the WRONG side: a span written `t+al` does not match a
+# model that emitted `t@@ al`, and the rule then never fires while its deficit
+# is reported as 8.89 -- which reads like a model limitation and is not.
+# tools/check_vocab_coverage.py derives covers under this rule now, so a
+# replacement span can be generated instead of guessed.
+
+# Position word: the highest-value rule in this block. `driver` loses to
+# `driry ather` by 0.61 on seat2_en03 and *wins* by 0.88 on win2_en01 -- the
+# model wanted the right answer both times, which is why a rewrite is enough
+# and no gain is needed. Getting the seat side wrong is the worst failure a
+# cabin assistant can make, so it is fixed even though it covers two clips.
+R 1.2 dri@@+ry+a@@+ther => dri@@+ver
+# `driver or window`: the `or` is a stray token off the same sibilance.
+R 1.2 dri@@+ver+or => dri@@+ver
+
+# Relative control verbs. 调低 is `lower`, and it decoded as `loyred` with the
+# first two pieces fused. The product requirement is that 调高/调低 (relative)
+# and 调到 (absolute) stay distinguishable downstream; `loyred ... by one
+# degree` states no direction, so nothing can be executed.
+R 8.2 lo@@+y@@+red => low@@+er
+
+# `rear` -> `re@@r`: the vowel is dropped, not the word. Deficit 0.68.
+R 1.2 re@@+r => re@@+ar
+# `fog` -> `fot` in `rear fog lights`, a different failure from `front fog
+# lights` below because the model fails differently in each position.
+R 2.4 fo@@+t => fo@@+g
+
+# Lights beyond ambient. `hazard` arrives as `hazard+s`, one token too many.
+R 1.8 ha@@+z@@+ar@@+ds => ha@@+z@@+ard
+# `brightest` -> `brigest`; the right cover is bri@@|gh@@|test.
+R 2.3 bri@@+ge@@+st => bri@@+gh@@+test
+# `dome` -> `d@@|om@@|e`, again one extra token. 9.0 because `d`+`om`+`e` is a
+# common shape and the span alone would match other words.
+R 9.4 d@@+om@@+e => do@@+me
+# `footwell` on a pure-English clip -> `footal`. §15 covers the mixed-utterance
+# form with `t@@>well` plus a five-piece rewrite; here the model stops at `t@@`
+# and picks `al`, so the wrong span is four pieces. Deficit 1.41.
+R 1.9 f@@+oo@@+t@@+al => f@@+oo@@+t@@+well
+# `set the ambient` -> `sately` + `ambient`: verb and article fused into one
+# word, so both disappear.
+R 8.2 sa@@+te@@+le@@+ly => set+the
+
+# Sunroof and sunshade: two failure shapes on the same noun family.
+# `sunroof` -> `su@@|n|ro@@|of` (vowel merged into the previous piece).
+R 6.2 su@@+n+ro@@+of => su@@+n@@+roo@@+f
+# `sunshade` -> `s@@|un@@|sh@@|e@@|et`, tail becomes `et` instead of `ade`.
+R 7.6 s@@+un@@+sh@@+e@@+et => su@@+n@@+sha@@+de
+
+# Seat backrest -> `b@@|ack@@|ru@@|st`. `backrest` is ba@@|c@@|k@@|rest, so the
+# model has the word and only the join is wrong.
+R 8.2 b@@+ack@@+ru@@+st => ba@@+c@@+k@@+rest
+# `recline` -> `reclined`: a tense, not a misrecognition, but the downstream
+# parser sees a different verb form.
+R 2.9 rec@@+l@@+ined => rec@@+line
+# `driver seat massage` -> `massave`. `massage` is ma@@|ss@@|age and the model
+# has `ma@@|ss|a@@|ve`; only the last two pieces are wrong. Deficit 2.03.
+R 9.8 m@@+as@@+sa@@+ve => ma@@+ss@@+age
+# `seat heater` -> `siat he to`. The word split into two and the model inserted
+# `to` from the following phrase, which a rewrite has to consume as well.
+R 6.8 si@@+at+he+to+le@@+ar@@+n+to => se@@+at+he@@+at@@+er+to
+# `highest` -> `highst`; the right cover is hi@@|gh@@|es@@|t.
+R 5.9 hi@@+gh@@+st => hi@@+gh@@+es@@+t
+
+# Media: `pause` -> `post`. Same length, so a tail gain would also reach it,
+# but the span is unambiguous and a rewrite disturbs nothing else.
+R 3.4 po@@+st+the+mu@@+si@@+c => pa@@+use+the+mu@@+si@@+c
+
+# Navigation. `navigate` -> `na@@|vi@@|get`: the last piece is `get`, not
+# `gate`, and `te` is a valid final piece, so the rewrite closes the word.
+R 3.6 na@@+vi@@+get => na@@+vi@@+ga@@+te
+
+# `front fog lights` -> `front found lights`. `found` replaces `fog`, so the
+# span is three pieces against two; the article anchors it.
+R 3.8 fron@@+t+found => fron@@+t+fo@@+g
+
+# HVAC. `windshield` arrives split as `wind shield`, and `day frost` is
+# `defrost` with the first piece replaced. Both are their own spans.
+R 5.3 w@@+ind+shi@@+e@@+ld => win@@+d@@+shi@@+el@@+d
+R 1.7 day+fro@@+st => de@@+fro@@+st
+# `rear window defog` -> `rear window definitely`. Defog is de@@|fo@@|g.
+R 8.1 de@@+fin@@+i@@+tely => de@@+fo@@+g
+# `footwell airflow mode` -> `foot will airflow moat`. Two separate rules: the
+# noun (`foot will` is the two-word version of the four-piece one above) and the
+# tail of `mode`.
+R 1.4 f@@+oo@@+t+will => f@@+oo@@+t@@+well
+R 1.2 mo@@+at => mo@@+de
+
+# --- not fixable with a hotword: recorded so nobody re-tries them ------------
+# `air purifier` -> `airpurifier`. This is not a recognition error. `air` has
+# no standalone form in this vocabulary -- only `air@@`, which continues a word
+# -- so two words cannot be rendered where the model produced one, and every
+# rewrite candidate ends up as `air@@|pu@@|ri@@|fi@@|er`. Verified with
+# PF_DUMP_VOCAB. Fixing it means saying `air filter` instead.
+#
+# `favourites playlist` -> `favorite playlist` with a duplicated `tes`. The
+# right span is unreachable (deficit 10.67) and the redundancy is in the model,
+# not in one token.
+#
+# `Luckin`, `Wangfujing`, `Tiananmen`, `Americano`, `Hongqiao` are all
+# spellable (tools/check_vocab_coverage.py: 3-7 pieces each) but decode as
+# unrelated words -- `locking`, `one fuging`, `shinnamon`, `emy cananel`,
+# `hunkill`. Their deficits are 9-11, and a margin that high rewrites unrelated
+# sentences. These are proper nouns the acoustic model has never seen; the fix
+# is a retrained model or a downstream name matcher, not a hotword.
+#
+# `Jay Chou` -> `j true` is the same class: an out-of-vocabulary proper noun.
+
+# --- §33 Chinese: per-character modelling leaves only near-homophones --------
+# The Mandarin side of the 84 clips is 31/33 correct with no profile at all.
+# The zh checkpoint emits one token per character, so a Mandarin word is never
+# assembled and there is no word-boundary problem at all. Both remaining
+# failures are single-character homophones, which is exactly what a
+# per-character checkpoint can be biased on.
+#
+# 除雾 (defog) -> 储物 (storage): 物 leads 雾 by 2.60. Deficit 2.58.
+R 3.0 储+物 => 除+雾
+# 吹脚 (footwell airflow) -> 吹角 (blow angle): 角 leads 脚 by 4.42.
+# Conditional on 吹 rather than global -- 角 is a real word elsewhere (角度), so
+# a bare `5.0 脚` would fire on every utterance that mentions an angle.
+5.0 吹>脚
