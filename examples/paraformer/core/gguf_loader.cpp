@@ -9,13 +9,9 @@
 namespace core_gguf {
 
 gguf_context * open_metadata(const char * path) {
-    ggml_context * ctx = nullptr;
-    gguf_context * g = gguf_init_from_file(path, {true, &ctx});
+    gguf_context * g = gguf_init_from_file(path, {true, nullptr});
     if (!g) {
         fprintf(stderr, "paraformer: cannot open GGUF '%s'\n", path);
-        if (ctx) {
-            ggml_free(ctx);
-        }
         return nullptr;
     }
     return g;
