@@ -2,6 +2,26 @@
 
 The product receives complete 16 kHz VAD segments and returns final Mandarin and English transcripts. The target device is SM6650, with up to four concurrent requests and no required partial display. The existing Q8_0 HTP + CPU configuration is the reference. Compare changes against endpoint-to-final P95 as well as failures, transcript and command-field accuracy, and device resource use.
 
+## Paths and reproducibility
+
+Nothing in this file depends on the machine it was written on. Three shell variables stand in for the paths a reader will use; set them once in the shell that runs these commands and every snippet below works unchanged.
+
+| Variable | Meaning | Example |
+|---|---|---|
+| `PF_MODELS` | Directory holding the `.gguf` weights and the `tingting/`, `voices/` fixture trees | `~/models/paraformer` |
+| `PF_CACHE` | Scratch/tooling root: python venv, ONNX reference checkouts | `~/pf-cache` |
+| `PF_RUN` | Run directory for one recorded experiment | `~/pf-runs/quality-1` |
+
+```sh
+export PF_MODELS="$HOME/models/paraformer"
+export PF_CACHE="$HOME/pf-cache"
+export PF_RUN="$HOME/pf-runs/quality-1"
+```
+
+Get the weights with [`tools/fetch_models.py`](README.md#weights); it verifies sha256 and is the only supported way to obtain a byte-exact copy. Build the binaries as described in [the README](README.md). Fixtures are regenerated, not shipped - see [Fixture provenance](#fixture-provenance).
+
+Some sections cite an archive directory named like `$PF_RUN/<stage>.<nonce>` (`lifecycle.Ojlk2S`, `quality-funasr.7dHKEX`, ...). Those directories exist **only on the authoring machine**. They are cited so a reviewer can see which run a number came from, not because a reader is expected to open them. Every command needed to re-derive the numbers is inline in the section, and `reproduce.sh` runs the accuracy gate end to end. Treat a missing archive as normal.
+
 ## Request lifecycle and input boundaries
 
 Baseline source `7d7590cdc` reproduced two WebSocket failures on macOS CPU. An empty commit did not return an error. Two consecutive accepted commits on the same connection returned only the second result.
@@ -14,7 +34,7 @@ All server inputs now enforce a 30-second segment limit. TCP validates sample al
 
 ```sh
 cmake --build build-x-asr --target llama-paraformer-api llama-paraformer-server -j 6
-PF_MODELS="$HOME/Library/Caches/qwen3-asr-htp/paraformer-models"
+PF_MODELS="${PF_MODELS:-$HOME/models/paraformer}"
 PF_WAV="$PF_MODELS/tingting/hvac_zh01.wav"
 build-x-asr/bin/llama-paraformer-api "$PF_MODELS/paraformer-zh-q8_0.gguf" \
     --bind 127.0.0.1 --port 18785 --engines 1 --threads 2 --no-partials --warmup "$PF_WAV"
@@ -23,7 +43,7 @@ build-x-asr/bin/llama-paraformer-api "$PF_MODELS/paraformer-zh-q8_0.gguf" \
 In a second terminal, run the smoke test with Python and the `websockets` package installed.
 
 ```sh
-PF_WAV="$HOME/Library/Caches/qwen3-asr-htp/paraformer-models/tingting/hvac_zh01.wav"
+PF_WAV="$PF_MODELS/tingting/hvac_zh01.wav"
 python3 examples/paraformer/tools/smoke_production.py --port 18785 --wav "$PF_WAV"
 ```
 
@@ -33,7 +53,7 @@ The macOS ARM64 CPU run passed all 18 checks with VAD, speaker scoring, and prev
 
 Cross-build both server binaries using [the Android build](README.md#openai-compatible-api) with the existing `build-android-xasr` release configuration and `XASR_SPEAKER=ON`. Run the API binary with the same options as the host replay, using device paths for the model and WAV. Add `--vad-model onnx/model/silero_vad.onnx`, include `onnx/bin` in `LD_LIBRARY_PATH`, and forward the loopback port with ADB. Pass `--expect-vad` to the smoke test.
 
-An isolated API instance on SM6650 passed 20/20 checks with one CPU engine, two threads, VAD enabled, and previews and speaker scoring disabled. This verifies the ARM64 implementation and runs separately from the installed HTP service. The baseline observations, host and Android raw output, build logs, and source, model and binary hashes are archived in `$HOME/Library/Caches/qwen3-asr-htp/paraformer-production/lifecycle.Ojlk2S`.
+An isolated API instance on SM6650 passed 20/20 checks with one CPU engine, two threads, VAD enabled, and previews and speaker scoring disabled. This verifies the ARM64 implementation and runs separately from the installed HTP service. The baseline observations, host and Android raw output, build logs, and source, model and binary hashes are archived in `$PF_RUN/lifecycle.Ojlk2S`.
 
 ## Backend readiness and inference status
 
@@ -43,7 +63,7 @@ An unavailable requested accelerator or failed warmup exits before listening by 
 
 The host run verified strict failure with missing HTP, strict failure with a sub-frame warmup WAV, and successful CPU fallback with `degraded` and `requested=HTP0:0 actual=CPU`. Both ordinary CPU and fallback CPU passed 20 smoke checks. With the same WAV in a separate SM6650 instance, HTP performed 1454/1504 encoder and 559/575 decoder compute nodes. All 66 nodes outside HTP were `FLASH_ATTN_EXT`. Both engines warmed up and the mixed instance passed 20 smoke checks, including empty text from a valid sub-frame PCM request. This is a placement and API check at the warmup shape. Compare attention paths within the same API binary before changing the serving default.
 
-To replay, use the host and Android builds and model above. On macOS run with `--device HTP0:0` and expect startup exit 3, then add `--allow-cpu-fallback` and run the smoke script with `--expect-backend CPU --expect-degraded`. On SM6650 run the HTP launch from the [API section](README.md#openai-compatible-api) with `--engines 2 --threads 2 --no-partials` and a real speech warmup WAV. Pass `--expect-backend HTP0:0` to the smoke script. The exact launchers, source and device hashes, and raw results are in `$HOME/Library/Caches/qwen3-asr-htp/paraformer-production/readiness.hzWCkj`.
+To replay, use the host and Android builds and model above. On macOS run with `--device HTP0:0` and expect startup exit 3, then add `--allow-cpu-fallback` and run the smoke script with `--expect-backend CPU --expect-degraded`. On SM6650 run the HTP launch from the [API section](README.md#openai-compatible-api) with `--engines 2 --threads 2 --no-partials` and a real speech warmup WAV. Pass `--expect-backend HTP0:0` to the smoke script. The exact launchers, source and device hashes, and raw results are in `$PF_RUN/readiness.hzWCkj`.
 
 The Hexagon backend can abort the process on a DSP error during synchronization or tensor readback. Runtime fault isolation and retry still need a recovery path that can survive termination of the accelerator worker. The startup fallback above covers initialization and recoverable warmup failures.
 
@@ -54,7 +74,7 @@ Each decoder choice keeps its source CIF position. A length-changing rewrite kee
 The Q8_0 shipping profile changed `likes` from two to three pieces within 720-1020 ms and `footwall` from five to four pieces within 300-720 ms, on macOS CPU and SM6650 HTP. The unchanged suffixes kept their original timestamps. The final `light` of `light_en03.wav` stays at 2340 ms, where it previously flipped to 0 ms. Plain and timed CLI transcripts agreed on all 32 Tingting fixtures. A 22 s fixture with six commands and silence exercised the model's windowed path. On the SM6650 REST API with server VAD off, 52 ordered word spans ended at 20.060 s.
 
 ```sh
-PF_MODELS="$HOME/Library/Caches/qwen3-asr-htp/paraformer-models"
+PF_MODELS="${PF_MODELS:-$HOME/models/paraformer}"
 PF_WAVS="$PF_MODELS/tingting"
 PF_MODEL="$PF_MODELS/paraformer-zh-q8_0.gguf"
 PF_PROFILE=examples/paraformer/hotwords_vehicle_replace.txt
@@ -65,7 +85,7 @@ build-x-asr/bin/llama-paraformer "$PF_MODEL" "$PF_WAVS/light_en03.wav" "$PF_WAVS
 python3 examples/paraformer/tools/check_rewrite_times.py rewrite-off.tsv rewrite-on.tsv
 ```
 
-The run archive holds the long fixture generator, isolated Android replay and REST assertions, both CLI TSV arms, REST JSON, and artifact hashes under `$HOME/Library/Caches/qwen3-asr-htp/paraformer-production/rewrite-times.AkZMgI`.
+The run archive holds the long fixture generator, isolated Android replay and REST assertions, both CLI TSV arms, REST JSON, and artifact hashes under `$PF_RUN/rewrite-times.AkZMgI`.
 
 ## Final request VAD and long segments
 
@@ -76,12 +96,12 @@ On SM6650, one HTP engine with Silero VAD passed 22 smoke checks. WAV, raw PCM a
 Run the Android API with `--vad-model onnx/model/silero_vad.onnx --engines 1 --threads 2 --no-partials`, the Q8_0 model and the vehicle rewrite profile. Forward the loopback port and run the Python verifier with `websockets` installed.
 
 ```sh
-PF_WAVS="$HOME/Library/Caches/qwen3-asr-htp/paraformer-models/tingting"
+PF_WAVS="$PF_MODELS/tingting"
 python3 examples/paraformer/tools/check_vad_ingress.py --port 18788 \
     --wav "$PF_WAVS/light_en03.wav" "$PF_WAVS/light_en04.wav" --out /tmp/pf-vad-replay
 ```
 
-The build log, device hashes, launcher, fixture generators and per-transport outputs are archived in `$HOME/Library/Caches/qwen3-asr-htp/paraformer-production/vad-ingress.ARo9fu`.
+The build log, device hashes, launcher, fixture generators and per-transport outputs are archived in `$PF_RUN/vad-ingress.ARo9fu`.
 
 ## Bounded speaker scoring
 
@@ -94,13 +114,13 @@ On SM6650 with the same binary on both arms, six rounds of four aligned WS reque
 Build Android with `XASR_SPEAKER=ON` and launch [the API](README.md#speaker-gate-optional) with two engines (`HTP0:0` + CPU), two inference threads, previews off and server VAD off. Replay with the same 2.32 s mono fixture and no speaker flags for the off arm. Enable `--speaker-model` and `--enroll-dir` for the on arm. Install `websockets` for both commands.
 
 ```sh
-PF_WAV="$HOME/Library/Caches/qwen3-asr-htp/paraformer-models/tingting/hvac_zh01.wav"
+PF_WAV="$PF_MODELS/tingting/hvac_zh01.wav"
 python3 examples/paraformer/tools/smoke_production.py --port 18789 --wav "$PF_WAV" --expect-backend HTP0:0 --expect-gate
 python3 examples/paraformer/tools/bench_ws_realtime.py --url ws://127.0.0.1:18789/v1/realtime \
     --metrics http://127.0.0.1:18789/metrics --wav "$PF_WAV" --sessions 4 --rounds 6 --out speaker-on.jsonl
 ```
 
-The Android launcher, synthetic enrollment fixture identifiers and hashes, raw response JSON, per-commit JSONL, and counters before and after each arm are in `$HOME/Library/Caches/qwen3-asr-htp/paraformer-production/speaker.5xc2A3`.
+The Android launcher, synthetic enrollment fixture identifiers and hashes, raw response JSON, per-commit JSONL, and counters before and after each arm are in `$PF_RUN/speaker.5xc2A3`.
 
 ## HTP attention placement and latency
 
@@ -130,8 +150,8 @@ The pre/post snapshots showed about 415-425 MiB RSS, zero process swap, and Andr
 Run the two Android API arms with `--device HTP0:0 --engines 2 --threads 2 --no-partials` and the same warmup WAV. Add `--no-htp-flash-attn` for the decomposed arm. Forward the loopback port and run the paced client.
 
 ```sh
-PF_CACHE="$HOME/Library/Caches/qwen3-asr-htp"
-PF_WAVS="$PF_CACHE/paraformer-models/tingting"
+PF_CACHE="${PF_CACHE:-$HOME/pf-cache}"
+PF_WAVS="$PF_MODELS/tingting"
 python3 examples/paraformer/tools/bench_ws_realtime.py --url ws://127.0.0.1:18791/v1/realtime \
     --metrics http://127.0.0.1:18791/metrics --sessions 4 --rounds 2 \
     --wavs "$PF_CACHE/cabin-asr-probe/long-perf/zh-10.wav" "$PF_WAVS/hvac_zh01.wav" \
@@ -139,7 +159,7 @@ python3 examples/paraformer/tools/bench_ws_realtime.py --url ws://127.0.0.1:1879
     --out mixed.jsonl
 ```
 
-The exact launcher, quality replay, raw requests, backend placement, hashes, memory and thermal snapshots are archived in `$HOME/Library/Caches/qwen3-asr-htp/paraformer-production/attention-ab.rPnRkA`.
+The exact launcher, quality replay, raw requests, backend placement, hashes, memory and thermal snapshots are archived in `$PF_RUN/attention-ab.rPnRkA`.
 
 ## HTP encoder width-two probe
 
@@ -155,10 +175,10 @@ The SM6650 run used Q8_0, decomposed attention, two threads and two distinct cli
 Keep this as a CLI benchmark. The pair saves about 13-15 ms when both rows are already available. The first item in a serial pair can finish its encoder stage much earlier than the batched pair, which matters for staggered commits. Service scheduling continues to submit one segment per engine call.
 
 ```sh
-PF_CACHE="$HOME/Library/Caches/qwen3-asr-htp"
-PF_OUT="$PF_CACHE/paraformer-production/encoder-b2.IENc7B"
-python3 "$PF_OUT/make_fixtures.py" "$PF_CACHE/paraformer-models/tingting" "$PF_OUT"
-build-x-asr/bin/llama-paraformer "$PF_CACHE/paraformer-models/paraformer-zh-q8_0.gguf" \
+PF_CACHE="${PF_CACHE:-$HOME/pf-cache}"
+PF_OUT="${PF_RUN:-$HOME/pf-runs}/encoder-b2"
+python3 "$PF_OUT/make_fixtures.py" "$PF_MODELS/tingting" "$PF_OUT"
+build-x-asr/bin/llama-paraformer "$PF_MODELS/paraformer-zh-q8_0.gguf" \
     "$PF_OUT/short-a.wav" "$PF_OUT/short-b.wav" --threads 2 --bench-encoder-pair 6
 bash "$PF_OUT/android.sh" "$PF_OUT"
 ```
@@ -172,7 +192,7 @@ The API caps its connection pool at 12 active socket handlers with up to eight s
 `--deadline-ms` defaults to 30,000 ms and starts at final request submission, after HTTP body intake or WS COMMIT. REST returns 504 with `deadline_exceeded`. A WS commit keeps its item ID and receives one terminal `error` with the same code. The WS poll loop checks for expired items every 40 ms when idle. The worker skips expired queued work and drops the result of a completed decode if it missed the deadline. A model call already running continues to hold its engine until it returns. `--timeout-ms` continues to cap the wait for an engine and returns 503 when that limit is reached first.
 
 ```sh
-PF_MODELS="$HOME/Library/Caches/qwen3-asr-htp/paraformer-models"
+PF_MODELS="${PF_MODELS:-$HOME/models/paraformer}"
 PF_WAV="$PF_MODELS/tingting/hvac_zh01.wav"
 build-x-asr/bin/llama-paraformer-api "$PF_MODELS/paraformer-zh-q8_0.gguf" \
     --bind 127.0.0.1 --port 18797 --engines 1 --threads 2 --no-partials --warmup "$PF_WAV" \
@@ -181,7 +201,7 @@ build-x-asr/bin/llama-paraformer-api "$PF_MODELS/paraformer-zh-q8_0.gguf" \
 python3 examples/paraformer/tools/check_admission.py --port 18797 --wav "$PF_WAV"
 ```
 
-The host CPU and SM6650 HTP both rejected an over-budget PCM request, rejected a fifth session, let a WS client retry a rejected commit, returned three deadline terminal responses across WAV, raw PCM and WS, suppressed a late duplicate result, and accepted a reconnect. Each run ended with zero queued bytes and zero in-flight requests. The 20 ms profile is a test configuration. Launchers, hashes and raw responses are in `$HOME/Library/Caches/qwen3-asr-htp/paraformer-production/admission.iALkbe`.
+The host CPU and SM6650 HTP both rejected an over-budget PCM request, rejected a fifth session, let a WS client retry a rejected commit, returned three deadline terminal responses across WAV, raw PCM and WS, suppressed a late duplicate result, and accepted a reconnect. Each run ended with zero queued bytes and zero in-flight requests. The 20 ms profile is a test configuration. Launchers, hashes and raw responses are in `$PF_RUN/admission.iALkbe`.
 
 Disconnect releases a session's uncommitted PCM and removes its waiting jobs from the queue. Run the same checker with `--disconnect-only` against a single engine using the default queue and deadline. On the host and SM6650, filling the per-session pending limit led to one overload reply and four cancellations. Closing the queued socket returned `queue_bytes` to zero before the active request finished. In a separate Android run, four of 24 simultaneous incomplete HTTP requests were dropped and `/health` returned 200 after closing the sockets. The final device checks and socket replay are in the routing run directory.
 
@@ -198,7 +218,7 @@ The post-admission API ran for 307 s on the attached SM6650. It used Q8_0, one H
 
 All 260 final requests succeeded, with zero rejects, deadlines or inference failures. Between warmup and the final snapshot, RSS ranged from 419 to 426 MiB. `VmHWM` records a 642 MiB peak including startup. Process swap stayed at zero and Android reported thermal status 0 in all 22 snapshots. This soak establishes a baseline for the tested device and load. Test duration was five minutes and there was no separately injected CPU contention.
 
-The isolated build and launch commands, metrics, per-request JSONL, parts of `/proc`, thermal outputs and artifact hashes are in `$HOME/Library/Caches/qwen3-asr-htp/paraformer-production/admission.iALkbe`. Re-run with `bash "$PF_OUT/device.sh" "$PF_OUT"` from the repo, with `PF_OUT` set to that run directory. Device scripts use temporary paths and an ADB loopback forward.
+The isolated build and launch commands, metrics, per-request JSONL, parts of `/proc`, thermal outputs and artifact hashes are in `$PF_RUN/admission.iALkbe`. Re-run with `bash "$PF_OUT/device.sh" "$PF_OUT"` from the repo, with `PF_OUT` set to that run directory. Device scripts use temporary paths and an ADB loopback forward.
 
 ## Backend scheduling on SM6650
 
@@ -218,7 +238,7 @@ With two workers, the flag routed all six 10 s clips to HTP. The shared queue se
 
 The second ABBA run pinned one busy thread each to CPUs 6 and 7. `/proc/stat` measured 100% busy time on both cores over the test and 10-23% on the remaining cores. Both routing arms completed all 144 requests with matching transcripts. Default versus idle-HTP P95 was 884 versus 833 ms aligned, 520 versus 527 ms staggered, and 1558 versus 1451 ms mixed. P95 for short requests within mixed fell from 1059 to 847 ms. The candidate remains one HTP and one CPU worker with `--prefer-idle-htp`. The test used synthetic CPU contention and thermal status remained 0.
 
-The ABBA launchers, per-request results with `backend`, health, artifact hashes, and resource snapshots are in `$HOME/Library/Caches/qwen3-asr-htp/paraformer-production/routing.vjddv2`. Use `bash "$PF_OUT/route.sh" "$PF_OUT"` and `bash "$PF_OUT/pressure.sh" "$PF_OUT"` from the repo with that run directory as `PF_OUT`. The recorded pressure hash is from the phone. The initial routing executable was reconstructed from the archived source version after the manifest file was reused for the pressure run. It matches the logged transfer size. The model and backend libraries were identical in both runs.
+The ABBA launchers, per-request results with `backend`, health, artifact hashes, and resource snapshots are in `$PF_RUN/routing.vjddv2`. Use `bash "$PF_OUT/route.sh" "$PF_OUT"` and `bash "$PF_OUT/pressure.sh" "$PF_OUT"` from the repo with that run directory as `PF_OUT`. The recorded pressure hash is from the phone. The initial routing executable was reconstructed from the archived source version after the manifest file was reused for the pressure run. It matches the logged transfer size. The model and backend libraries were identical in both runs.
 
 ### Reordering the queue does not help
 
@@ -244,7 +264,7 @@ sh tools/supervise_api.sh ./bin/llama-paraformer-api paraformer-zh-q8_0.gguf HTP
     --bind 127.0.0.1 --port 18798 --engines 2 --threads 2 --no-partials --warmup pf-api-warm.wav
 ```
 
-On SM6650, sending SIGKILL to the isolated HTP child after an acknowledged WS COMMIT closed that connection. Health returned `degraded` with two CPU engines on the same port after 1.57 s. The client opened a new socket, resent audio and received a correctly timed CPU result. The recovered child passed 21/21 smoke checks. The injection tests process death, the supervisor transition and client recovery. DSP faults and hangs require separate injection. A process that hangs needs the service manager's watchdog. Recovering an interrupted WS commit requires the client to retain and resubmit its audio after reconnect. The hashes, injection script, event output and supervisor log are in `$HOME/Library/Caches/qwen3-asr-htp/paraformer-production/admission.iALkbe`.
+On SM6650, sending SIGKILL to the isolated HTP child after an acknowledged WS COMMIT closed that connection. Health returned `degraded` with two CPU engines on the same port after 1.57 s. The client opened a new socket, resent audio and received a correctly timed CPU result. The recovered child passed 21/21 smoke checks. The injection tests process death, the supervisor transition and client recovery. DSP faults and hangs require separate injection. A process that hangs needs the service manager's watchdog. Recovering an interrupted WS commit requires the client to retain and resubmit its audio after reconnect. The hashes, injection script, event output and supervisor log are in `$PF_RUN/admission.iALkbe`.
 
 Repeated on SM6650 with `SIGKILL` on the api child: the supervisor logged `exited mode=htp status=137`, started `mode=cpu`, and the new child reported `requested=HTP0:0 actual=CPU` with a full 1504/1504 encoder and 575/575 decoder placement in 329 ms. `/health` returned `degraded` and a plain `POST /v1/audio/transcriptions` still returned the correct text.
 
@@ -275,10 +295,17 @@ That table predates both the mixed-language fixture and the hotword retune, and 
 |---|---:|---:|---:|
 | Q8_0, no hotwords | 56.2% | 80.0% | 0.60% / 12.21% |
 | Q8_0, §13-14 profile | — | **70.0%** | 0.60% / 8.40% |
-| Q8_0, §15 profile (current) | **65.6%** | **100.0%** | 0.60% / 8.40% |
-| Q8_0 SM6650 HTP, §15 profile | **65.6%** | **100.0%** | 0.60% / 8.40% |
+| Q8_0, §15 profile as first committed | 65.6% | **100.0%** | 0.60% / 8.40% |
+| Q8_0, §15 profile with the two noun rewrites (§32) | **71.9%** | **100.0%** | 0.60% / **6.87%** |
+| Q8_0 SM6650 HTP, same profile | **71.9%** | **100.0%** | 0.60% / **6.87%** |
 
-The §13-14 profile scores *below* no hotwords on mixed speech: its global `1.5 two` gain fires after `to` in `temperature to 二十一度` and inserts a token that the parser reads as 11 degrees. The current profile replaces it with `1.5 l>two`, which is narrow enough to fix `level two` and not fire at the boundary. Accuracy is settled at mixed command 100%, Mandarin CER 0.60% and dictation English 8.40%; the remaining six English errors are missing word forms (`heater`, `massage`, `vents`) and multi-token clumps that no logit bias can reach.
+The device row is not borrowed from the host: it was re-measured on SM6650 with `--device HTP0`, and the 47 transcripts behind it are byte-identical to the host ones. `R` fires on the same spans because the logits come from the same quantized weights, so the 2.39 deficit that calibrates the `rear right` margin is unchanged on device.
+
+The §13-14 profile scores *below* no hotwords on mixed speech: its global `1.5 two` gain fires after `to` in `temperature to 二十一度` and inserts a token that the parser reads as 11 degrees. The current profile replaces it with `1.5 l>two`, which is narrow enough to fix `level two` and not fire at the boundary.
+
+The §15 retune initially dropped the two noun rewrites (`footwall`, `likes`) that `hotwords_vehicle_replace.txt` had carried, on the reasoning that they belonged to the deprecated file. They do not carry the poisoned `two` rule, and restoring them is worth 6.3 points of cabin command and 1.5 points of en WER with mixed command and Mandarin unchanged. The lesson is about the file, not the rules: deprecating a profile should move its good rules out, not discard them with the bad one. See design doc §32.
+
+Accuracy is settled at mixed command 100%, Mandarin CER 0.60% and dictation English 6.87%. The remaining six English errors are missing word forms (`heater`, `massage`, `vents`) and multi-token clumps (`driversee peater`) that no logit bias can reach: `R` can rewrite an observed span but not one the model never emitted.
 
 On HTP the first and second voice sets got 37/42 and 20/42 device-position clauses, and 18/18 and 5/18 value clauses. Negation and exclusion cases scored 3/4, 1/4 and 2/3 across the two voice sets and the confusable pack. The second voice exposes a release blocker even for the upstream model. Keep the existing profile as a regression arm and avoid deriving new substitutions from the holdout run.
 
@@ -379,12 +406,12 @@ Three independent arms agree, which is what makes this a measurement rather than
 `tools/sensevoice_baseline.py` is the SenseVoice arm. It is a second architecture (SAN-M encoder + CTC, 25055-token multilingual vocab) rather than another Paraformer, so its agreement is not a shared-checkpoint artefact:
 
 ```sh
-VENV="$HOME/Library/Caches/qwen3-asr-htp/venv/bin/python"
-SV="$HOME/Library/Caches/qwen3-asr-htp/sensevoice-original"
+VENV="$PF_CACHE/venv/bin/python"
+SV="$PF_CACHE/sensevoice-original"
 $VENV examples/paraformer/tools/sensevoice_baseline.py \
     --onnx "$SV/model.int8.onnx" --tokens "$SV/tokens.txt" --lang en \
     --refs examples/paraformer/tools/cabin_commands.tsv \
-    $HOME/Library/Caches/qwen3-asr-htp/paraformer-models/voices/eddy/*_en*.wav
+    $PF_MODELS/voices/eddy/*_en*.wav
 ```
 
 ### Bilingual in one checkpoint: what the data says
@@ -396,7 +423,7 @@ The requirement is a single model, Mandarin first, that survives a sentence mixi
 | Vocab / markers | 8404, `@@` | 10020, `▁` | 25055, `▁` |
 | Mandarin CER | **0.60%** clean | unusable (pinyin) | **0%** after ITN canon |
 | English WER, zh-voice speaker | 12.21% | 4.58% | 20.16% |
-| English WER, native US speaker | 39.50% | 24.14% | 35.66% |
+| English WER, native US speaker | 39.50% (**6.87%** with shipped profile) | 24.14% | 35.66% |
 | Mixed sentence | **works** | collapses to pinyin | works |
 | Size int8/Q8_0 | 226 MiB | 228 MiB | 228 MiB |
 
@@ -436,23 +463,24 @@ That is a 15.4 point absolute and 39% relative reduction, measured at matched qu
 
 The checkpoints are unambiguous about which one applies. In the zh vocab `▁` appears 0 times; in the en vocab `@@` appears 0 times. `pf_detect_word_marker` counts both over the whole table at load and records the winner, so a new checkpoint needs no flag and cannot be silently scored with the wrong rule. Both the single-utterance and long-audio paths call the same `pf_append_token`, which is what makes the bug impossible to reintroduce in one path only - the previous version had the rule copy-pasted in two places and the long-audio copy would have drifted on the next change.
 
-### What is left in the 24%
+### What is left of the English error
 
-The residual errors are systematic, not random, and they cluster on out-of-vocabulary nouns:
+The residual errors are systematic, not random, and they cluster on out-of-vocabulary nouns. The table lists both checkpoints' behaviour, because the same word fails for the same reason on either one - what differs is whether the shipped profile can reach it:
 
-| Reference | Typical hypothesis | Note |
+| Reference | Typical hypothesis | Status with the shipped profile |
 |---|---|---|
-| `ambient` | `emmy and`, `amity and`, `empty and` | not a token in either vocab |
-| `seat heater` | `seat either`, `seat theater`, `seat here` | `heater` absent; `theater` is the nearest token |
-| `footwell` | `foot well`, `foot will`, `football` | absent |
-| `recirculation` | `recirrculation`, `recy`, `circulation` | present but rarely chosen |
-| `rear right` | `real right` | single-token confusion |
-| `Set` (sentence-initial) | `said`, `send`, `sets` | gap only 0.62-1.12, much smaller than the zh checkpoint's 2.89 |
+| `ambient` | `emmy and`, `amity and`, `empty and` | still failing; not a token in either vocab |
+| `seat heater` | `seat either`, `seat theater`, `seat here` | still failing; `heater` absent, `theater` is the nearest token |
+| `footwell` | `foot well`, `foot will`, `football` | **fixed** by `R 5.0 f@@+oo@@+t@@+w@@+all => f@@+oo@@+t@@+well` |
+| `recirculation` | `recirrculation`, `recy`, `circulation` | present but rarely chosen; no rule |
+| `rear right` | `real right`, `we are right` | **fixed** on mixed input by the §15 span rewrite |
+| `lights` | `likes` | **fixed** by `R 5.0 li@@+kes => li@@+gh@@+ts` |
+| `Set` (sentence-initial) | `said`, `send`, `sets` | fixed on the zh checkpoint by `3.2 set` |
 
-Two of these are addressable and two are not:
+The split is now sharp: everything that could be expressed as a **span rewrite over tokens the model actually emits** has been fixed, and what remains is vocabulary the model does not have. `ambient`, `heater` and `massage` are absent from the 8404-entry vocabulary, and `driversee peater` is a clump that never appears as the right sequence, so `R` has nothing to match. Decode-time bias cannot create a token that does not exist; this needs either an in-domain fine-tune or a proper-noun post-processor. Both checkpoints have the same gap for the same words, so this is not a checkpoint-selection problem and no amount of profile tuning will clear it.
 
-- `Set`/`said` is a whole-word confusion with a measured gap of 0.62-1.12 logits over the 48 clips that start with "Set" (the model prefers `said` on exactly half of them). A `PF_HOTWORDS` entry of `3.0 ▁set` flips it and moves the corpus from 24.14% to 23.57%, but it also over-fires once: `turn on recirculation and set the fan` becomes `... set set fan`, because the gain applies at every CIF position rather than only word-initially. A prefix-conditional rule (§14's `prefix>target` form) is the fix, not a larger gain.
-- The noun gaps are vocabulary problems. `ambient`, `heater`, `footwell` and `recirculation` are not single tokens in the 10020 vocab, and the model has to spell them from pieces it has rarely seen in that combination. Decode-time bias cannot create a token that does not exist; this needs either an in-domain fine-tune or a proper-noun post-processor. The Mandarin checkpoint has the same gap for the same words, so switching checkpoints did not cause it and switching back will not fix it.
+- **`Set`/`said` on the English checkpoint** is a whole-word confusion with a measured gap of 0.62-1.12 logits over the 48 clips that start with "Set" (the model prefers `said` on exactly half of them). A `PF_HOTWORDS` entry of `3.0 ▁set` flips it and moves that corpus from 24.14% to 23.57%, but it also over-fires once: `turn on recirculation and set the fan` becomes `... set set fan`, because the gain applies at every CIF position rather than only word-initially. This measurement belongs to the *en* checkpoint only - `▁set` is a 10020-vocab token and does not exist in the shipped 8404 table - so it is **not** the rule we ship. On the zh checkpoint the same confusion is fixed by `3.2 set` (see the table above), which does apply, because `set` is a single token there. Two checkpoints, two different tokens for the same word, two different rules.
+- Note the contrast with `footwell`, which *looked* like the same class of problem and was not. The model had already emitted the right prefix `f@@|oo@@|t@@`; only the final piece was wrong (`w@@|all` for `well`, a 2.89 logit deficit). That is a span rewrite, not a missing word - the fix was `R 5.0 f@@+oo@@+t@@+w@@+all => f@@+oo@@+t@@+well`. §14 concluded "token count differs, bias cannot fix it" from the whole-word form and applied it to the tail, which was the wrong object. The test that separates the two cases: dump the tokens (`PF_DUMP_TOKENS`) and ask whether the *prefix* is already correct.
 
 Hotword files are **not portable across checkpoints**. `hotwords_vehicle.txt` uses `set` (single token in 8404) and `se@@>at` (an `@@`-convention prefix); neither exists in the 10020 vocab, which has `▁set` and no `@@` tokens at all. Loading the zh file against the en checkpoint logs `hotword token not in vocab: 'two'` and silently applies nothing. The bias profile has to be regenerated per checkpoint from that checkpoint's own logit gaps.
 
@@ -462,12 +490,14 @@ For Mandarin, the fallback is unchanged and short: use a Mandarin voice for fixt
 
 For English, the fallback is now two things and neither is a decode-time trick. The checkpoint swap is the fix that works today; it costs a second 228 MiB weight file and a way to route each utterance, and it removes 15.4 points. Everything above the remaining 24% sits in nouns that are absent from the 10020 vocabulary, which no runtime knob can repair. The options in cost order are a cabin-domain proper-noun post-processor, in-domain fine-tuning, or accepting 24% and adding a confirmation prompt for commands the confidence cannot separate.
 
+The shipping path is not the English checkpoint, though, and its English number is better than the 24% above. On the shipped `paraformer-zh` plus `hotwords_vehicle.txt`, the `tingting` dictation fixture reads **6.87%** en WER against 12.21% without the profile, with zh CER bit-identical at 0.60% and mixed command at 100%. That is the number that matters for this product, because Mandarin is the primary case and accented English is what a Chinese driver actually speaks. The 24%/39.50% pair is the answer to a different question - how the engine handles General American - and it is the reason a US-market SKU would need its own profile, not the reason the shipping path is weak.
+
 Measured rather than assumed: running the sweep with `PF_HOTWORDS=hotwords_vehicle_replace.txt`, the profile tuned on Tingting with the Mandarin checkpoint, moved every voice down by 0.8-2.3 points en WER on that checkpoint and left zh CER bit-identical. That profile does not transfer to the English checkpoint at all - see the portability note above - so on the shipping English path its contribution is zero rather than negative. The historical value of that measurement was in showing the bias still helps off-domain and costs nothing when it does not apply; it was never the source of the remaining error.
 
 Fixtures and scores are reproducible with:
 
 ```sh
-PF_MODELS="$HOME/Library/Caches/qwen3-asr-htp/paraformer-models"
+PF_MODELS="${PF_MODELS:-$HOME/models/paraformer}"
 for v in Sandy Eddy Rocko Shelley Reed Grandma Grandpa Flo; do
     python3 examples/paraformer/tools/gen_voice_fixtures.py --voice "$v" --out "/tmp/voice-$v"
 done
@@ -487,10 +517,10 @@ build-pf-host/bin/llama-paraformer-requant "$PF_MODELS/paraformer-en-f32.gguf" \
 
 `llama-quantize` cannot do this: it accepts only llama architectures and rejects `paraformer` with `unknown model architecture`.
 
-The fixture generator, package versions, checkpoint and clip hashes, transcript and per-clip grades, score trials and launchers are archived in `$HOME/Library/Caches/qwen3-asr-htp/paraformer-production/quality-funasr.7dHKEX`. Replay the upstream model with [`tools/run_funasr_reference.py`](tools/run_funasr_reference.py) and the exact dependency versions in `pip-freeze.txt`. To reproduce AISHELL-5 slicing from a local Dev archive, extract sessions 016, 017 and 018, then run the commands below with the same run directory. The corpus is publicly sourced and is kept outside the repository.
+The fixture generator, package versions, checkpoint and clip hashes, transcript and per-clip grades, score trials and launchers are archived in `$PF_RUN/quality-funasr.7dHKEX`. Replay the upstream model with [`tools/run_funasr_reference.py`](tools/run_funasr_reference.py) and the exact dependency versions in `pip-freeze.txt`. To reproduce AISHELL-5 slicing from a local Dev archive, extract sessions 016, 017 and 018, then run the commands below with the same run directory. The corpus is publicly sourced and is kept outside the repository.
 
 ```sh
-PF_OUT="$HOME/Library/Caches/qwen3-asr-htp/paraformer-production/quality-funasr.7dHKEX"
+PF_OUT="$PF_RUN/quality-funasr.7dHKEX"
 python3 examples/paraformer/tools/slice_aishell5.py --dev "$PF_OUT/aishell5" \
     --out "$PF_OUT/aishell5-clips" --per-speaker 6
 bash "$PF_OUT/replay.sh" "$PF_OUT" reference
@@ -517,7 +547,7 @@ docker run --rm --platform linux/amd64 --user "$(id -u):$(id -g)" \
 The package groups the ARM64 executables under `bin/`, ggml and the v73 DSP library under `lib/`, Sherpa and ONNX Runtime under `onnx/bin/` and the Q8_0 weights at the bundle root. It includes the supervisor, the vehicle rewrite profile and a warmup WAV. The audit replay uses ADB to copy the package to a fresh directory, verifies every SHA-256 on-device, forwards a loopback port and starts one HTP and one CPU worker with `--prefer-idle-htp --no-partials`. Its 16 file hashes matched and all 21 API checks passed. Time from the start command through both workers warming up and returning HTTP 200 was 2.35 s. The benchmark measures a process-cold start from an already running Android device.
 
 ```sh
-PF_OUT="$HOME/Library/Caches/qwen3-asr-htp/paraformer-production/release-sm6650.JSHel3"
+PF_OUT="$PF_RUN/release-sm6650.JSHel3"
 bash "$PF_OUT/package.sh" "$PF_OUT"
 bash "$PF_OUT/verify-package.sh" "$PF_OUT"
 ```
@@ -527,7 +557,8 @@ The archive includes `bundle/SHA256SUMS`, source hashes, base revision, toolchai
 ## Open acceptance work
 
 - English command recognition is a speaker effect, not a language effect, and the model decision is settled. `paraformer-zh` stays as the product checkpoint because it is the only candidate that survives mixed Mandarin/English sentences, and Mandarin is the primary case. On Mandarin-accented English it reads 12.21%; `paraformer-en` would read the same clips at 4.58% but returns pinyin for the Mandarin half of a mixed sentence, so it cannot ship. What is left is that native-US-accented English costs 39.50% WER, which matters only if the product must serve American-accented speakers. Three independent engines agree on the direction, so this is audio and speaker distribution rather than a defect in this engine.
-- The cabin hotword profile is now built against the mixed fixture (`tools/cabin_mixed.tsv`) and closed this round. Mixed command field 80% -> **100%**, English WER 12.21% -> **8.40%**, Mandarin bit-identical. Retiring the old profile was the win, not adding rules: the §13 `1.5 two` gain inserted a stray `two` after `to` in `temperature to 二十一度`, so mixed scored **70%** with the old profile against 80% with none. Two rules did the remaining work - `3.0 t@@>well` for `footal`->`footwell`, which §14 had written off as unfixable on a token-count argument that only holds for the whole word, and an `R 2.6 we+are+right => re@@+ar+right` span rewrite for the zh->Latin boundary. See design doc §30.
+- The cabin hotword profile is now built against the mixed fixture (`tools/cabin_mixed.tsv`) and closed this round. Mixed command field 80% -> **100%**, 32-clip cabin command 56.2% -> **71.9%**, English WER 12.21% -> **6.87%**, Mandarin bit-identical, identical on host and SM6650. Retiring the old profile was the win, not adding rules: the §13 `1.5 two` gain inserted a stray `two` after `to` in `temperature to 二十一度`, so mixed scored **70%** with the old profile against 80% with none. Three rules then did the remaining work - `3.0 t@@>well` for `footal`->`footwell`, which §14 had written off as unfixable on a token-count argument that only holds for the whole word; `R 2.6 we+are+right => re@@+ar+right` for the zh->Latin boundary; and two `R` noun rewrites recovered from the deprecated file. See design doc §30-32.
+- Deprecating a hotword profile is a file operation, not a rule operation. The §15 retune replaced `hotwords_vehicle_replace.txt` and dropped its two noun rewrites along with the bad `two` rule, which cost 6.3 points of cabin command until they were restored. Add this to the checklist for any future retune: diff the old and new profiles rule by rule, and move each rule that still earns its place into the new file before deleting the old one.
 - Mixed-language scoring needs a command-field gate, not character CER, and `tools/eval_mixed.py` now provides it (`--run base=... --run hot=... --baseline base` fails on any field regression). It reuses `eval_vehicle.py`'s parser rather than reimplementing it, and self-checks against the reference sentences first: it must score perfect input as 100%, which is how the space-stripping and numeral defects were found.
 - The previous round's SM6650 HTP failures were not device breakage. `--device HTP0:0` is resolved to `HTP0` by the device resolver, and `main()` then rejected it against the resolved name with a plain `strcmp` and returned 2 — after the session was already up and the full `ggml-hex` log had printed, which is why it read as a transport error. The check now compares device names, so the session-suffix form works and typos still fail loudly. Re-verified on SM6650: mixed command field 80% -> 100%, 32-clip cabin command 56.2% -> 65.6%, `zhCER` 0.60% unchanged, `enWER` 12.21% -> 8.40%, device transcripts identical to host including both hotword fixes. See design doc §31.
 - Inject a DSP transport failure and a stuck worker to validate process isolation with the target service manager. Exercise restart under load and confirm the socket and queue resource bounds on that deployment.

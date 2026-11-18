@@ -6,6 +6,23 @@ The runtime code is derived from CrispASR's `src/paraformer.cpp` and its
 commercial use requires attribution). The GGUF loader and device shims here are
 minimal local replacements so the example builds against this repository.
 
+## Quick start
+
+`reproduce.sh` wraps weights, build, fixtures and the accuracy gate. It is the
+fastest way to check that a checkout still does what this file says it does, and
+it is the answer to "can I reproduce the numbers" - see
+[NOTES-REPRODUCE.md](NOTES-REPRODUCE.md) for what transfers between machines and
+what does not.
+
+```sh
+cd examples/paraformer
+./reproduce.sh check      # tools, weights, fixtures, binary: reports, writes nothing
+./reproduce.sh all        # fetch -> build -> render fixtures -> assert the 4 numbers
+```
+
+The four gates are 71.9% cabin command, 100.0% mixed command, 0.60% Mandarin CER
+and 6.87% English WER, and the script exits non-zero if any of them regress.
+
 ## Build
 
 ```sh
@@ -34,55 +51,132 @@ omit it for pure CPU. `--timestamps` also exposes CIF fire frames through
 `paraformer_transcribe_with_timestamps()` (currently only the char count is
 printed by the CLI).
 
-### Whole-word / prefix-conditional logit bias (off by default)
+### Hotword profile: gains, prefix conditions and span rewrites (off by default)
 
-`--hotwords FILE` applies a fixed logit gain in the NAR decoder's argmax. Two
-line forms (`#` comments OK, gain in [0,5], tokens must exist in the GGUF vocab):
+`--hotwords FILE` applies a fixed logit gain in the NAR decoder's argmax. Three
+line forms (`#` comments OK, gain in [0,5] and margin in [0,5]; tokens must exist
+in the GGUF vocab):
 
 ```text
-<gain> <token>              global gain at every CIF position
-<gain> <prefix>><token>     conditional: only when previous token == prefix
+<gain> <token>                    global gain at every CIF position
+<gain> <prefix>><token>           conditional: only when previous token == prefix
+R <margin> <w1+w2+...> => <r1+r2+...>
+                                  span rewrite, applied after argmax
 ```
 
-The second form handles BPE word-tail swaps, and works only when the right and
-wrong words have the **same token count** and differ in the last token —
-`se@@ ed`→`se@@ at` ("seed"→"seat") works; `footwall`→`footwell` (3→2 tokens)
-and `likes`→`lights` (2→3) cannot be fixed by a bias. Without the flag the
-baseline is bit-identical. `hotwords_vehicle.txt` ships the recommended config:
+Picking between them is a question about the **shape** of the error, and the
+three cases are distinct:
+
+| Error shape | Use | Example |
+|---|---|---|
+| Same token count, the right word is one token, a correct prefix precedes it | `<prefix>><token>` | `se@@ ed`→`se@@ at` ("seed"→"seat"), `t@@ al`→`t@@ well` ("footal"→"footwell") |
+| Same token count, but the wrong path won from the start and no prefix is correct | `R` | `we+are+right`→`re@@+ar+right` ("we are right"→"rear right") |
+| Different token count | `R` only | `li@@ kes`(2)→`li@@ gh@@ ts`(3), `f@@ oo@@ t@@ w@@ all`(5)→`f@@ oo@@ t@@ well`(4) |
+
+A logit gain cannot change the token count, and a global gain is the wrong tool
+whenever the same target token needs opposite signs in different contexts: bare
+`two` needs `1.5` after `l` (`level two`) and must be suppressed after `to`
+(`temperature to 二十一度`), so the profile uses `1.5 l>two`. `R` is gated on the
+acoustic score — it fires only when the replacement's per-position average logit
+is within `<margin>` of the observed span, so a margin below the measured deficit
+silently does nothing (measured 2.39 for `rear right`: `1.5` is rejected, `2.6`
+fires).
+
+`hotwords_vehicle.txt` ships the recommended config. Without the flag the
+baseline is bit-identical.
 
 ```sh
-llama-paraformer MODEL.gguf WAV --hotwords hotwords_vehicle.txt [--device HTP0:0]
+llama-paraformer MODEL.gguf WAV --hotwords hotwords_vehicle.txt [--device HTP0]
 ```
 
-`--dump-logits N` prints the top-5 logits (with gain applied) at the first N CIF
-positions; `PF_WATCH_TOKENS=a,b` (env) appends the exact gap of named tokens.
-Use these to measure the gap a bias must overcome before picking a gain — on
-this model `said→set` is 2.89–3.00, `too→two` 0.96, `se@@+ed→at` 3.26–3.46,
-while `in→and` is 4.16 and also disturbs a neighbouring position, so excluded.
+Diagnostics: `--dump-logits N` prints the top-5 logits (with gain applied) at the
+first N CIF positions; `PF_WATCH_TOKENS=a,b` (env) appends the exact gap of named
+tokens; `PF_DUMP_TOKENS=1` shows the raw token sequence; `PF_REPLACE_LOG=1`
+reports each `R` match with its deficit; `PF_DUMP_VOCAB=<substring>` dumps vocab
+entries. Measure the gap before choosing a gain — on this model `said→set` is
+2.89–3.00, `too→two` 0.96, `se@@+ed→at` 3.26–3.46, while `in→and` is 4.16 and
+also disturbs a neighbouring position, so it is excluded.
 
-With the existing punctuation layer, the 32-clip cabin command field goes
-68.8% → 75.0% (§13, matching x-asr) → **78.1%** (§14, adding `3.8 se@@>at`);
-en WER 12.21% → 8.40%, zh CER unchanged, no regressions or false triggers.
-See design doc §13–14.
+Measured with the shipped profile (clause-weighted command field, `zh` CER and
+dictation `en` WER over the `tingting` fixture):
+
+| Arm | 32-clip cabin | 15-clip mixed | zh CER / en WER |
+|---|---:|---:|---:|
+| no profile | 56.2% | 80.0% | 0.60% / 12.21% |
+| shipped profile | **71.9%** | **100.0%** | 0.60% / **6.87%** |
+
+Reproduce with `./reproduce.sh all`; the gate exits non-zero if any of those four
+numbers regress, and the run directory keeps both arms' transcripts so a failure
+can be diffed rather than guessed at. `./reproduce.sh check` reports what is
+missing without writing anything. Design doc §13–15 and §30–32 cover how each
+rule was derived, including two rules that were tested and rejected.
+
+Those four numbers are measured on **Tingting-rendered fixtures**, and the
+fixtures are not committed - only the text they were rendered from is. macOS
+`say` is what produced them; on another platform `./reproduce.sh fixtures`
+cannot run and the gate's absolute thresholds will fail by construction. Read
+[NOTES-REPRODUCE.md](NOTES-REPRODUCE.md) before concluding that means a
+regression: what transfers off-Mac is the profile's gain over the no-profile
+arm, not the absolute rate.
 
 These gains and gaps belong to the **zh checkpoint** (`hotwords_vehicle.txt`
 uses `set` and `se@@`, neither of which exists in the en vocab). The profile is
 not portable: loading it against the en checkpoint logs `hotword token not in
 vocab` and applies nothing. Regenerate the gaps per checkpoint before tuning.
 
-## Status (2026-11-17, host CPU, Q8_0)
+`hotwords_vehicle_replace.txt` is **deprecated**: it carries the global `1.5 two`
+that the shipped profile replaces with `1.5 l>two`, and it scores 70% mixed
+against 80% with no profile at all. It is kept only to replay an older
+measurement.
 
-- Weight: `cstr/paraformer-zh-GGUF`, Q8_0, sha256 `e73232ec…`.
-- 32-clip `tingting` cabin fixture: Chinese CER 0.60%. The English column of
-  that same fixture is not quotable - Tingting has no `en_US` variant, so its
-  English clips are Mandarin-accented speech and measure the voice. English is
-  measured on the eight native `en_US` voices instead; see the checkpoint
-  section below for 39.50% (zh checkpoint) and 24.14% (en checkpoint).
-- Raw command field 56.2%; after punctuation-only post-processing 68.8%.
-  The raw number is depressed because Paraformer emits no punctuation and the
-  semantic evaluator splits clauses on `，`/`,`. This is a post-processing gap,
-  not an acoustic error.
-- x-asr reference on the same fixture (on-arm): command 75.0%, CER 7.23%.
+## Weights
+
+Every number in this file and in `PRODUCTION.md` belongs to these exact files.
+The fingerprint is the contract, not the URL — any copy with a matching sha256
+is equivalent, and a different conversion of the same source checkpoint shifts
+the logit gaps that `hotwords_vehicle.txt` was tuned against, which makes a
+correct profile look broken for no visible reason.
+
+| File | Bytes | sha256 | Role |
+|---|---:|---|---|
+| `paraformer-zh-q8_0.gguf` | 237454336 | `e73232ecf7e484907fd58f6a481fa27c1ceff454a1bc441d4a032a3a63e9783f` | ships |
+| `paraformer-en-q8_0.gguf` | 239295840 | `87c2845b1100a629bef15dfaafdbeb30be9ac5b3b5a07077e413979533d26638` | comparison arm |
+| `paraformer-en-f32.gguf` | 444785792 | `a41d43bc2a34dbdd66e7e741baa466577f9137a16f93f454b35658b0db861c42` | source for `requant.cpp` |
+| `paraformer-zh-q4_k.gguf` | 128687104 | `c3dc70409857d7450895d8ae586f1bef23755a7635cc79cb1ff2ffb08720260e` | A/B arm, slower on v73 |
+
+```sh
+python3 tools/fetch_models.py --out ~/models/paraformer          # fetch + verify
+python3 tools/fetch_models.py --out ~/models/paraformer --verify-only
+```
+
+`tools/model_manifest.txt` is the authoritative list; the fetch script deletes
+anything that fails verification rather than leaving a usable-looking file
+behind. The source checkpoint is [FunASR Paraformer on
+ModelScope](https://www.modelscope.cn/models/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch);
+the GGUF conversion is the one recorded in `tools/model_manifest.txt`, and this
+repository does not contain the HF→GGUF converter (`convert_hf_to_gguf.py` has
+no `paraformer` architecture). Treat the sha256 as the requirement.
+
+## Status (2026-11-18, host CPU and SM6650, Q8_0)
+
+- 32-clip `tingting` cabin fixture, with the shipped hotword profile: Chinese
+  CER 0.60%, command field **71.9%**, en WER **6.87%**. The English column of
+  that same fixture is not quotable on its own - Tingting has no `en_US`
+  variant, so its English clips are Mandarin-accented speech and measure the
+  voice. English on native `en_US` voices is 39.50% (zh checkpoint) and 24.14%
+  (en checkpoint); see the checkpoint section below.
+- Raw command field without the profile is 56.2%; the gap to 71.9% is both the
+  hotword profile and the lack of punctuation (Paraformer emits none, and the
+  semantic evaluator splits clauses on `，`/`,`). The punctuation-only arm is
+  68.8%, so the profile is worth about 3 points on top of punctuation.
+- 15-clip mixed Mandarin/English fixture (`tools/cabin_mixed.tsv`): command
+  field **100%**. This is the fixture that decides the checkpoint, and it is the
+  one the old `hotwords_vehicle_replace.txt` loses 30 points on.
+- x-asr reference on the same 32-clip fixture (on-arm): command 75.0%, CER 7.23%.
+- Device SM6650, 32 clips, warm-run excluded: CPU p50/p95 357/496 ms, HTP
+  290/380 ms; transcripts are identical between CPU and HTP. A single CLI
+  invocation measured in isolation also carries process start and the first
+  scheduler allocation, so its wall time is not a steady-state latency.
 - Device SM6650, 32 clips, warm-run excluded: CPU p50/p95 357/496 ms, HTP
   290/380 ms; transcripts are identical between CPU and HTP.
 - **Graph and arena reuse (§16)**: encoder and decoder graphs are now cached per
@@ -100,8 +194,12 @@ vocab` and applies nothing. Regenerate the gaps per checkpoint before tuning.
   (a 1.4 s warmup also covers a 3.5 s request), so a single representative clip
   is enough. Length bucketing was tested and rejected: the remaining cost is
   compute linear in LFR frames, which padding cannot reduce.
-- Paraformer fixes `Set the driver temperature...` in one clip, but still emits
-  `said` in two English seat/light clips; English remains the open risk.
+- Six English clips still fail with the shipped profile, and all six are word
+  forms the vocabulary lacks (`heater`, `massage`, `vents`, `lights` as a whole
+  word) or multi-token clumps (`driversee peater`). Bias cannot create a token
+  that is not in the 8404-entry vocabulary, and the `R` margin cannot bridge a
+  deficit that large. Closing these needs in-domain fine-tuning or a
+  cabin-domain proper-noun post-processor; see `PRODUCTION.md`.
 
 ## Server
 
@@ -279,11 +377,12 @@ Mandarin one.** FunASR publishes a separate `paraformer-en` (vocab 10020, 50000 
 English) alongside `paraformer-zh` (vocab 8404, 60000 h Mandarin+English). Both
 load in this engine unchanged - the vocabulary size comes from GGUF metadata.
 On 8 native `en_US` voices the English checkpoint scores 24.14% WER against the
-Mandarin checkpoint's 39.50% at matched Q8_0. But the 39.50% is a speaker
-effect, not a language effect: scored on the same English sentences rendered
-through a Mandarin voice, `paraformer-zh` reads 12.21% and `paraformer-en` reads
-4.58%. Accented English is inside the Mandarin checkpoint's training
-distribution; General American is closer to outside it.
+Mandarin checkpoint's 39.50% at matched Q8_0 (39.50% -> **6.87%** with the
+shipped hotword profile; the other 32.6 points are hotwords, not precision). But
+the 39.50% is a speaker effect, not a language effect: scored on the same
+English sentences rendered through a Mandarin voice, `paraformer-zh` reads
+12.21% and `paraformer-en` reads 4.58%. Accented English is inside the Mandarin
+checkpoint's training distribution; General American is closer to outside it.
 
 That decides the model. `paraformer-en` fed a mixed sentence returns pinyin -
 `打开 front left window` becomes `dark high front left window` - so it cannot be
@@ -320,12 +419,15 @@ python3 tools/compare_checkpoints.py \
 audio rather than of one architecture. It needs `onnxruntime` in the venv:
 
 ```sh
-SV="$HOME/Library/Caches/qwen3-asr-htp/sensevoice-original"
-"$HOME/Library/Caches/qwen3-asr-htp/venv/bin/python" \
+SV="$PF_CACHE/sensevoice-original"          # or wherever the ONNX export lives
+"$PF_CACHE/venv/bin/python" \
     tools/sensevoice_baseline.py --onnx "$SV/model.int8.onnx" \
     --tokens "$SV/tokens.txt" --lang en \
     --refs tools/cabin_commands.tsv /tmp/voice-Eddy/*_en*.wav
 ```
+
+`PF_CACHE` is the scratch root from [NOTES-REPRODUCE.md](NOTES-REPRODUCE.md); any
+directory holding the venv and the SenseVoice export works.
 
 See `docs/backend/snapdragon/paraformer-htp-adaptation-design.md` for the
 stage-split, length-bucket, overlap/stitch and bilingual plan.
