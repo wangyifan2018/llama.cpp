@@ -126,6 +126,12 @@ fi
 if [ -n "${PF_VAD_MODEL:-}" ] && [ -r "$PF_VAD_MODEL" ]; then
     set -- "$@" --vad-model "$PF_VAD_MODEL"
 fi
+# Prefer the HTP worker while it is free. Without this a single stream alternates
+# between HTP and the CPU worker, so every other result comes from the slower
+# backend (measured 265-283 ms on HTP against 192-512 ms on CPU).
+if [ "${PF_PREFER_IDLE_HTP:-0}" = "1" ]; then
+    set -- "$@" --prefer-idle-htp
+fi
 if [ -n "${PF_MODEL_ID:-}" ]; then
     set -- "$@" --model-id "$PF_MODEL_ID"
 fi

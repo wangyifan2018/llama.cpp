@@ -110,6 +110,7 @@
       <span class="badge" id="bVad"><i></i>VAD ?</span>
       <span class="badge" id="bGate"><i></i>声纹 ?</span>
       <span class="badge" id="bPartial"><i></i>预览 ?</span>
+      <span class="badge" id="bBackend"><i></i>后端 -</span>
     </div>
   </header>
 
@@ -320,6 +321,19 @@
     } catch (e) { log('health', 'fail ' + e.message); }
   }
 
+  // Turning the switch on after the socket is open has to take effect at once:
+  // otherwise the session keeps the mode it had at connect time and no partial
+  // ever arrives.
+  function applyTurnDetection() {
+    if (!ws || ws.readyState !== 1) return;
+    const on = $('chkVad').checked;
+    ws.send(JSON.stringify({type: 'session.update', session: {
+      turn_detection: on
+        ? {type: 'server_vad', silence_duration_ms: 300, min_speech_duration_ms: 200, threshold: 0.5}
+        : {type: 'none'}}}));
+    log('session', on ? 'server_vad on' : 'server_vad off');
+  }
+
   function connect() {
     if (ws && ws.readyState <= 1) return Promise.resolve();
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -329,10 +343,7 @@
       ws.onopen = () => {
         setBadge('bConn', 'on', '已连接');
         log('ws', 'open');
-        if ($('chkVad').checked) {
-          ws.send(JSON.stringify({type: 'session.update', session: {
-            turn_detection: {type: 'server_vad', silence_duration_ms: 300, min_speech_duration_ms: 200, threshold: 0.5}}}));
-        }
+        if ($('chkVad').checked) applyTurnDetection();
         resolve();
       };
       ws.onerror = () => { setBadge('bConn', '', '连接失败'); toast('WebSocket 连接失败', true); reject(new Error('ws')); };
@@ -395,7 +406,15 @@
             $('chipPieces').textContent = '分段 ' + m.vad_pieces;
           }
           log('completed', ms + ' ms · ' + (text || '(空)'));
+        } else if (t === 'session.updated') {
+          const td = (m.session && m.session.turn_detection) || {};
+          log('session', 'turn_detection=' + (td.type || 'none'));
         } else if (t === 'x.pf.metrics') {
+          if (m.backend) {
+            const b = $('bBackend');
+            b.className = 'badge ' + (String(m.backend).startsWith('HTP') ? 'on' : '');
+            b.innerHTML = '<i></i>后端 ' + m.backend;
+          }
           // The server sends queue_ms, infer_ms, vad_ms and backend here. It
           // does not send speaker_score -- that arrives on the completed event
           // -- and this branch used to read it anyway, so the speaker chip was
@@ -591,6 +610,7 @@
   btnRec.onclick = () => (recording ? stop() : start());
   $('btnStop').onclick = () => stop();
   $('btnClear').onclick = () => clearAll();
+  $('chkVad').onchange = () => applyTurnDetection();
   $('btnFile').onclick = () => $('file').click();
   $('file').onchange = (e) => { if (e.target.files[0]) playFile(e.target.files[0]); };
   addEventListener('keydown', (e) => {
