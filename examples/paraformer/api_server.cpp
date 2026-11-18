@@ -12,6 +12,7 @@
 // See docs/backend/snapdragon/api-reference.md for the supported formats.
 
 #include "paraformer.h"
+#include "core/device_select.h"
 #include "core/engine_start.h"
 #include "core/segment_limits.h"
 
@@ -234,13 +235,12 @@ static double g_seg_gap_ms = 600;       // silence that starts a new subtitle/se
 static double g_punct_gap_ms = 600;     // silence that earns a clause separator
 static double g_partial_min_ms = 800;   // new audio needed before a partial
 static double g_partial_interval = 600; // minimum time between partials
-static double g_partial_max_s = 2.0;    // stop partials past this much audio
-// Below this much audio a session previews nothing; see the note in the partial
-// scheduler. This sits at the ceiling above, so the preview window is
-// deliberately closed for the lengths a cabin command actually has: a wrong
-// revision stuck on screen was worse than no revision at all. Raise the ceiling
-// together with this if previews are wanted for longer dictation.
-static double g_partial_min_s = 2.0;
+static double g_partial_max_s = 6.0;    // stop partials past this much audio
+// Previews start once the segment is long enough to be worth showing. The
+// revision problem that used to close this window is handled by sending the full
+// hypothesis on every preview (x.pf.partial), so a revised guess replaces the
+// previous one instead of being dropped.
+static double g_partial_min_s = 0.8;
 static bool g_partials = true;
 static std::atomic<uint64_t> g_partials_run{0};
 static std::atomic<uint64_t> g_partials_skipped{0};
@@ -1262,14 +1262,22 @@ static void maybe_schedule_partial(const std::shared_ptr<WsSession>& s) {
         std::lock_guard<std::mutex> lock(s->m);
         s->partial_inflight = false;
         auto& text = reply.text;
-        if (reply.status != 200 || s->closed || gen != s->gen || text.size() <= s->partial_text.size() ||
-            text.compare(0, s->partial_text.size(), s->partial_text) != 0) {
+        if (reply.status != 200 || s->closed || gen != s->gen || text.empty()) {
             return;
         }
-        auto delta = text.substr(s->partial_text.size());
-        s->partial_text = std::move(text);
-        ws_queue_event(*s, "conversation.item.input_audio_transcription.delta",
-                       {{"item_id", item}, {"content_index", 0}, {"delta", delta}});
+        // The model revises itself as audio arrives, and a delta cannot take text
+        // back. Send the whole hypothesis so the client can replace its line, and
+        // keep the append-only delta for clients that only understand that.
+        const bool extends = text.size() > s->partial_text.size() &&
+                             text.compare(0, s->partial_text.size(), s->partial_text) == 0;
+        const std::string delta = extends ? text.substr(s->partial_text.size()) : std::string();
+        s->partial_text = text;
+        ws_queue_event(*s, "x.pf.partial",
+                       {{"item_id", item}, {"content_index", 0}, {"text", s->partial_text}});
+        if (!delta.empty()) {
+            ws_queue_event(*s, "conversation.item.input_audio_transcription.delta",
+                           {{"item_id", item}, {"content_index", 0}, {"delta", delta}});
+        }
     }, false, [s, gen] {
         std::lock_guard<std::mutex> lock(s->m);
         return s->closed || gen != s->gen;
@@ -1915,29 +1923,15 @@ int main(int argc, char** argv) {
             g_punct_gap_ms = std::atof(argv[++i]);
         }
     }
-    // Pick HTP when the backend is present and the user did not choose. A phone
-    // run should not need the flag, and a host run must not fail because the
-    // backend is absent, so the choice is made from the registered devices and
-    // printed either way. This has to run before anything reads `device`: the
-    // first version lived after setenv("PARAFORMER_DEVICE"), so an auto-selected
-    // run printed "using HTP0:0" and then brought the engine up on CPU.
+    // Pick HTP when the backend is present and the user did not choose. This
+    // has to run before anything reads `device`; see core/device_select.h for
+    // why the ordering matters and for the shared rule every entry point uses.
+    bool htp_present = false;
     if (!device_set) {
         ggml_backend_load_all();
-        const bool have_htp = [] {
-            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-                const char* name = ggml_backend_dev_name(ggml_backend_dev_get(i));
-                if (name && std::strstr(name, "HTP")) {
-                    return true;
-                }
-            }
-            return false;
-        }();
-        if (have_htp && !recover_on_cpu) {
-            device = "HTP0:0";
-            std::fprintf(stderr, "pf-api: --device not given, using HTP0:0 (pass --device CPU to force CPU)\n");
-        } else {
-            std::fprintf(stderr, "pf-api: --device not given, using CPU\n");
-        }
+        htp_present = pf_htp_present();
+        device = pf_default_device();
+        pf_report_device(device, htp_present, recover_on_cpu);
     }
     // From here on `device` is the single source of truth: whether it came from
     // --device or from the probe above, "not CPU" means an accelerator engine.

@@ -328,7 +328,10 @@
       ws.onmessage = (ev) => {
         let m; try { m = JSON.parse(ev.data); } catch { return; }
         const t = m.type || '';
-        if (t.endsWith('delta')) {
+        if (t === 'x.pf.partial') {
+          lastPartial = m.text || '';
+          $('partial').textContent = lastPartial;
+        } else if (t.endsWith('delta')) {
           lastPartial += m.delta;
           $('partial').textContent = lastPartial;
         } else if (t.endsWith('completed')) {

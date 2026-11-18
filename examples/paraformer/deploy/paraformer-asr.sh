@@ -38,7 +38,7 @@ STATE_DIR=${PF_STATE:-$PF_WORKDIR}
 PF_PORT=${PF_PORT:-8080}
 PF_BIND=${PF_BIND:-127.0.0.1}
 PF_ENGINES=${PF_ENGINES:-2}
-PF_THREADS=${PF_THREADS:-2}
+PF_THREADS=${PF_THREADS:-4}
 
 [ -x "$PF_BIN" ] || die "$PF_BIN is not executable"
 [ -r "$PF_MODEL" ] || die "cannot read model $PF_MODEL"

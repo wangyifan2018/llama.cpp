@@ -6,6 +6,15 @@ The runtime code is derived from CrispASR's `src/paraformer.cpp` and its
 commercial use requires attribution). The GGUF loader and device shims here are
 minimal local replacements so the example builds against this repository.
 
+## Deployment
+
+[DEPLOY.md](DEPLOY.md) is the production form: an OpenAI-compatible server
+(`POST /v1/audio/transcriptions`, `GET /v1/models`) that defaults to the HTP
+backend, installed either as an init service under `/vendor` on a rooted device
+or under `/data/local/tmp` with a supervisor loop where root is unavailable.
+It lists the configuration keys, the accuracy profile that must ship with the
+service, the measured latency and memory numbers, and the troubleshooting table.
+
 ## Quick start
 
 `reproduce.sh` wraps weights, build, fixtures and the accuracy gate. It is the

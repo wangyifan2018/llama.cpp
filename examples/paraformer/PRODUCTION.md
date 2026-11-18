@@ -1,5 +1,9 @@
 # Paraformer production work log
 
+The deployed form (OpenAI server, HTP default, init service or supervisor loop,
+configuration and acceptance) is defined in [DEPLOY.md](DEPLOY.md). This file is
+the experiment log behind those numbers.
+
 The product receives complete 16 kHz VAD segments and returns final Mandarin and English transcripts. The target device is SM6650, with up to four concurrent requests and no required partial display. The existing Q8_0 HTP + CPU configuration is the reference. Compare changes against endpoint-to-final P95 as well as failures, transcript and command-field accuracy, and device resource use.
 
 ## Paths and reproducibility
