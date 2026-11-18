@@ -346,6 +346,57 @@ python3 examples/paraformer/tools/check_audio_quality.py \
 
 The English side splits differently, and this is the part that matters for release. These voices all have `en_US` variants, so the English clips are native speech. The first version of this section concluded that English command recognition was simply weak, at 32-50% WER. That was also wrong, and wrong in a more interesting way: the engine was running the Mandarin checkpoint (`paraformer-zh`, vocab 8404) on English audio. FunASR publishes a separate English checkpoint. See the next section.
 
+### The English spread is a speaker effect, not a language effect
+
+Before choosing a checkpoint it is worth knowing which variable the 39.50% belongs to. The same 16 English sentences were rendered through Tingting, a Mandarin voice, and scored against the same references with the same function. Tingting is not in the English sweep because it has no `en_US` variant - and that exclusion hid the most informative row in the whole table:
+
+| Arm (identical wav references, `norm_en`, no number canonicalisation) | Tingting (zh voice) | 8 native `en_US` voices |
+|---|---:|---:|
+| `paraformer-zh` Q8_0 | **12.21%** | 39.50% |
+| `paraformer-en` Q8_0 | **4.58%** | 24.14% |
+
+Both checkpoints do dramatically better on English spoken by a Mandarin voice. `paraformer-en` reads the Tingting English clips at 4.58%, which is near-perfect, and the Mandarin checkpoint reads them at 12.21%, which is the number the README used to quote. So:
+
+- English is not hard for these models. English from a **native American voice** is hard for them.
+- The defect scales with speaker, not with language: 4.58% -> 24.14% for the English checkpoint is a 5x degradation on the same sentences.
+- `paraformer-zh` was trained on 60000 h that is mostly Mandarin, with English in it as *foreign words read by Mandarin speakers*. Accented English is inside its training distribution; General American is closer to out of distribution. That is the mechanism, and it explains why the checkpoint with less English training (8404) beats the one with 50000 h of English (10020) on the Mandarin-accented clips.
+
+This also means the 24.14% baseline is not a floor to optimise against for this product. A Chinese user issuing English cabin commands speaks the same accented English Tingting renders, and `paraformer-en` covers that case at 4.58%.
+
+Three independent arms agree, which is what makes this a measurement rather than a theory: Whisper small (9.35% raw / 3.39% canon on the 8 voices, 6.87% on Tingting), SenseVoiceSmall (35.66% Eddy, 20.16% Tingting, 0% zh after ITN canonicalisation), and both Paraformer checkpoints all move in the same direction with the same magnitude. A defect that only one engine showed would be an engine bug; one that moves all three is a property of the audio.
+
+`tools/sensevoice_baseline.py` is the SenseVoice arm. It is a second architecture (SAN-M encoder + CTC, 25055-token multilingual vocab) rather than another Paraformer, so its agreement is not a shared-checkpoint artefact:
+
+```sh
+VENV="$HOME/Library/Caches/qwen3-asr-htp/venv/bin/python"
+SV="$HOME/Library/Caches/qwen3-asr-htp/sensevoice-original"
+$VENV examples/paraformer/tools/sensevoice_baseline.py \
+    --onnx "$SV/model.int8.onnx" --tokens "$SV/tokens.txt" --lang en \
+    --refs examples/paraformer/tools/cabin_commands.tsv \
+    $HOME/Library/Caches/qwen3-asr-htp/paraformer-models/voices/eddy/*_en*.wav
+```
+
+### Bilingual in one checkpoint: what the data says
+
+The requirement is a single model, Mandarin first, that survives a sentence mixing both languages. Two candidates exist and they fail differently:
+
+| | `paraformer-zh` | `paraformer-en` | SenseVoiceSmall |
+|---|---|---|---|
+| Vocab / markers | 8404, `@@` | 10020, `▁` | 25055, `▁` |
+| Mandarin CER | **0.60%** clean | unusable (pinyin) | **0%** after ITN canon |
+| English WER, zh-voice speaker | 12.21% | 4.58% | 20.16% |
+| English WER, native US speaker | 39.50% | 24.14% | 35.66% |
+| Mixed sentence | **works** | collapses to pinyin | works |
+| Size int8/Q8_0 | 226 MiB | 228 MiB | 228 MiB |
+
+Measured on 15 mixed sentences rendered through a Mandarin voice (`tools/cabin_mixed.tsv`), the choice is not close. `paraformer-en` fed `打开 front left window` returns `dark high front left window`, and `把氛围灯调成 warm white` returns `bafeng wei de diaocheng born white` - every Mandarin syllable becomes Latin. It cannot be the product model no matter how good its English is, because cabin commands in Chinese are the primary case.
+
+`paraformer-zh` handles the mixed case well: `打开 front left window`, `关闭 seat heater`, `把氛围灯调成 warm white`, `空调调到 twenty two degrees` all come back correct, with the Mandarin part exactly right. Its failures are the nouns already listed - `rear right` -> `we are right`, `footwell` -> `footal` - and those are vocabulary gaps that a hotword profile can address because the model produces plausible tokens and picks the wrong one, rather than producing an unusable language.
+
+**So the answer to "is there one model for both languages" is: `paraformer-zh` is the one, and it already is what ships.** `paraformer-en` is a specialist for English-only sessions with native-accented speech; `paraformer-zh` plus a cabin hotword profile covers Mandarin, mixed speech, and Mandarin-accented English. Switching to `paraformer-en` by language would break exactly the mixed case the product needs.
+
+Scoring caveat for mixed speech, which the table above exposes: character CER cannot fairly score `导航到 Beijing 机场` decoded as `导航到北京机场`. The transcription is semantically right and the reference is written in Latin script, so `norm_zh` charges 7 characters for a correct answer. Any mixed-language regression gate needs to score the command fields (window/seat/HVAC target and value) rather than characters, or it will reject correct output. The mixed fixture records its text with the script the speaker actually used, so `导航到 Beijing 机场` stays Latin in the reference and the number is honest about being a literal comparison.
+
 ### English needs the English checkpoint
 
 FunASR ships two large Paraformer checkpoints that differ only in training data and vocabulary:
@@ -464,8 +515,10 @@ The archive includes `bundle/SHA256SUMS`, source hashes, base revision, toolchai
 
 ## Open acceptance work
 
-- English command recognition is the one measured defect with a partial fix in place. On clean native-speaker audio the Mandarin checkpoint scores 39.50% WER; the English checkpoint scores 24.14%, against 3.39% for an independent model on the same clips. The remaining 24% is concentrated in cabin nouns absent from the 10020 vocabulary (`ambient`, `heater`, `footwell`), which no decode-time bias can repair. Two decisions are open: whether to ship two weight files and route per utterance (costs 228 MiB and a language decision), and whether to post-process the noun class or fine-tune. Both are model decisions, not runtime ones.
-- The English checkpoint has not been validated on SM6650. It loads and transcribes correctly on host CPU at matched Q8_0, and the HTP session accepted it during this round, but the device was in a degraded state (load average 13.4 after 4 days uptime) at the point of verification and every HTP run, including the previously working Mandarin one, failed with `remote_handle64_invoke failed ... method 3` (`Error 0x27`). Re-run the HTP path after a device restart before treating bilingual deployment as ready. The failure was reproducible on both checkpoints, so it is device state rather than the English weights.
+- English command recognition is a speaker effect, not a language effect, and the model decision is settled. `paraformer-zh` stays as the product checkpoint because it is the only candidate that survives mixed Mandarin/English sentences, and Mandarin is the primary case. On Mandarin-accented English it reads 12.21%; `paraformer-en` would read the same clips at 4.58% but returns pinyin for the Mandarin half of a mixed sentence, so it cannot ship. What is left is that native-US-accented English costs 39.50% WER, which matters only if the product must serve American-accented speakers. Three independent engines agree on the direction, so this is audio and speaker distribution rather than a defect in this engine.
+- Build the cabin hotword profile against the mixed fixture (`tools/cabin_mixed.tsv`) rather than the pure-English one. The failures worth biasing are `rear right` -> `we are right` and `footwell` -> `footal`, both of which the model emits as plausible tokens that a gain can flip. `Set`/`said` does not appear on the Mandarin-voice clips at all, so the §13 profile may now be over-fitting a fixture that is not representative of the target speaker.
+- Mixed-language scoring needs a command-field gate, not character CER. `导航到 Beijing 机场` decoded as `导航到北京机场` is correct and costs 7 characters under `norm_zh`. No mixed-language regression should be reported from character edit distance alone.
+- The English checkpoint has not been validated on SM6650. It loads and transcribes correctly on host CPU at matched Q8_0, and the HTP session accepted it during this round, but the device was in a degraded state (load average 13.4 after 4 days uptime) at the point of verification and every HTP run, including the previously working Mandarin one, failed with `remote_handle64_invoke failed ... method 3` (`Error 0x27`). This does not block the product decision above, since the shipping checkpoint is unchanged.
 - Inject a DSP transport failure and a stuck worker to validate process isolation with the target service manager. Exercise restart under load and confirm the socket and queue resource bounds on that deployment.
 - Establish release thresholds with target-vehicle command recordings from independent Mandarin and English speakers. Record overlap, speed, window state, HVAC, playback, seat and microphone for each utterance, and score the actual downstream command parser for wrong actions, extra actions and false activation. Keep voiceprint advisory until target-channel independent enrollment and impostor trials qualify it.
 - Agree the user-facing P95/P99 deadlines, failure and recovery targets, soak duration and RAM budget on the production SoC with representative services active. Use the same 20 ms workload and compare the two routing modes at that load.

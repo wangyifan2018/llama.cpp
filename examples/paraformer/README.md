@@ -274,14 +274,24 @@ English is a real gap rather than a fixture artefact. Use a Mandarin voice for
 Mandarin fixtures: Meijia scores 0.00% zh CER. These are TTS clips: speaker
 variety without channel variety.
 
-**English needs the English checkpoint.** FunASR publishes a separate
-`paraformer-en` (vocab 10020, 50000 h English) alongside `paraformer-zh`
-(vocab 8404, 60000 h Mandarin+English). Both load in this engine unchanged -
-the vocabulary size comes from GGUF metadata - and on 8 native `en_US` voices
-the English checkpoint scores 24.14% WER against the Mandarin checkpoint's
-39.50% at matched Q8_0. The two are complementary: the English checkpoint fed
-Mandarin emits pinyin (`把左前车窗打开一半` → `buto qian chehechuang da kai
-yiban`), so a bilingual product needs both and a per-utterance choice.
+**English needs the English checkpoint for American speakers; the product needs the
+Mandarin one.** FunASR publishes a separate `paraformer-en` (vocab 10020, 50000 h
+English) alongside `paraformer-zh` (vocab 8404, 60000 h Mandarin+English). Both
+load in this engine unchanged - the vocabulary size comes from GGUF metadata.
+On 8 native `en_US` voices the English checkpoint scores 24.14% WER against the
+Mandarin checkpoint's 39.50% at matched Q8_0. But the 39.50% is a speaker
+effect, not a language effect: scored on the same English sentences rendered
+through a Mandarin voice, `paraformer-zh` reads 12.21% and `paraformer-en` reads
+4.58%. Accented English is inside the Mandarin checkpoint's training
+distribution; General American is closer to outside it.
+
+That decides the model. `paraformer-en` fed a mixed sentence returns pinyin -
+`打开 front left window` becomes `dark high front left window` - so it cannot be
+the product checkpoint when Mandarin is primary. `paraformer-zh` handles mixed
+speech correctly (`打开 front left window`, `关闭 seat heater`, `空调调到 twenty
+two degrees` all come back right). `tools/cabin_mixed.tsv` is the 15-sentence
+mixed fixture that measures this; regenerate it with
+`gen_voice_fixtures.py --manifest tools/cabin_mixed.tsv`.
 
 The checkpoints use opposite sub-word conventions, which cost a full debugging
 round here: `paraformer-zh` marks continuation with a trailing `@@`, so an
@@ -303,6 +313,18 @@ python3 tools/compare_checkpoints.py \
     --zh "$PF_MODELS/paraformer-zh-q8_0.gguf" \
     --en "$PF_MODELS/paraformer-en-q8_0.gguf" \
     --dir /tmp/voice-Eddy --dir /tmp/voice-Rocko --out /tmp/ckpt-ab.json
+```
+
+`tools/sensevoice_baseline.py` is a third, non-Paraformer arm (SAN-M + CTC,
+25055-token multilingual vocab) used to check that a result is a property of the
+audio rather than of one architecture. It needs `onnxruntime` in the venv:
+
+```sh
+SV="$HOME/Library/Caches/qwen3-asr-htp/sensevoice-original"
+"$HOME/Library/Caches/qwen3-asr-htp/venv/bin/python" \
+    tools/sensevoice_baseline.py --onnx "$SV/model.int8.onnx" \
+    --tokens "$SV/tokens.txt" --lang en \
+    --refs tools/cabin_commands.tsv /tmp/voice-Eddy/*_en*.wav
 ```
 
 See `docs/backend/snapdragon/paraformer-htp-adaptation-design.md` for the
