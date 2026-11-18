@@ -167,6 +167,7 @@ pf-api: shut down cleanly
 | `X-Vad-Ms` | 能量检查、VAD 和分段规划耗时 |
 | `X-Language` | 检测到的语言为 `zh`、`en` 或 `mixed`，空转写为 `und` |
 | `X-Vad-Pieces` | 本请求实际送进 ASR 的段数。长音频裁剪为一段时也为 1 |
+| `X-Tail` | `hot` = 音频以语音结尾（客户端可能把尾音切掉了）；`silence` = 结尾有静音 |
 | `X-ASR-Backend` | 实际处理这次请求的 ASR 引擎 |
 | `X-Empty` | 值为 `silence` 时表示判定为静音、直接返回空文本 |
 | `X-Speaker-Score` / `X-Speaker-Ok` | 声纹相似度与是否通过阈值（开启门控时） |

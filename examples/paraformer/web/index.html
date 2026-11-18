@@ -141,7 +141,7 @@
         <div class="result">
           <div class="final empty" id="final">等待音频...</div>
           <div class="partial" id="partial"></div>
-          <ol id="segments" style="margin:10px 0 0;padding-left:20px;color:#cfe3f7"></ol>
+          <ol id="segments" style="margin:10px 0 0;padding-left:20px;color:#cfe3f7;max-height:180px;overflow:auto"></ol>
           <div class="meta">
             <span class="chip" id="chipPieces">分段 -</span>
             <span class="chip spk-none" id="chipSpk">说话人 -</span>
@@ -350,15 +350,19 @@
           const ms = committedAt ? Math.round(performance.now() - committedAt) : 0;
           committedAt = 0;
           const text = m.transcript || '';
-          if ($('chkVad').checked) {
+          $('final').textContent = text || '(空)';
+          {
+            // Every result is a segment, in either mode: list them so a long
+            // stream is readable instead of only the last line surviving.
             const li = document.createElement('li');
-            li.textContent = text || '(空)';
+            const spk = (typeof m.speaker_score === 'number')
+              ? '  [' + (m.speaker_ok ? '司机' : '非司机') + ' ' + m.speaker_score.toFixed(2) + ']' : '';
+            const dur = (m.usage && m.usage.seconds) ? '  ' + m.usage.seconds.toFixed(1) + ' s' : '';
+            li.textContent = (text || '(空)') + spk + dur + (ms ? '  ' + ms + ' ms' : '');
             li.style.marginBottom = '4px';
             $('segments').appendChild(li);
             $('mSegs').textContent = $('segments').children.length;
-            $('final').textContent = text || '(空)';
-          } else {
-            $('final').textContent = text || '(空)';
+            $('segments').scrollTop = $('segments').scrollHeight;
           }
           $('final').classList.toggle('empty', !text);
           $('partial').textContent = '';

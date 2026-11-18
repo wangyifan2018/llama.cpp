@@ -1612,6 +1612,22 @@ static void ws_serve(httplib::ws::WebSocket& ws) {
 
 // ---- HTTP ----
 
+// Whether the submitted audio ends in speech instead of silence. A client that
+// cuts at its own VAD endpoint sends a hot tail, and the last syllable is already
+// gone: padding with silence does not bring it back (measured 0 of 16 clips), so
+// report it and let the client add a hangover.
+static const char* classify_tail(const std::vector<float>& samples) {
+    if (samples.empty()) {
+        return "silence";
+    }
+    const size_t n = std::min<size_t>(samples.size(), (size_t) (0.15 * 16000.0));
+    double acc = 0;
+    for (size_t i = samples.size() - n; i < samples.size(); ++i) {
+        acc += (double) samples[i] * samples[i];
+    }
+    return std::sqrt(acc / (double) n) > 0.02 ? "hot" : "silence";
+}
+
 static void set_segment_headers(httplib::Response& res, const SegmentReply& reply) {
     res.set_header("X-Queue-Ms", std::to_string((int) std::lround(reply.queue_ms)));
     res.set_header("X-Infer-Ms", std::to_string((int) std::lround(reply.infer_ms)));
@@ -1669,8 +1685,10 @@ static void handle_transcription(const httplib::Request& req, httplib::Response&
     const bool want_punct = punct == "true" || punct == "1";
     const bool want_tokens = fmt == "verbose_json" || fmt == "srt" || want_punct;
     const double duration = (double) samples.size() / 16000.0;
+    const char* tail = classify_tail(samples); // before the buffer is moved
     const SegmentReply r = transcribe_sync(std::move(samples), want_tokens);
     set_segment_headers(res, r);
+    res.set_header("X-Tail", tail);
     if (r.status != 200) {
         reply_error(res, r.status, r.text, r.status == 429 ? "rate_limit_error" : "server_error", "",
                     r.status == 504 ? "deadline_exceeded" : "");
