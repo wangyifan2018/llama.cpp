@@ -9,10 +9,11 @@
 // final text. Partials are opportunistic full re-decodes of the audio received
 // so far, throttled and always outranked by a commit.
 //
-// Limits: one segment per commit (no server-side VAD), no diarisation, no word
-// timestamps yet. See docs/backend/snapdragon/asr-server-api-design.md.
+// See docs/backend/snapdragon/api-reference.md for the supported formats.
 
 #include "paraformer.h"
+#include "core/engine_start.h"
+#include "core/segment_limits.h"
 
 #include "httplib.h"
 #include "json.hpp"
@@ -22,6 +23,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -35,6 +37,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -42,11 +45,78 @@
 using json = nlohmann::json;
 using pf_clock = std::chrono::steady_clock;
 
+class HtpWatchdog {
+public:
+    explicit HtpWatchdog(std::chrono::milliseconds limit) : limit(limit), thread([this] { monitor(); }) {}
+
+    ~HtpWatchdog() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+        }
+        changed.notify_one();
+        thread.join();
+    }
+
+    struct Guard {
+        Guard(HtpWatchdog* watchdog, const char* stage) : watchdog(watchdog) {
+            if (watchdog) watchdog->set(pf_clock::now() + watchdog->limit, stage);
+        }
+        ~Guard() {
+            if (watchdog) watchdog->set(pf_clock::time_point::max(), nullptr);
+        }
+        Guard(const Guard&) = delete;
+        Guard& operator=(const Guard&) = delete;
+
+    private:
+        HtpWatchdog* watchdog;
+    };
+
+private:
+    void set(pf_clock::time_point when, const char* stage) {
+        std::lock_guard<std::mutex> lock(mutex);
+        deadline = when;
+        phase = stage;
+        changed.notify_one();
+    }
+
+    void monitor() {
+        std::unique_lock<std::mutex> lock(mutex);
+        while (!stopping) {
+            changed.wait(lock, [this] { return stopping || phase; });
+            if (stopping) break;
+            const auto when = deadline;
+            if (!changed.wait_until(lock, when, [this, when] { return stopping || deadline != when; })) {
+                std::fprintf(stderr, "pf-api: HTP watchdog expired during %s after %lld ms\n", phase,
+                             (long long) limit.count());
+                // The backend may be waiting on FastRPC. Skip its teardown.
+                std::_Exit(75);
+            }
+        }
+    }
+
+    const std::chrono::milliseconds limit;
+    std::mutex mutex;
+    std::condition_variable changed;
+    pf_clock::time_point deadline = pf_clock::time_point::max();
+    const char* phase = nullptr;
+    bool stopping = false;
+    std::thread thread;
+};
+
 struct Engine {
-    paraformer_context* ctx = nullptr;
+    paraformer_context_ptr ctx{nullptr, &paraformer_free};
     std::thread worker;
+    std::string requested;
     std::string name;
+    bool flash_attn = true;
+    HtpWatchdog* watchdog = nullptr;
+    paraformer_placement placement = {};
     std::atomic<uint64_t> requests{0};
+#ifdef XASR_SPEAKER
+    std::unique_ptr<const SherpaOnnxVoiceActivityDetector, decltype(&SherpaOnnxDestroyVoiceActivityDetector)> vad{
+        nullptr, &SherpaOnnxDestroyVoiceActivityDetector};
+#endif
 };
 
 struct TokensDeleter {
@@ -54,17 +124,50 @@ struct TokensDeleter {
         paraformer_tokens_free(t);
     }
 };
-using TokensPtr = std::shared_ptr<paraformer_tokens>;
+struct WordSpan {
+    std::string text;
+    double start_ms = 0;
+    double end_ms = 0;
+};
 
-// status, text, queue_ms, infer_ms, tokens (null unless requested)
-using pool_done = std::function<void(int, std::string, double, double, TokensPtr)>;
+struct SpeakerTicket {
+    std::atomic<bool> ready{false};
+    std::optional<float> score;
+};
+
+struct SpeakerResult {
+    const char* status = "disabled";
+    const char* reason = nullptr;
+    std::optional<float> score;
+};
+
+struct SegmentReply {
+    int status = 200;
+    std::string text;
+    double queue_ms = 0;
+    double infer_ms = 0;
+    double vad_ms = 0;
+    std::string backend;
+    size_t pieces = 0;
+    bool silence = false;
+    std::vector<WordSpan> words;
+    SpeakerResult speaker;
+};
+
+using pool_done = std::function<void(SegmentReply)>;
+struct WsSession;
 
 struct PoolTask {
     std::vector<float> samples;
     pool_done done;
     double enqueued_ms = 0;
+    pf_clock::time_point deadline = pf_clock::time_point::max();
     int priority = 0;    // 1 = commit, 0 = partial
     bool want_tokens = false;
+    const WsSession* ws_owner = nullptr;
+    std::function<bool()> cancelled;
+    std::shared_ptr<SpeakerTicket> speaker;
+    const char* speaker_skip_reason = "busy";
 };
 
 static std::deque<std::unique_ptr<PoolTask>> g_queue;
@@ -72,13 +175,24 @@ static std::mutex g_mutex;
 static std::condition_variable g_cv;
 static bool g_stop = false;
 static std::vector<Engine*> g_engines;
+static Engine* g_preferred_engine = nullptr;
+static bool g_preferred_busy = false;
 static size_t g_queue_limit = 64;
+static size_t g_queue_bytes_limit = 8 * 1024 * 1024;
+static size_t g_queue_bytes = 0;
 static double g_timeout_ms = 30000;
+static std::chrono::milliseconds g_deadline{30000};
 static std::string g_model_id = "paraformer-zh";
 static std::atomic<uint64_t> g_requests{0};
 static std::atomic<int> g_inflight{0}; // tasks a worker is currently running
 static std::atomic<uint64_t> g_rejected{0};
 static std::atomic<uint64_t> g_failed{0};
+static std::atomic<uint64_t> g_deadline_expired{0};
+static std::atomic<uint64_t> g_cancelled_queued{0};
+static std::atomic<size_t> g_ws_sessions{0};
+static constexpr size_t max_ws_sessions = 4;
+static constexpr size_t max_ws_pending = 4;
+static bool g_degraded = false;
 static std::atomic<uint64_t> g_event_seq{0};
 static double g_seg_gap_ms = 600;       // silence that starts a new subtitle/segment
 static double g_punct_gap_ms = 600;     // silence that earns a clause separator
@@ -91,6 +205,18 @@ static std::atomic<uint64_t> g_partials_skipped{0};
 
 static double now_ms() {
     return std::chrono::duration<double, std::milli>(pf_clock::now().time_since_epoch()).count();
+}
+
+static size_t queue_depth() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_queue.size();
+}
+
+static SegmentReply deadline_reply() {
+    SegmentReply reply;
+    reply.status = 504;
+    reply.text = "transcription deadline exceeded";
+    return reply;
 }
 
 static json error_body(const std::string& message, const std::string& type, const std::string& param = "",
@@ -108,13 +234,23 @@ static void reply_error(httplib::Response& res, int status, const std::string& m
 
 // ---- WAV ----
 
+static std::vector<float> decode_pcm16(const char* data, size_t n) {
+    std::vector<float> out(n);
+    for (size_t i = 0; i < n; ++i) {
+        int16_t sample;
+        std::memcpy(&sample, data + i * sizeof(sample), sizeof(sample));
+        out[i] = (float) sample / 32768.0f;
+    }
+    return out;
+}
+
 static bool parse_wav(const std::string& bytes, std::vector<float>& out, std::string& err) {
     if (bytes.size() < 44 || std::memcmp(bytes.data(), "RIFF", 4) != 0 || std::memcmp(bytes.data() + 8, "WAVE", 4) != 0) {
         err = "file is not a RIFF/WAVE container";
         return false;
     }
     size_t pos = 12;
-    int channels = 0, bits = 0, rate = 0;
+    int channels = 0, bits = 0, rate = 0, format = 0;
     const char* data = nullptr;
     size_t data_bytes = 0;
     while (pos + 8 <= bytes.size()) {
@@ -127,19 +263,21 @@ static bool parse_wav(const std::string& bytes, std::vector<float>& out, std::st
             break;
         }
         if (std::strcmp(id, "fmt ") == 0 && size >= 16) {
-            uint16_t ch = 0, bps = 0;
+            uint16_t ch = 0, bps = 0, tag = 0;
+            std::memcpy(&tag, bytes.data() + body, 2);
             std::memcpy(&ch, bytes.data() + body + 2, 2);
             std::memcpy(&rate, bytes.data() + body + 4, 4);
             std::memcpy(&bps, bytes.data() + body + 14, 2);
             channels = ch;
             bits = bps;
+            format = tag;
         } else if (std::strcmp(id, "data") == 0) {
             data = bytes.data() + body;
             data_bytes = size;
         }
         pos = body + size + (size & 1);
     }
-    if (rate != 16000 || channels != 1 || bits != 16 || !data) {
+    if (format != 1 || rate != 16000 || channels != 1 || bits != 16 || !data) {
         char buf[160];
         std::snprintf(buf, sizeof(buf), "expected 16 kHz mono 16-bit PCM, got %d Hz, %d channels, %d bits", rate, channels,
                       bits);
@@ -147,37 +285,12 @@ static bool parse_wav(const std::string& bytes, std::vector<float>& out, std::st
         return false;
     }
     const size_t n = data_bytes / 2;
-    out.resize(n);
-    const int16_t* p = reinterpret_cast<const int16_t*>(data);
-    for (size_t i = 0; i < n; ++i) {
-        out[i] = (float) p[i] / 32768.0f;
+    if (data_bytes % 2 != 0 || n > pf_segment::max_samples) {
+        err = "expected whole PCM16 samples and at most 30 s of audio";
+        return false;
     }
+    out = decode_pcm16(data, n);
     return true;
-}
-
-// Linear resampling to 16 kHz. Fine for the Realtime convenience path; the native
-// endpoints take 16 kHz directly and are what the product uses.
-static std::vector<float> resample_to_16k(const int16_t* pcm, size_t n, int rate) {
-    std::vector<float> out;
-    if (rate == 16000) {
-        out.resize(n);
-        for (size_t i = 0; i < n; ++i) {
-            out[i] = (float) pcm[i] / 32768.0f;
-        }
-        return out;
-    }
-    const double step = (double) rate / 16000.0;
-    const size_t out_n = (size_t) (n / step);
-    out.resize(out_n);
-    for (size_t i = 0; i < out_n; ++i) {
-        const double pos = i * step;
-        const size_t i0 = (size_t) pos;
-        const size_t i1 = std::min(i0 + 1, n - 1);
-        const double frac = pos - (double) i0;
-        const double a = (double) pcm[i0] / 32768.0, b = (double) pcm[i1] / 32768.0;
-        out[i] = (float) (a + (b - a) * frac);
-    }
-    return out;
 }
 
 static std::string srt_time(double seconds) {
@@ -191,16 +304,26 @@ static std::string srt_time(double seconds) {
 
 // Commit tasks jump the queue so a partial decode never delays an endpoint.
 static std::unique_ptr<PoolTask> pop_task() {
-    for (size_t i = 0; i < g_queue.size(); ++i) {
-        if (g_queue[i]->priority > 0) {
-            auto t = std::move(g_queue[i]);
-            g_queue.erase(g_queue.begin() + (long) i);
-            return t;
-        }
-    }
-    auto t = std::move(g_queue.front());
-    g_queue.pop_front();
+    auto pos = std::find_if(g_queue.begin(), g_queue.end(), [](const auto& task) { return task->priority > 0; });
+    if (pos == g_queue.end()) pos = g_queue.begin();
+    auto t = std::move(*pos);
+    g_queue_bytes -= t->samples.capacity() * sizeof(float);
+    g_queue.erase(pos);
     return t;
+}
+
+static SegmentReply decode_task(Engine& eng, const PoolTask& task);
+static void try_schedule_speaker(PoolTask& task, const std::vector<float>& samples);
+static SpeakerResult speaker_result(const PoolTask& task, bool silence);
+
+static void finish_worker_task(Engine* eng) {
+    if (eng == g_preferred_engine) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_preferred_busy = false;
+        g_inflight.fetch_sub(1);
+    } else {
+        g_inflight.fetch_sub(1);
+    }
 }
 
 static void worker_loop(Engine* eng) {
@@ -208,7 +331,10 @@ static void worker_loop(Engine* eng) {
         std::unique_ptr<PoolTask> task;
         {
             std::unique_lock<std::mutex> lock(g_mutex);
-            g_cv.wait(lock, [] { return !g_queue.empty() || g_stop; });
+            g_cv.wait(lock, [eng] {
+                const bool may_take = !g_preferred_engine || eng == g_preferred_engine || g_preferred_busy;
+                return (!g_queue.empty() && may_take) || g_stop;
+            });
             if (g_queue.empty()) {
                 if (g_stop) {
                     return;
@@ -216,102 +342,112 @@ static void worker_loop(Engine* eng) {
                 continue;
             }
             task = pop_task();
+            if (eng == g_preferred_engine) g_preferred_busy = true;
+            g_inflight.fetch_add(1);
         }
         g_cv.notify_all();
         const double queue_ms = now_ms() - task->enqueued_ms;
+        if (pf_clock::now() >= task->deadline) {
+            finish_worker_task(eng);
+            task->done(deadline_reply());
+            continue;
+        }
+        if (task->cancelled && task->cancelled()) {
+            finish_worker_task(eng);
+            SegmentReply reply;
+            reply.status = 499;
+            reply.text = "request cancelled";
+            reply.queue_ms = queue_ms;
+            task->done(std::move(reply));
+            continue;
+        }
         if (g_timeout_ms > 0 && queue_ms > g_timeout_ms) {
-            task->done(503, "queue timeout", queue_ms, 0.0, nullptr);
+            finish_worker_task(eng);
+            SegmentReply reply;
+            reply.status = 503;
+            reply.text = "queue timeout";
+            reply.queue_ms = queue_ms;
+            task->done(std::move(reply));
             continue;
         }
-        const double t0 = now_ms();
-        g_inflight.fetch_add(1);
-        TokensPtr tokens;
-        std::string text;
-        if (task->want_tokens) {
-            tokens.reset(paraformer_transcribe_tokens(eng->ctx, task->samples.data(), (int) task->samples.size()),
-                         TokensDeleter{});
-            if (tokens && tokens->text) {
-                text = tokens->text;
-            }
-        } else {
-            std::unique_ptr<char, decltype(&std::free)> t(
-                paraformer_transcribe(eng->ctx, task->samples.data(), (int) task->samples.size()), &std::free);
-            if (t) {
-                text = t.get();
-            }
+        SegmentReply reply;
+        try {
+            reply = decode_task(*eng, *task);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "pf-api: inference on %s failed: %s\n", eng->name.c_str(), e.what());
+            reply.status = 500;
+            reply.text = "inference failed";
         }
-        const double infer_ms = now_ms() - t0;
-        g_inflight.fetch_sub(1);
-        if (!tokens && text.empty()) {
+        finish_worker_task(eng);
+        if (pf_clock::now() >= task->deadline) {
+            task->done(deadline_reply());
+            continue;
+        }
+        reply.queue_ms = queue_ms;
+        reply.backend = eng->name;
+        if (reply.status == 500) {
             g_failed.fetch_add(1);
-            task->done(500, "inference failed", queue_ms, infer_ms, nullptr);
-            continue;
+        } else if (reply.status == 200) {
+            eng->requests.fetch_add(1);
+            if (task->priority > 0) reply.speaker = speaker_result(*task, reply.silence);
         }
-        eng->requests.fetch_add(1);
-        task->done(200, std::move(text), queue_ms, infer_ms, std::move(tokens));
+        task->done(std::move(reply));
     }
 }
 
 // Returns false when the queue is full (the caller maps that to 429 / an error event).
-static bool submit(std::vector<float> samples, int priority, pool_done done, bool want_tokens = false) {
+static bool submit(std::vector<float>&& samples, int priority, pool_done done, bool want_tokens = false,
+                   std::function<bool()> cancelled = {}, pf_clock::time_point deadline = pf_clock::time_point::max(),
+                   const WsSession* ws_owner = nullptr) {
     auto task = std::make_unique<PoolTask>();
-    task->samples = std::move(samples);
     task->done = std::move(done);
     task->priority = priority;
     task->want_tokens = want_tokens;
+    task->ws_owner = ws_owner;
+    task->cancelled = std::move(cancelled);
     task->enqueued_ms = now_ms();
+    task->deadline = deadline;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (g_queue.size() >= g_queue_limit) {
+        const size_t bytes = samples.capacity() * sizeof(float);
+        if (g_queue.size() >= g_queue_limit || bytes > g_queue_bytes_limit - g_queue_bytes) {
             g_rejected.fetch_add(1);
             return false;
         }
+        if (priority > 0 && g_queue.empty() && g_inflight.load() == 0) {
+            try_schedule_speaker(*task, samples);
+        }
+        task->samples = std::move(samples);
         g_queue.push_back(std::move(task));
+        g_queue_bytes += bytes;
     }
-    g_cv.notify_one();
+    if (g_preferred_engine) g_cv.notify_all();
+    else g_cv.notify_one();
     g_requests.fetch_add(1);
     return true;
 }
 
-struct SyncReply {
-    int status = 200;
-    std::string text;
-    double queue_ms = 0;
-    double infer_ms = 0;
-    TokensPtr tokens;
-};
-
 // Synchronous helper for the REST endpoints.
-static SyncReply transcribe_sync(const std::vector<float>& samples, bool want_tokens = false) {
-    struct Result {
-        int status;
-        std::string text;
-        double queue_ms;
-        double infer_ms;
-        TokensPtr tokens;
-    };
-    auto promise = std::make_shared<std::promise<Result>>();
+static SegmentReply transcribe_sync(std::vector<float>&& samples, bool want_tokens = false) {
+    const auto deadline = pf_clock::now() + g_deadline;
+    auto promise = std::make_shared<std::promise<SegmentReply>>();
     auto fut = promise->get_future();
-    const bool ok = submit(
-        samples, 1,
-        [promise](int status, std::string text, double queue_ms, double infer_ms, TokensPtr tokens) {
-            promise->set_value({status, std::move(text), queue_ms, infer_ms, std::move(tokens)});
-        },
-        want_tokens);
+    const bool ok = submit(std::move(samples), 1, [promise](SegmentReply reply) {
+        promise->set_value(std::move(reply));
+    }, want_tokens, {}, deadline);
     if (!ok) {
-        SyncReply r;
+        SegmentReply r;
         r.status = 429;
         r.text = "server is busy, retry later";
         return r;
     }
-    const Result v = fut.get();
-    SyncReply r;
-    r.status = v.status;
-    r.text = v.text;
-    r.queue_ms = v.queue_ms;
-    r.infer_ms = v.infer_ms;
-    r.tokens = v.tokens;
-    return r;
+    if (fut.wait_until(deadline) != std::future_status::ready) {
+        g_deadline_expired.fetch_add(1);
+        return deadline_reply();
+    }
+    auto reply = fut.get();
+    if (reply.status == 504) g_deadline_expired.fetch_add(1);
+    return reply;
 }
 
 // Chinese/CJK shows up as multi-byte UTF-8; English transcripts are ASCII.
@@ -327,16 +463,9 @@ static bool any_multibyte(const std::string& s) {
 // ---- word and clause structure from token times ----
 
 // A word is one or more BPE pieces; a piece ending in @@ continues the word.
-struct WordSpan {
-    std::string text;
-    double start_ms = 0;
-    double end_ms = 0;
-};
-
-static std::vector<WordSpan> build_words(const paraformer_tokens* t) {
-    std::vector<WordSpan> out;
+static void append_words(std::vector<WordSpan>& out, const paraformer_tokens* t, double offset_ms) {
     if (!t || t->n_tokens <= 0) {
-        return out;
+        return;
     }
     WordSpan cur;
     bool open = false;
@@ -346,13 +475,12 @@ static std::vector<WordSpan> build_words(const paraformer_tokens* t) {
         const bool cont = s.size() >= 2 && s.compare(s.size() - 2, 2, "@@") == 0;
         if (!open) {
             cur = WordSpan();
-            // Start at this word's first fire time: the gap to the previous word
-            // is then (start_next - end_prev), which is what the pause test needs.
-            cur.start_ms = (double) t->tokens[i].t_ms;
+            // Use the start of the original CIF span for the pause test.
+            cur.start_ms = offset_ms + t->tokens[i].start_ms;
             open = true;
         }
         cur.text += cont ? s.substr(0, s.size() - 2) : s;
-        cur.end_ms = (double) t->tokens[i].t_ms;
+        cur.end_ms = offset_ms + t->tokens[i].t_ms;
         if (!cont) {
             out.push_back(cur);
             open = false;
@@ -361,7 +489,6 @@ static std::vector<WordSpan> build_words(const paraformer_tokens* t) {
     if (open) {
         out.push_back(cur);
     }
-    return out;
 }
 
 // Insert a separator where consecutive words are separated by a pause longer
@@ -445,10 +572,7 @@ static json segments_json(const std::vector<WordSpan>& words, bool zh, double ga
 
 // ---- speaker gate (optional) ----
 //
-// The CAM++ embedding runs on the CPU while the ASR runs on HTP, so a commit
-// costs max(asr, embedding) rather than their sum. The voiceprint is enrolled at
-// startup from a directory of the driver's utterances; every segment is scored
-// against its centroid and reported as speaker_score / speaker_ok.
+// The CPU scorer only publishes results that are ready when ASR completes.
 
 static std::string g_speaker_model;
 static std::string g_enroll_dir;
@@ -461,19 +585,21 @@ static bool g_speaker_enabled = false;
 // --vad-split-s; everything else is transcribed untouched.
 static std::string g_vad_model;
 static float g_vad_split_s = 18.0f;   // only split commits longer than this
-static float g_vad_piece_s = 15.0f;    // and never make a piece longer than this
+static float g_vad_piece_s = 15.0f;    // target length when merging speech spans
 static float g_silence_rms = 0.004f;   // below this, "no speech" means empty text
 static float g_speaker_max_s = 1.5f;    // only the first N seconds are embedded
 static std::atomic<uint64_t> g_speaker_deferred{0};
+static std::atomic<uint64_t> g_speaker_started{0};
+static std::atomic<uint64_t> g_speaker_assessed{0};
 static float g_vad_threshold = 0.5f;
 static float g_vad_min_silence = 0.15f;
 static float g_vad_min_speech = 0.20f;
 static bool g_vad_enabled = false;
 
 #ifdef XASR_SPEAKER
-static const SherpaOnnxSpeakerEmbeddingExtractor* g_extractor = nullptr;
+static std::unique_ptr<const SherpaOnnxSpeakerEmbeddingExtractor, decltype(&SherpaOnnxDestroySpeakerEmbeddingExtractor)>
+    g_extractor{nullptr, &SherpaOnnxDestroySpeakerEmbeddingExtractor};
 static std::vector<float> g_voiceprint;
-static std::mutex g_extractor_mutex;
 
 static bool spk_read_wav(const std::string& path, std::vector<float>& out) {
     FILE* f = std::fopen(path.c_str(), "rb");
@@ -482,8 +608,12 @@ static bool spk_read_wav(const std::string& path, std::vector<float>& out) {
     }
     std::fseek(f, 0, SEEK_END);
     long n = std::ftell(f);
+    if (n < 44 || n > 2 * 1024 * 1024) {
+        std::fclose(f);
+        return false;
+    }
     std::fseek(f, 0, SEEK_SET);
-    std::vector<char> bytes((size_t) std::max(0L, n));
+    std::vector<char> bytes((size_t) n);
     const bool ok = std::fread(bytes.data(), 1, bytes.size(), f) == bytes.size();
     std::fclose(f);
     if (!ok) {
@@ -494,29 +624,28 @@ static bool spk_read_wav(const std::string& path, std::vector<float>& out) {
 }
 
 static std::vector<float> spk_embed(const std::vector<float>& samples) {
-    std::lock_guard<std::mutex> lock(g_extractor_mutex);
     if (!g_extractor) {
         return {};
     }
-    const SherpaOnnxOnlineStream* s = SherpaOnnxSpeakerEmbeddingExtractorCreateStream(g_extractor);
-    SherpaOnnxOnlineStreamAcceptWaveform(s, 16000, samples.data(), (int32_t) samples.size());
-    SherpaOnnxOnlineStreamInputFinished(s);
-    std::vector<float> emb;
-    if (SherpaOnnxSpeakerEmbeddingExtractorIsReady(g_extractor, s)) {
-        const float* v = SherpaOnnxSpeakerEmbeddingExtractorComputeEmbedding(g_extractor, s);
-        if (v) {
-            const int32_t dim = SherpaOnnxSpeakerEmbeddingExtractorDim(g_extractor);
-            emb.assign(v, v + dim);
-            SherpaOnnxSpeakerEmbeddingExtractorDestroyEmbedding(v);
-        }
-    }
-    SherpaOnnxDestroyOnlineStream(s);
-    return emb;
+    const auto* extractor = g_extractor.get();
+    std::unique_ptr<const SherpaOnnxOnlineStream, decltype(&SherpaOnnxDestroyOnlineStream)> s(
+        SherpaOnnxSpeakerEmbeddingExtractorCreateStream(extractor), &SherpaOnnxDestroyOnlineStream);
+    if (!s) return {};
+    SherpaOnnxOnlineStreamAcceptWaveform(s.get(), 16000, samples.data(), (int32_t) samples.size());
+    SherpaOnnxOnlineStreamInputFinished(s.get());
+    if (!SherpaOnnxSpeakerEmbeddingExtractorIsReady(extractor, s.get())) return {};
+    std::unique_ptr<const float, decltype(&SherpaOnnxSpeakerEmbeddingExtractorDestroyEmbedding)> v(
+        SherpaOnnxSpeakerEmbeddingExtractorComputeEmbedding(extractor, s.get()),
+        &SherpaOnnxSpeakerEmbeddingExtractorDestroyEmbedding);
+    if (!v) return {};
+    const int32_t dim = SherpaOnnxSpeakerEmbeddingExtractorDim(extractor);
+    if (dim <= 0) return {};
+    return {v.get(), v.get() + dim};
 }
 
-static float spk_cosine(const std::vector<float>& a, const std::vector<float>& b) {
+static std::optional<float> spk_cosine(const std::vector<float>& a, const std::vector<float>& b) {
     if (a.size() != b.size() || a.empty()) {
-        return 0.0f;
+        return std::nullopt;
     }
     double dot = 0, na = 0, nb = 0;
     for (size_t i = 0; i < a.size(); ++i) {
@@ -524,11 +653,16 @@ static float spk_cosine(const std::vector<float>& a, const std::vector<float>& b
         na += (double) a[i] * a[i];
         nb += (double) b[i] * b[i];
     }
-    return (float) (dot / (std::sqrt(na * nb) + 1e-9));
+    const double norm = std::sqrt(na * nb);
+    if (!std::isfinite(norm) || norm <= 0.0 || !std::isfinite(dot)) return std::nullopt;
+    return (float) std::clamp(dot / norm, -1.0, 1.0);
 }
 
 static bool spk_init() {
-    if (g_speaker_model.empty()) {
+    if (g_speaker_model.empty() && g_enroll_dir.empty()) return true;
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(g_speaker_model, ec) || !std::filesystem::is_directory(g_enroll_dir, ec)) {
+        std::fprintf(stderr, "pf-api: speaker scoring needs a model file and enrollment directory\n");
         return false;
     }
     SherpaOnnxSpeakerEmbeddingExtractorConfig cfg;
@@ -537,17 +671,14 @@ static bool spk_init() {
     cfg.num_threads = 1;
     cfg.debug = 0;
     cfg.provider = "cpu";
-    g_extractor = SherpaOnnxCreateSpeakerEmbeddingExtractor(&cfg);
+    g_extractor.reset(SherpaOnnxCreateSpeakerEmbeddingExtractor(&cfg));
     if (!g_extractor) {
         std::fprintf(stderr, "pf-api: cannot load speaker model %s\n", g_speaker_model.c_str());
         return false;
     }
-    const int32_t dim = SherpaOnnxSpeakerEmbeddingExtractorDim(g_extractor);
+    const int32_t dim = SherpaOnnxSpeakerEmbeddingExtractorDim(g_extractor.get());
     std::fprintf(stderr, "pf-api: speaker model %s, dim=%d\n", g_speaker_model.c_str(), dim);
-    if (g_enroll_dir.empty()) {
-        std::fprintf(stderr, "pf-api: no --enroll-dir, speaker gate disabled\n");
-        return false;
-    }
+    if (dim <= 0) return false;
     std::vector<std::string> files;
     for (const auto& entry : std::filesystem::directory_iterator(g_enroll_dir)) {
         const std::string p = entry.path().string();
@@ -571,7 +702,8 @@ static bool spk_init() {
         }
         double nrm = 0;
         for (float v : e) nrm += (double) v * v;
-        nrm = std::sqrt(nrm) + 1e-9;
+        nrm = std::sqrt(nrm);
+        if (!std::isfinite(nrm) || nrm <= 0.0) continue;
         for (size_t i = 0; i < e.size(); ++i) acc[i] += (float) (e[i] / nrm);
         embs.push_back(e);
         ++used;
@@ -582,53 +714,84 @@ static bool spk_init() {
     }
     double nrm = 0;
     for (float v : acc) nrm += (double) v * v;
-    nrm = std::sqrt(nrm) + 1e-9;
+    nrm = std::sqrt(nrm);
+    if (!std::isfinite(nrm) || nrm <= 0.0) return false;
     for (float& v : acc) v = (float) (v / nrm);
     g_voiceprint = acc;
-    for (const auto& e : embs) self_cos += spk_cosine(e, g_voiceprint);
+    for (const auto& e : embs) self_cos += spk_cosine(e, g_voiceprint).value_or(0.0f);
     std::fprintf(stderr, "pf-api: speaker gate on, enrolled %d clips, mean self-cosine %.3f, threshold %.2f\n", used,
                  self_cos / used, g_speaker_threshold);
     g_speaker_enabled = true;
     return true;
 }
 
-// The gate is best effort: it is skipped when another request is already queued,
-// so it cannot steal CPU from an ASR that is waiting. It also only embeds the
-// first g_speaker_max_s seconds, which bounds the cost for long commits.
-static float spk_score(const std::vector<float>& samples) {
-    if (!g_speaker_enabled) {
-        return -1.0f;
+class SpeakerWorker {
+public:
+    SpeakerWorker() : worker(&SpeakerWorker::run, this) {}
+    ~SpeakerWorker() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+        }
+        cv.notify_one();
+        worker.join();
     }
-    const size_t max_samples = (size_t) (g_speaker_max_s * 16000.0f);
-    if (samples.size() > max_samples) {
-        std::vector<float> head(samples.begin(), samples.begin() + (long) max_samples);
-        return spk_cosine(spk_embed(head), g_voiceprint);
+
+    void schedule(PoolTask& task, const std::vector<float>& samples) {
+        const size_t n = std::min(samples.size(), (size_t) (g_speaker_max_s * 16000.0f));
+        std::lock_guard<std::mutex> lock(mutex);
+        if (job) return;
+        if (std::none_of(samples.begin(), samples.begin() + n, [](float v) { return v != 0.0f; })) {
+            task.speaker_skip_reason = "no_audio_in_prefix";
+            return;
+        }
+        head.assign(samples.begin(), samples.begin() + n);
+        job = std::make_shared<SpeakerTicket>();
+        task.speaker = job;
+        g_speaker_started.fetch_add(1);
+        cv.notify_one();
     }
-    return spk_cosine(spk_embed(samples), g_voiceprint);
-}
+
+private:
+    void run() {
+        for (;;) {
+            std::vector<float> samples;
+            std::shared_ptr<SpeakerTicket> ticket;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                cv.wait(lock, [&] { return stopping || job; });
+                if (stopping) return;
+                ticket = job;
+                samples.swap(head);
+            }
+            try {
+                ticket->score = spk_cosine(spk_embed(samples), g_voiceprint);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "pf-api: speaker scoring failed: %s\n", e.what());
+            }
+            ticket->ready.store(true, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                job.reset();
+            }
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool stopping = false;
+    std::vector<float> head;
+    std::shared_ptr<SpeakerTicket> job;
+    std::thread worker;
+};
+
+static std::unique_ptr<SpeakerWorker> g_speaker_worker;
 
 // ---- server-side VAD ----
 
-static bool vad_init() {
+static bool vad_init(Engine& eng) {
     if (g_vad_model.empty()) {
-        return false;
-    }
-    g_vad_enabled = true;
-    std::fprintf(stderr,
-                 "pf-api: server VAD on (%s), split above %.1f s, threshold %.2f, min_silence %.2f s, "
-                 "min_speech %.2f s\n",
-                 g_vad_model.c_str(), g_vad_split_s, g_vad_threshold, g_vad_min_silence, g_vad_min_speech);
-    return true;
-}
-
-// Speech spans (in samples) for one committed segment. An empty result means "no
-// confident speech": the caller then transcribes the whole segment anyway,
-// because a client that already cut at its own VAD endpoint can send a segment
-// whose tail silence is too short for the detector to close.
-static std::vector<std::pair<int, int>> vad_spans(const std::vector<float>& samples) {
-    std::vector<std::pair<int, int>> spans;
-    if (!g_vad_enabled || samples.empty()) {
-        return spans;
+        return true;
     }
     SherpaOnnxVadModelConfig cfg;
     std::memset(&cfg, 0, sizeof(cfg));
@@ -641,10 +804,14 @@ static std::vector<std::pair<int, int>> vad_spans(const std::vector<float>& samp
     cfg.sample_rate = 16000;
     cfg.num_threads = 1;
     cfg.provider = "cpu";
-    const SherpaOnnxVoiceActivityDetector* vad = SherpaOnnxCreateVoiceActivityDetector(&cfg, 30.0f);
-    if (!vad) {
-        return spans;
-    }
+    eng.vad.reset(SherpaOnnxCreateVoiceActivityDetector(&cfg, 30.0f));
+    return static_cast<bool>(eng.vad);
+}
+
+static std::vector<std::pair<int, int>> vad_spans(Engine& eng, const std::vector<float>& samples) {
+    std::vector<std::pair<int, int>> spans;
+    const auto* vad = eng.vad.get();
+    SherpaOnnxVoiceActivityDetectorReset(vad);
     for (size_t i = 0; i < samples.size(); i += 512) {
         const size_t n = std::min<size_t>(512, samples.size() - i);
         SherpaOnnxVoiceActivityDetectorAcceptWaveform(vad, samples.data() + i, (int32_t) n);
@@ -652,97 +819,107 @@ static std::vector<std::pair<int, int>> vad_spans(const std::vector<float>& samp
     SherpaOnnxVoiceActivityDetectorFlush(vad);
     while (!SherpaOnnxVoiceActivityDetectorEmpty(vad)) {
         const SherpaOnnxSpeechSegment* seg = SherpaOnnxVoiceActivityDetectorFront(vad);
-        spans.push_back({seg->start, seg->start + seg->n});
-        SherpaOnnxDestroySpeechSegment(seg);
+        if (seg) {
+            spans.emplace_back(seg->start, seg->start + seg->n);
+            SherpaOnnxDestroySpeechSegment(seg);
+        }
         SherpaOnnxVoiceActivityDetectorPop(vad);
     }
-    SherpaOnnxDestroyVoiceActivityDetector(vad);
     std::sort(spans.begin(), spans.end());
     return spans;
 }
 #else
 static bool spk_init() {
-    return false;
+    return g_speaker_model.empty() && g_enroll_dir.empty();
 }
-static float spk_score(const std::vector<float>&) {
-    return -1.0f;
+static bool vad_init(Engine&) {
+    return g_vad_model.empty();
 }
-static bool vad_init() {
-    return false;
-}
-static std::vector<std::pair<int, int>> vad_spans(const std::vector<float>&) {
+static std::vector<std::pair<int, int>> vad_spans(Engine&, const std::vector<float>&) {
     return {};
 }
 #endif
 
-// True when running the embedding now would compete with a waiting request.
-static bool spk_would_contend() {
-    return g_speaker_enabled && (g_queue.size() > 0 || g_inflight.load() > 0);
+static void try_schedule_speaker(PoolTask& task, const std::vector<float>& samples) {
+#ifdef XASR_SPEAKER
+    if (g_speaker_worker) g_speaker_worker->schedule(task, samples);
+#else
+    (void) task;
+    (void) samples;
+#endif
+}
+
+static SpeakerResult speaker_result(const PoolTask& task, bool silence) {
+    if (!g_speaker_enabled) return {};
+    if (silence) return {"not_assessed", "silence", std::nullopt};
+    const char* reason = task.speaker_skip_reason;
+    if (task.speaker) {
+        if (!task.speaker->ready.load(std::memory_order_acquire)) {
+            reason = "in_progress";
+        } else if (task.speaker->score) {
+            g_speaker_assessed.fetch_add(1);
+            return {"assessed", nullptr, task.speaker->score};
+        } else {
+            reason = "no_embedding";
+        }
+    }
+    g_speaker_deferred.fetch_add(1);
+    return {"not_assessed", reason, std::nullopt};
+}
+
+static void set_speaker_json(json& body, const SpeakerResult& speaker) {
+    body["speaker_status"] = speaker.status;
+    if (speaker.reason) body["speaker_reason"] = speaker.reason;
+    if (speaker.score) {
+        body["speaker_score"] = *speaker.score;
+        body["speaker_ok"] = *speaker.score >= g_speaker_threshold;
+    }
 }
 
 // Pieces to transcribe for one committed segment. Normal cabin commits (already
 // cut at the client's VAD) stay a single piece; only over-long audio is split, so
 // a client with its own VAD and little tail silence is never re-cut.
-static std::vector<std::pair<size_t, size_t>> plan_pieces(const std::vector<float>& samples, size_t* vad_pieces) {
+static std::vector<std::pair<size_t, size_t>> plan_pieces(Engine& eng, const std::vector<float>& samples) {
     std::vector<std::pair<size_t, size_t>> pieces;
-    if (vad_pieces) {
-        *vad_pieces = 0;
+    double energy = 0.0;
+    for (float sample : samples) energy += (double) sample * sample;
+    if (energy == 0.0) {
+        return pieces;
     }
-    const size_t max_len = (size_t) (g_vad_split_s * 16000.0f);
-    if (g_vad_enabled && samples.size() > max_len) {
-        const std::vector<std::pair<int, int>> spans = vad_spans(samples);
-        if (vad_pieces) {
-            *vad_pieces = spans.size();
-        }
-        // Group consecutive speech spans into chunks of at most g_vad_piece_s.
-        // One piece per span would cut a sentence at every comma-level pause and
-        // pay the per-call overhead each time (measured: 7 pieces for 13.9 s).
-        const size_t piece_len = (size_t) (g_vad_piece_s * 16000.0f);
-        size_t cur_a = 0, cur_b = 0;
-        bool open = false;
-        for (const auto& sp : spans) {
-            const size_t a = (size_t) std::max(0, sp.first);
-            const size_t b = std::min(samples.size(), (size_t) std::max(0, sp.second));
-            if (b <= a + 1600) { // ignore slivers under 100 ms
-                continue;
-            }
-            if (!open) {
-                cur_a = a;
-                cur_b = b;
-                open = true;
-            } else if (b - cur_a <= piece_len) {
-                cur_b = b;
-            } else {
-                pieces.push_back({cur_a, cur_b});
-                cur_a = a;
-                cur_b = b;
-            }
-        }
-        if (open) {
-            pieces.push_back({cur_a, cur_b});
+    if (!g_vad_enabled) return {{0, samples.size()}};
+    const bool long_segment = samples.size() > (size_t) (g_vad_split_s * 16000.0f);
+    const bool quiet = energy < (double) g_silence_rms * g_silence_rms * samples.size();
+    if (!long_segment && !quiet) {
+        return {{0, samples.size()}};
+    }
+
+    const auto spans = vad_spans(eng, samples);
+    if (quiet && spans.empty()) return pieces;
+    if (!long_segment || spans.empty()) return {{0, samples.size()}};
+
+    const size_t piece_len = (size_t) (g_vad_piece_s * 16000.0f);
+    for (const auto& sp : spans) {
+        const size_t a = (size_t) std::max(0, sp.first);
+        const size_t b = std::min(samples.size(), (size_t) std::max(0, sp.second));
+        if (b <= a + 1600) continue;
+        if (!pieces.empty() && (a <= pieces.back().second || b - pieces.back().first <= piece_len)) {
+            pieces.back().second = std::max(b, pieces.back().second);
+        } else {
+            pieces.emplace_back(a, b);
         }
     }
-    if (pieces.empty()) {
-        pieces.push_back({0, samples.size()});
+    if (pieces.empty()) return {{0, samples.size()}};
+
+    // Keep up to 100 ms of surrounding audio without duplicating neighboring pieces.
+    size_t left_limit = 0;
+    for (size_t i = 0; i < pieces.size(); ++i) {
+        auto& p = pieces[i];
+        const size_t right_limit = i + 1 < pieces.size() ? (p.second + pieces[i + 1].first) / 2 : samples.size();
+        p.first = std::max(left_limit, p.first > 1600 ? p.first - 1600 : 0);
+        p.second = std::min(right_limit, p.second + 1600);
+        left_limit = right_limit;
     }
     return pieces;
-}
-
-// Pure silence makes the model hallucinate syllables, so a commit with no
-// detected speech and very low energy returns an empty transcript instead.
-static float pcm_rms(const std::vector<float>& samples) {
-    if (samples.empty()) {
-        return 0.0f;
-    }
-    double acc = 0;
-    for (float v : samples) acc += (double) v * v;
-    return (float) std::sqrt(acc / (double) samples.size());
-}
-
-// True when the segment carries no detected speech and almost no energy, in
-// which case the model would hallucinate syllables. Both request paths use it.
-static bool is_silent_commit(const std::vector<float>& samples) {
-    return g_vad_enabled && pcm_rms(samples) < g_silence_rms && vad_spans(samples).empty();
 }
 
 // Join piece transcripts: a space only between two ASCII ends/ starts.
@@ -761,19 +938,60 @@ static void append_text(std::string& out, const std::string& add) {
     out += add;
 }
 
+static SegmentReply decode_task(Engine& eng, const PoolTask& task) {
+    SegmentReply reply;
+    const double t0 = now_ms();
+    const auto& samples = task.samples;
+    const auto pieces = task.priority > 0 ? plan_pieces(eng, samples)
+                                         : std::vector<std::pair<size_t, size_t>>{{0, samples.size()}};
+    reply.vad_ms = now_ms() - t0;
+    reply.pieces = pieces.size();
+    reply.silence = pieces.empty();
+    for (const auto& piece : pieces) {
+        if (pf_clock::now() >= task.deadline) return deadline_reply();
+        if (task.cancelled && task.cancelled()) {
+            reply.status = 499;
+            reply.text = "request cancelled";
+            break;
+        }
+        const float* pcm = samples.data() + piece.first;
+        const int count = (int) (piece.second - piece.first);
+        const double begin_ms = now_ms();
+        HtpWatchdog::Guard guard(eng.watchdog, "inference");
+        if (task.want_tokens) {
+            std::unique_ptr<paraformer_tokens, TokensDeleter> tokens(paraformer_transcribe_tokens(eng.ctx.get(), pcm, count));
+            if (tokens) {
+                append_text(reply.text, tokens->text);
+                append_words(reply.words, tokens.get(), (double) piece.first / 16.0);
+            } else {
+                reply.status = 500;
+            }
+        } else {
+            std::unique_ptr<char, decltype(&std::free)> text(paraformer_transcribe(eng.ctx.get(), pcm, count), &std::free);
+            if (text) append_text(reply.text, text.get());
+            else reply.status = 500;
+        }
+        reply.infer_ms += now_ms() - begin_ms;
+        if (reply.status != 200) {
+            reply.text = "inference failed";
+            break;
+        }
+    }
+    return reply;
+}
+
 // ---- base64 ----
 
 static bool base64_decode(const std::string& in, std::string& out) {
-    static int8_t table[256];
-    static bool init = false;
-    if (!init) {
-        std::fill(std::begin(table), std::end(table), (int8_t) -1);
+    static const auto table = [] {
+        std::array<int8_t, 256> alphabet;
+        alphabet.fill(-1);
         const char* a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         for (int i = 0; i < 64; ++i) {
-            table[(uint8_t) a[i]] = (int8_t) i;
+            alphabet[(uint8_t) a[i]] = (int8_t) i;
         }
-        init = true;
-    }
+        return alphabet;
+    }();
     out.clear();
     out.reserve(in.size() * 3 / 4);
     uint32_t acc = 0;
@@ -801,36 +1019,52 @@ static bool base64_decode(const std::string& in, std::string& out) {
 
 // ---- Realtime session ----
 
+struct WsCommit {
+    std::string item;
+    pf_clock::time_point deadline;
+};
+
 struct WsSession {
     std::mutex m;
     std::deque<std::string> outbox;
+    std::deque<WsCommit> pending;
     std::vector<float> pcm;       // 16 kHz mono
     std::string language = "zh";
-    std::string item_id;
     std::string partial_text;
-    uint64_t gen = 0;             // bumped by commit/clear to invalidate in-flight work
+    uint64_t gen = 0;             // invalidates previews on commit or clear
     size_t partial_mark = 0;      // pcm size when the last partial was scheduled
     double last_partial_ms = 0;
     bool partial_inflight = false;
-    int commits = 0;
+    bool closed = false;
+    uint64_t commits = 0;
 };
 
 static std::string next_event_id() {
     return "event_" + std::to_string(++g_event_seq);
 }
 
-static void ws_send_event(WsSession& s, const char* type, json body) {
+static void ws_queue_event(WsSession& s, const char* type, json body) {
     body["type"] = type;
     body["event_id"] = next_event_id();
-    std::lock_guard<std::mutex> lock(s.m);
     s.outbox.push_back(body.dump());
+}
+
+static void ws_send_event(WsSession& s, const char* type, json body) {
+    std::lock_guard<std::mutex> lock(s.m);
+    ws_queue_event(s, type, std::move(body));
 }
 
 static void ws_send_error(WsSession& s, const std::string& message, const std::string& type,
                           const std::string& param = "", const std::string& code = "") {
-    json e = {{"type", "error"}, {"event_id", next_event_id()}, {"error", error_body(message, type, param, code)["error"]}};
-    std::lock_guard<std::mutex> lock(s.m);
-    s.outbox.push_back(e.dump());
+    ws_send_event(s, "error", error_body(message, type, param, code));
+}
+
+static void ws_final_error(WsSession& s, const std::string& item, const SegmentReply& reply) {
+    const bool expired = reply.status == 504;
+    if (expired) g_deadline_expired.fetch_add(1);
+    auto body = error_body(reply.text, "server_error", "", expired ? "deadline_exceeded" : "");
+    body["item_id"] = item;
+    ws_queue_event(s, "error", std::move(body));
 }
 
 static json session_object(const WsSession& s) {
@@ -849,10 +1083,11 @@ static void maybe_schedule_partial(const std::shared_ptr<WsSession>& s) {
     // A partial costs a full decode. Never let one run while a commit (or any
     // other request) is waiting, and stop partials once the segment is long
     // enough that the final matters more than the preview.
-    if (g_queue.size() > 0) {
+    if (queue_depth() > 0) {
         g_partials_skipped.fetch_add(1);
         return;
     }
+    std::lock_guard<std::mutex> lock(s->m);
     if (g_partial_max_s > 0 && s->pcm.size() > (size_t) (g_partial_max_s * 16000.0)) {
         g_partials_skipped.fetch_add(1);
         return;
@@ -870,31 +1105,24 @@ static void maybe_schedule_partial(const std::shared_ptr<WsSession>& s) {
     s->last_partial_ms = t;
     std::vector<float> snapshot = s->pcm;
     const uint64_t gen = s->gen;
-    const bool ok = submit(std::move(snapshot), 0, [s, gen](int status, std::string text, double, double, TokensPtr) {
-        {
-            std::lock_guard<std::mutex> lock(s->m);
-            s->partial_inflight = false;
-        }
-        if (status != 200 || gen != s->gen) {
-            return; // stale or failed: a commit or clear superseded it
-        }
-        std::string delta;
-        {
-            std::lock_guard<std::mutex> lock(s->m);
-            size_t i = 0;
-            while (i < text.size() && i < s->partial_text.size() && text[i] == s->partial_text[i]) {
-                ++i;
-            }
-            delta = text.substr(i);
-            s->partial_text = text;
-        }
-        if (!delta.empty()) {
-            ws_send_event(*s, "conversation.item.input_audio_transcription.delta",
-                          {{"item_id", s->item_id}, {"content_index", 0}, {"delta", delta}});
-        }
-    });
-    if (!ok) {
+    const std::string item = "item_" + std::to_string(s->commits + 1);
+    const bool ok = submit(std::move(snapshot), 0, [s, gen, item](SegmentReply reply) {
         std::lock_guard<std::mutex> lock(s->m);
+        s->partial_inflight = false;
+        auto& text = reply.text;
+        if (reply.status != 200 || s->closed || gen != s->gen || text.size() <= s->partial_text.size() ||
+            text.compare(0, s->partial_text.size(), s->partial_text) != 0) {
+            return;
+        }
+        auto delta = text.substr(s->partial_text.size());
+        s->partial_text = std::move(text);
+        ws_queue_event(*s, "conversation.item.input_audio_transcription.delta",
+                       {{"item_id", item}, {"content_index", 0}, {"delta", delta}});
+    }, false, [s, gen] {
+        std::lock_guard<std::mutex> lock(s->m);
+        return s->closed || gen != s->gen;
+    }, pf_clock::time_point::max(), s.get());
+    if (!ok) {
         s->partial_inflight = false;
         return;
     }
@@ -902,6 +1130,10 @@ static void maybe_schedule_partial(const std::shared_ptr<WsSession>& s) {
 }
 
 static void ws_handle_text(const std::shared_ptr<WsSession>& s, const std::string& msg) {
+    if (msg.size() > 4 * ((pf_segment::max_samples * sizeof(int16_t) + 2) / 3) + 4096) {
+        ws_send_error(*s, "event exceeds maximum size", "invalid_request_error");
+        return;
+    }
     json j;
     try {
         j = json::parse(msg);
@@ -909,18 +1141,31 @@ static void ws_handle_text(const std::shared_ptr<WsSession>& s, const std::strin
         ws_send_error(*s, "client event is not valid JSON", "invalid_request_error");
         return;
     }
-    const std::string type = j.value("type", "");
+    if (!j.is_object() || !j.contains("type") || !j["type"].is_string()) {
+        ws_send_error(*s, "event needs a string 'type' field", "invalid_request_error", "type");
+        return;
+    }
+    const std::string type = j["type"].get<std::string>();
     if (type == "session.update") {
         const json& sess = j.contains("session") ? j["session"] : json::object();
+        if (!sess.is_object() || (sess.contains("input_audio_transcription") && !sess["input_audio_transcription"].is_object())) {
+            ws_send_error(*s, "session and input_audio_transcription must be objects", "invalid_request_error", "session");
+            return;
+        }
         if (sess.contains("input_audio_transcription") && sess["input_audio_transcription"].contains("language")) {
-            s->language = sess["input_audio_transcription"]["language"].get<std::string>();
+            const auto& language = sess["input_audio_transcription"]["language"];
+            if (!language.is_string() || language.get_ref<const std::string&>().size() > 32) {
+                ws_send_error(*s, "language must be a string of at most 32 bytes", "invalid_request_error", "language");
+                return;
+            }
+            s->language = language.get<std::string>();
         }
         ws_send_event(*s, "session.updated", {{"session", session_object(*s)}});
         return;
     }
     if (type == "input_audio_buffer.append") {
         std::string raw;
-        if (!j.contains("audio") || !base64_decode(j["audio"].get<std::string>(), raw)) {
+        if (!j.contains("audio") || !j["audio"].is_string() || !base64_decode(j["audio"].get_ref<const std::string&>(), raw)) {
             ws_send_error(*s, "append needs a base64 'audio' field", "invalid_request_error", "audio");
             return;
         }
@@ -929,11 +1174,11 @@ static void ws_handle_text(const std::shared_ptr<WsSession>& s, const std::strin
             return;
         }
         const size_t n = raw.size() / 2;
-        std::vector<float> f = resample_to_16k(reinterpret_cast<const int16_t*>(raw.data()), n, 16000);
+        std::vector<float> f = decode_pcm16(raw.data(), n);
         {
             std::lock_guard<std::mutex> lock(s->m);
-            if (s->pcm.size() + f.size() > (size_t) 16000 * 30) {
-                ws_send_error(*s, "segment exceeds 30 s, commit or clear first", "invalid_request_error");
+            if (s->pcm.size() + f.size() > pf_segment::max_samples) {
+                ws_queue_event(*s, "error", error_body("segment exceeds 30 s, commit or clear first", "invalid_request_error"));
                 return;
             }
             s->pcm.insert(s->pcm.end(), f.begin(), f.end());
@@ -942,74 +1187,105 @@ static void ws_handle_text(const std::shared_ptr<WsSession>& s, const std::strin
         return;
     }
     if (type == "input_audio_buffer.commit") {
-        std::vector<float> snapshot;
-        uint64_t gen;
-        {
+        std::lock_guard<std::mutex> lock(s->m);
+        if (s->pcm.empty()) {
+            ws_queue_event(*s, "error", error_body("buffer is empty", "invalid_request_error"));
+            return;
+        }
+        if (s->pending.size() >= max_ws_pending) {
+            g_rejected.fetch_add(1);
+            ws_queue_event(*s, "error", error_body("too many pending commits, retry later", "rate_limit_error"));
+            return;
+        }
+        const std::string item = "item_" + std::to_string(s->commits + 1);
+        const auto deadline = pf_clock::now() + g_deadline;
+        const double duration = (double) s->pcm.size() / 16000.0;
+        const bool ok = submit(std::move(s->pcm), 1, [s, item, duration, deadline](SegmentReply reply) {
             std::lock_guard<std::mutex> lock(s->m);
-            if (s->pcm.empty()) {
-                ws_send_error(*s, "buffer is empty", "invalid_request_error");
-                return;
-            }
-            snapshot.swap(s->pcm);
-            s->pcm.clear();
-            s->partial_text.clear();
-            s->partial_mark = 0;
-            s->item_id = "item_" + std::to_string(++s->commits);
-            gen = ++s->gen;
-        }
-        ws_send_event(*s, "input_audio_buffer.committed", {{"item_id", s->item_id}, {"previous_item_id", nullptr}});
-        const std::string item = s->item_id;
-        std::shared_ptr<std::future<float>> score_future;
-        if (g_speaker_enabled) {
-            std::vector<float> score_samples = snapshot;
-            score_future = std::make_shared<std::future<float>>(
-                std::async(std::launch::async, [score_samples] { return spk_score(score_samples); }));
-        }
-        const bool ok = submit(std::move(snapshot), 1, [s, gen, item, score_future](int status, std::string text,
-                                                                                     double queue_ms, double infer_ms,
-                                                                                     TokensPtr) {
-            if (gen != s->gen) {
-                return; // cleared or superseded
-            }
-            if (status != 200) {
-                ws_send_error(*s, text, status == 503 ? "server_error" : "server_error");
+            if (s->closed) return;
+            const auto pending = std::find_if(s->pending.begin(), s->pending.end(), [&](const auto& commit) {
+                return commit.item == item;
+            });
+            if (pending == s->pending.end()) return;
+            s->pending.erase(pending);
+            if (pf_clock::now() >= deadline) reply = deadline_reply();
+            if (reply.status != 200) {
+                ws_final_error(*s, item, reply);
                 return;
             }
             json body = {{"item_id", item},
                          {"content_index", 0},
-                         {"transcript", text},
-                         {"usage", {{"type", "duration"}, {"seconds", (double) 0}}}};
-            if (score_future) {
-                const float sc = score_future->get();
-                body["speaker_score"] = sc;
-                body["speaker_ok"] = sc >= g_speaker_threshold;
-            }
-            ws_send_event(*s, "conversation.item.input_audio_transcription.completed", body);
-            json meta = {{"item_id", item}, {"queue_ms", queue_ms}, {"infer_ms", infer_ms}};
-            ws_send_event(*s, "x.pf.metrics", meta);
-        });
+                         {"transcript", reply.text},
+                         {"vad_pieces", reply.pieces},
+                         {"usage", {{"type", "duration"}, {"seconds", duration}}}};
+            if (reply.silence) body["empty"] = "silence";
+            set_speaker_json(body, reply.speaker);
+            ws_queue_event(*s, "conversation.item.input_audio_transcription.completed", std::move(body));
+            ws_queue_event(*s, "x.pf.metrics", {{"item_id", item}, {"queue_ms", reply.queue_ms},
+                                               {"infer_ms", reply.infer_ms}, {"vad_ms", reply.vad_ms},
+                                               {"backend", reply.backend}});
+        }, false, [s] {
+            std::lock_guard<std::mutex> lock(s->m);
+            return s->closed;
+        }, deadline, s.get());
         if (!ok) {
-            ws_send_error(*s, "server is busy, retry later", "rate_limit_error");
+            ws_queue_event(*s, "error", error_body("server is busy, retry later", "rate_limit_error"));
+            return;
         }
+        s->pending.push_back({item, deadline});
+        json prev = s->commits > 0 ? json("item_" + std::to_string(s->commits)) : json(nullptr);
+        ++s->commits;
+        ++s->gen;
+        s->pcm.clear();
+        s->partial_text.clear();
+        s->partial_mark = 0;
+        ws_queue_event(*s, "input_audio_buffer.committed", {{"item_id", item}, {"previous_item_id", std::move(prev)}});
         return;
     }
     if (type == "input_audio_buffer.clear") {
         {
             std::lock_guard<std::mutex> lock(s->m);
-            s->pcm.clear();
+            std::vector<float>().swap(s->pcm);
             s->partial_text.clear();
             s->partial_mark = 0;
             ++s->gen;
+            ws_queue_event(*s, "input_audio_buffer.cleared", json::object());
         }
-        ws_send_event(*s, "input_audio_buffer.cleared", json::object());
         return;
     }
-    ws_send_error(*s, "unsupported event type '" + type + "'", "invalid_request_error", "type", "unsupported_event");
+    ws_send_error(*s, "unsupported event type", "invalid_request_error", "type", "unsupported_event");
 }
 
 // ---- WS loop ----
 
+static void ws_close_session(WsSession& s) {
+    std::lock_guard<std::mutex> session_lock(s.m);
+    s.closed = true;
+    std::vector<float>().swap(s.pcm);
+    s.outbox.clear();
+    s.pending.clear();
+    std::lock_guard<std::mutex> queue_lock(g_mutex);
+    for (auto it = g_queue.begin(); it != g_queue.end();) {
+        if ((*it)->ws_owner != &s) {
+            ++it;
+            continue;
+        }
+        g_queue_bytes -= (*it)->samples.capacity() * sizeof(float);
+        it = g_queue.erase(it);
+        g_cancelled_queued.fetch_add(1);
+    }
+}
+
 static void ws_serve(httplib::ws::WebSocket& ws) {
+    if (g_ws_sessions.fetch_add(1) >= max_ws_sessions) {
+        g_ws_sessions.fetch_sub(1);
+        g_rejected.fetch_add(1);
+        ws.close(httplib::ws::CloseStatus::PolicyViolation, "too many realtime sessions");
+        return;
+    }
+    struct SessionSlot {
+        ~SessionSlot() { g_ws_sessions.fetch_sub(1); }
+    } slot;
     auto s = std::make_shared<WsSession>();
     ws.set_read_timeout(std::chrono::milliseconds(40));
     ws_send_event(*s, "session.created", {{"session", session_object(*s)}});
@@ -1024,21 +1300,46 @@ static void ws_serve(httplib::ws::WebSocket& ws) {
         std::deque<std::string> pending;
         {
             std::lock_guard<std::mutex> lock(s->m);
+            const auto now = pf_clock::now();
+            while (!s->pending.empty() && s->pending.front().deadline <= now) {
+                ws_final_error(*s, s->pending.front().item, deadline_reply());
+                s->pending.pop_front();
+            }
             pending.swap(s->outbox);
         }
         for (const auto& e : pending) {
             if (!ws.send(e)) {
+                ws_close_session(*s);
                 return;
             }
         }
     }
-    // Invalidate anything still in flight so its callback does not touch a
-    // session the connection no longer reads from.
-    std::lock_guard<std::mutex> lock(s->m);
-    ++s->gen;
+    ws_close_session(*s);
 }
 
 // ---- HTTP ----
+
+static void set_segment_headers(httplib::Response& res, const SegmentReply& reply) {
+    res.set_header("X-Queue-Ms", std::to_string((int) std::lround(reply.queue_ms)));
+    res.set_header("X-Infer-Ms", std::to_string((int) std::lround(reply.infer_ms)));
+    res.set_header("X-Vad-Ms", std::to_string(reply.vad_ms));
+    res.set_header("X-Vad-Pieces", std::to_string(reply.pieces));
+    if (!reply.backend.empty()) res.set_header("X-ASR-Backend", reply.backend);
+    if (reply.silence) res.set_header("X-Empty", "silence");
+}
+
+static void set_speaker_headers(httplib::Response& res, const SpeakerResult& speaker) {
+    res.set_header("X-Speaker-Status", speaker.status);
+    if (speaker.reason) res.set_header("X-Speaker-Reason", speaker.reason);
+    if (speaker.score) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.3f", *speaker.score);
+        res.set_header("X-Speaker-Score", buf);
+        res.set_header("X-Speaker-Ok", *speaker.score >= g_speaker_threshold ? "1" : "0");
+    } else if (std::strcmp(speaker.status, "not_assessed") == 0 && std::strcmp(speaker.reason, "silence") != 0) {
+        res.set_header("X-Speaker-Deferred", "1");
+    }
+}
 
 static void handle_transcription(const httplib::Request& req, httplib::Response& res) {
     if (!req.form.has_file("file")) {
@@ -1057,84 +1358,33 @@ static void handle_transcription(const httplib::Request& req, httplib::Response&
         return;
     }
     const std::string fmt = req.form.has_field("response_format") ? req.form.get_field("response_format") : "json";
+    if (fmt != "json" && fmt != "text" && fmt != "verbose_json" && fmt != "srt") {
+        reply_error(res, 400, "unsupported response_format '" + fmt + "'", "invalid_request_error", "response_format");
+        return;
+    }
     const std::string punct = req.form.has_field("punctuate") ? req.form.get_field("punctuate") : "false";
     const bool want_punct = punct == "true" || punct == "1";
     const bool want_tokens = fmt == "verbose_json" || fmt == "srt" || want_punct;
-    std::future<float> score_future;
-    const bool gate_now = g_speaker_enabled && !spk_would_contend();
-    if (gate_now) {
-        std::vector<float> score_samples = samples; // the ASR task takes ownership
-        score_future = std::async(std::launch::async, [score_samples] { return spk_score(score_samples); });
-    } else if (g_speaker_enabled) {
-        g_speaker_deferred.fetch_add(1);
-    }
-    size_t vad_pieces = 0;
-    if (is_silent_commit(samples)) {
-        res.set_header("X-Vad-Pieces", "0");
-        res.set_header("X-Infer-Ms", "0");
-        res.set_header("X-Queue-Ms", "0");
-        res.set_header("X-Empty", "silence");
-        res.set_content(json{{"text", ""}}.dump(), "application/json");
-        return;
-    }
-    const std::vector<std::pair<size_t, size_t>> pieces = plan_pieces(samples, &vad_pieces);
-    std::string joined;
-    TokensPtr last_tokens;
-    double final_queue_ms = 0.0, final_infer_ms = 0.0;
-    if (pieces.size() == 1) {
-        const SyncReply one = transcribe_sync(samples, want_tokens);
-        if (one.status != 200) {
-            reply_error(res, one.status, one.text, one.status == 429 ? "rate_limit_error" : "server_error");
-            return;
-        }
-        joined = one.text;
-        last_tokens = one.tokens;
-        final_queue_ms = one.queue_ms;
-        final_infer_ms = one.infer_ms;
-    } else {
-        double infer_ms = 0;
-        for (const auto& pc : pieces) {
-            std::vector<float> piece(samples.begin() + (long) pc.first, samples.begin() + (long) pc.second);
-            const SyncReply one = transcribe_sync(piece, false);
-            if (one.status != 200) {
-                reply_error(res, one.status, one.text, one.status == 429 ? "rate_limit_error" : "server_error");
-                return;
-            }
-            append_text(joined, one.text);
-            infer_ms += one.infer_ms;
-        }
-        final_queue_ms = 0.0;
-        final_infer_ms = infer_ms;
-    }
-    res.set_header("X-Queue-Ms", std::to_string((int) std::lround(final_queue_ms)));
-    res.set_header("X-Infer-Ms", std::to_string((int) std::lround(final_infer_ms)));
-    res.set_header("X-Vad-Pieces", std::to_string(pieces.size()));
-    const float speaker_score = score_future.valid() ? score_future.get() : -1.0f;
-    const SyncReply r = [&] { SyncReply x; x.status = 200; x.text = joined; x.tokens = last_tokens; return x; }();
+    const double duration = (double) samples.size() / 16000.0;
+    const SegmentReply r = transcribe_sync(std::move(samples), want_tokens);
+    set_segment_headers(res, r);
     if (r.status != 200) {
-        reply_error(res, r.status, r.text, r.status == 429 ? "rate_limit_error" : "server_error");
+        reply_error(res, r.status, r.text, r.status == 429 ? "rate_limit_error" : "server_error", "",
+                    r.status == 504 ? "deadline_exceeded" : "");
         return;
     }
-    const std::vector<WordSpan> words = build_words(r.tokens.get());
+    const auto& words = r.words;
     const bool zh = any_multibyte(r.text);
-    const std::string detected =
-        words.empty() ? (any_multibyte(r.text) ? std::string("zh") : std::string("en")) : utterance_language(words);
+    const std::string detected = r.text.empty() ? "und" :
+        (words.empty() ? (zh ? "zh" : "en") : utterance_language(words));
     const std::string text = want_punct && !words.empty() ? punctuate_words(words, zh, g_punct_gap_ms) : r.text;
     res.set_header("X-Language", detected);
-    if (speaker_score >= 0.0f) {
-        char buf[32];
-        std::snprintf(buf, sizeof(buf), "%.3f", speaker_score);
-        res.set_header("X-Speaker-Score", buf);
-        res.set_header("X-Speaker-Ok", speaker_score >= g_speaker_threshold ? "1" : "0");
-    } else if (g_speaker_enabled) {
-        res.set_header("X-Speaker-Deferred", "1");
-    }
+    set_speaker_headers(res, r.speaker);
     if (fmt == "text") {
         res.set_content(text, "text/plain; charset=utf-8");
         return;
     }
     if (fmt == "verbose_json") {
-        const double duration = (double) samples.size() / 16000.0;
         json jw = json::array();
         for (const auto& w : words) {
             jw.push_back({{"word", w.text}, {"start", w.start_ms / 1000.0}, {"end", w.end_ms / 1000.0}});
@@ -1144,15 +1394,16 @@ static void handle_transcription(const httplib::Request& req, httplib::Response&
                   {"duration", duration},
                   {"text", text},
                   {"words", jw},
-                  {"segments", segments_json(words, zh, g_seg_gap_ms, text)}};
-        if (speaker_score >= 0.0f) {
-            j["speaker_score"] = speaker_score;
-            j["speaker_ok"] = speaker_score >= g_speaker_threshold;
-        }
+                  {"segments", r.silence ? json::array() : segments_json(words, zh, g_seg_gap_ms, text)}};
+        set_speaker_json(j, r.speaker);
         res.set_content(j.dump(2), "application/json");
         return;
     }
     if (fmt == "srt") {
+        if (r.silence) {
+            res.set_content("", "text/plain; charset=utf-8");
+            return;
+        }
         const json segs = segments_json(words, zh, g_seg_gap_ms, text);
         std::string body;
         for (size_t i = 0; i < segs.size(); ++i) {
@@ -1160,10 +1411,6 @@ static void handle_transcription(const httplib::Request& req, httplib::Response&
                     srt_time(segs[i]["end"].get<double>()) + "\n" + segs[i]["text"].get<std::string>() + "\n\n";
         }
         res.set_content(body.empty() ? text + "\n" : body, "text/plain; charset=utf-8");
-        return;
-    }
-    if (fmt != "json") {
-        reply_error(res, 400, "unsupported response_format '" + fmt + "'", "invalid_request_error", "response_format");
         return;
     }
     res.set_content(json{{"text", text}}.dump(), "application/json");
@@ -1174,42 +1421,49 @@ static void handle_segment(const httplib::Request& req, httplib::Response& res) 
         reply_error(res, 400, "body must be non-empty float32 PCM", "invalid_request_error", "body");
         return;
     }
+    if (req.body.size() / sizeof(float) > pf_segment::max_samples) {
+        reply_error(res, 413, "segment exceeds 30 s", "invalid_request_error", "body");
+        return;
+    }
     std::vector<float> samples(req.body.size() / sizeof(float));
     std::memcpy(samples.data(), req.body.data(), req.body.size());
+    if (!pf_segment::finite(samples)) {
+        reply_error(res, 400, "audio contains non-finite samples", "invalid_request_error", "body");
+        return;
+    }
     const std::string fmt = req.has_param("format") ? req.get_param_value("format") : "json";
-    if (is_silent_commit(samples)) {
-        res.set_header("X-Empty", "silence");
-        res.set_header("X-Infer-Ms", "0");
-        if (fmt == "text") {
-            res.set_content("", "text/plain; charset=utf-8");
-        } else {
-            res.set_content(json{{"text", ""}, {"duration", (double) samples.size() / 16000.0}}.dump(),
-                            "application/json");
-        }
+    if (fmt != "json" && fmt != "text") {
+        reply_error(res, 400, "unsupported format '" + fmt + "'", "invalid_request_error", "format");
         return;
     }
-    const SyncReply r = transcribe_sync(samples);
-    res.set_header("X-Queue-Ms", std::to_string((int) std::lround(r.queue_ms)));
-    res.set_header("X-Infer-Ms", std::to_string((int) std::lround(r.infer_ms)));
+    const double duration = (double) samples.size() / 16000.0;
+    const SegmentReply r = transcribe_sync(std::move(samples));
+    set_segment_headers(res, r);
     if (r.status != 200) {
-        reply_error(res, r.status, r.text, r.status == 429 ? "rate_limit_error" : "server_error");
+        reply_error(res, r.status, r.text, r.status == 429 ? "rate_limit_error" : "server_error", "",
+                    r.status == 504 ? "deadline_exceeded" : "");
         return;
     }
+    set_speaker_headers(res, r.speaker);
     if (fmt == "text") {
         res.set_content(r.text, "text/plain; charset=utf-8");
         return;
     }
-    res.set_content(json{{"text", r.text}, {"duration", (double) samples.size() / 16000.0}}.dump(), "application/json");
+    json body = {{"text", r.text}, {"duration", duration}};
+    set_speaker_json(body, r.speaker);
+    res.set_content(body.dump(), "application/json");
 }
 
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
                      "usage: %s MODEL.gguf [--device HTP0:0] [--port N] [--engines N] [--threads N] "
-                     "[--bind ADDR] [--queue N] [--timeout-ms N] [--model-id ID] [--warmup WAV] "
+                     "[--no-htp-flash-attn] [--prefer-idle-htp] [--htp-watchdog-ms N] "
+                     "[--bind ADDR] [--queue N] [--queue-mib N] [--timeout-ms N] [--deadline-ms N] "
+                     "[--model-id ID] [--warmup WAV] [--allow-cpu-fallback] [--recover-on-cpu] "
                      "[--partial-ms N] [--partial-interval-ms N] [--partial-max-s N] [--no-partials] "
                      "[--seg-gap-ms N] [--punct-gap-ms N] "
-                     "[--web-dir DIR] [--speaker-model FILE] [--enroll-dir DIR] [--speaker-threshold F] "
+                     "[--web-dir DIR] [--speaker-model FILE] [--enroll-dir DIR] [--speaker-threshold F] [--speaker-max-s S] "
                      "[--vad-model FILE] [--vad-split-s S] [--vad-threshold F] [--vad-min-silence S] "
                      "[--vad-min-speech S]\n",
                      argv[0]);
@@ -1224,6 +1478,11 @@ int main(int argc, char** argv) {
     int n_engines = 2;
     int threads = 2;
     bool device_set = false;
+    bool allow_cpu_fallback = false;
+    bool recover_on_cpu = false;
+    bool htp_flash_attn = true;
+    bool prefer_idle_htp = false;
+    std::chrono::milliseconds htp_watchdog_limit{0};
     for (int i = 2; i < argc; ++i) {
         if (std::strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
             device = argv[++i];
@@ -1238,12 +1497,48 @@ int main(int argc, char** argv) {
             bind_addr = argv[++i];
         } else if (std::strcmp(argv[i], "--queue") == 0 && i + 1 < argc) {
             g_queue_limit = (size_t) std::max(1, std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--queue-mib") == 0 && i + 1 < argc) {
+            char* end = nullptr;
+            const long mib = std::strtol(argv[++i], &end, 10);
+            if (*end || mib < 1 || mib > 128) {
+                std::fprintf(stderr, "pf-api: --queue-mib must be an integer from 1 to 128\n");
+                return 1;
+            }
+            g_queue_bytes_limit = (size_t) mib * 1024 * 1024;
         } else if (std::strcmp(argv[i], "--timeout-ms") == 0 && i + 1 < argc) {
             g_timeout_ms = std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--deadline-ms") == 0 && i + 1 < argc) {
+            char* end = nullptr;
+            const long ms = std::strtol(argv[++i], &end, 10);
+            if (*end || ms < 1 || ms > 120000) {
+                std::fprintf(stderr, "pf-api: --deadline-ms must be an integer from 1 to 120000\n");
+                return 1;
+            }
+            g_deadline = std::chrono::milliseconds(ms);
         } else if (std::strcmp(argv[i], "--model-id") == 0 && i + 1 < argc) {
             g_model_id = argv[++i];
         } else if (std::strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) {
             warmup = argv[++i];
+        } else if (std::strcmp(argv[i], "--allow-cpu-fallback") == 0) {
+            allow_cpu_fallback = true;
+        } else if (std::strcmp(argv[i], "--recover-on-cpu") == 0) {
+            recover_on_cpu = true;
+        } else if (std::strcmp(argv[i], "--no-htp-flash-attn") == 0) {
+            htp_flash_attn = false;
+        } else if (std::strcmp(argv[i], "--prefer-idle-htp") == 0) {
+            prefer_idle_htp = true;
+        } else if (std::strcmp(argv[i], "--htp-watchdog-ms") == 0) {
+            char* end = nullptr;
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "pf-api: --htp-watchdog-ms requires a value\n");
+                return 1;
+            }
+            const long ms = std::strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end || (ms != 0 && (ms < 100 || ms > 300000))) {
+                std::fprintf(stderr, "pf-api: --htp-watchdog-ms must be 0 or an integer from 100 to 300000\n");
+                return 1;
+            }
+            htp_watchdog_limit = std::chrono::milliseconds(ms);
         } else if (std::strcmp(argv[i], "--web-dir") == 0 && i + 1 < argc) {
             web_dir = argv[++i];
         } else if (std::strcmp(argv[i], "--partial-ms") == 0 && i + 1 < argc) {
@@ -1282,12 +1577,38 @@ int main(int argc, char** argv) {
             g_punct_gap_ms = std::atof(argv[++i]);
         }
     }
+    if (recover_on_cpu && (!device_set || std::strncmp(device, "HTP", 3) != 0)) {
+        std::fprintf(stderr, "pf-api: --recover-on-cpu requires an HTP --device\n");
+        return 1;
+    }
+    g_degraded = recover_on_cpu;
     if (device_set && std::strcmp(device, "CPU") != 0) {
         setenv("PARAFORMER_DEVICE", device, 1);
     }
-    ggml_backend_load_all();
+    if (!g_vad_model.empty()) {
+        std::error_code ec;
+        const auto valid_seconds = [](float value) { return value > 0.0f && value <= 30.0f; };
+        if (!std::filesystem::is_regular_file(g_vad_model, ec) ||
+            !valid_seconds(g_vad_split_s) || !valid_seconds(g_vad_piece_s) ||
+            !valid_seconds(g_vad_min_silence) || !valid_seconds(g_vad_min_speech) ||
+            !(g_vad_threshold > 0.0f && g_vad_threshold <= 1.0f) ||
+            !(g_silence_rms >= 0.0f && g_silence_rms <= 1.0f)) {
+            std::fprintf(stderr, "pf-api: invalid VAD model or parameters\n");
+            return 3;
+        }
+        g_vad_enabled = true;
+    }
+    std::unique_ptr<HtpWatchdog> watchdog;
+    if (!recover_on_cpu) {
+        if (std::strncmp(device, "HTP", 3) == 0 && htp_watchdog_limit.count() > 0) {
+            watchdog = std::make_unique<HtpWatchdog>(htp_watchdog_limit);
+        }
+        HtpWatchdog::Guard guard(watchdog.get(), "backend discovery");
+        ggml_backend_load_all();
+    }
 
-    paraformer_weights* w = paraformer_weights_load(model, 1);
+    std::unique_ptr<paraformer_weights, decltype(&paraformer_weights_free)> w(paraformer_weights_load(model, 1),
+                                                                           &paraformer_weights_free);
     if (!w) {
         std::fprintf(stderr, "pf-api: cannot load %s\n", model);
         return 2;
@@ -1308,44 +1629,86 @@ int main(int argc, char** argv) {
             std::fclose(f);
         }
         if (warm.empty()) {
-            std::fprintf(stderr, "pf-api: cannot read warmup %s, using 1.2 s of silence\n", warmup);
+            std::fprintf(stderr, "pf-api: invalid warmup WAV %s: %s\n", warmup, err.c_str());
+            return 3;
         }
     }
     if (warm.empty()) {
         warm.assign((size_t) 16000 * 12 / 10, 0.0f);
     }
 
+    std::vector<std::unique_ptr<Engine>> engines;
     for (int i = 0; i < n_engines; ++i) {
         paraformer_context_params params = paraformer_context_default_params();
         params.n_threads = threads;
-        params.use_gpu = (i == 0) && device_set && std::strcmp(device, "CPU") != 0;
+        const bool wants_accelerator = i == 0 && device_set && std::strcmp(device, "CPU") != 0;
+        params.use_gpu = wants_accelerator && !recover_on_cpu;
         params.verbosity = 0;
-        auto* eng = new Engine();
-        eng->ctx = paraformer_init_shared(w, params);
+        if (params.use_gpu && std::strncmp(device, "HTP", 3) == 0) params.flash_attn = htp_flash_attn;
+        auto eng = std::make_unique<Engine>();
+        eng->requested = wants_accelerator ? device : "CPU";
+        const double t0 = now_ms();
+        {
+            HtpWatchdog::Guard guard(params.use_gpu ? watchdog.get() : nullptr, "engine warmup");
+            eng->ctx = paraformer_start_engine(w.get(), params, warm);
+        }
+        if (!eng->ctx && params.use_gpu && allow_cpu_fallback) {
+            std::fprintf(stderr, "pf-api: %s init or warmup failed, retrying on CPU\n", device);
+            params.use_gpu = false;
+            params.flash_attn = paraformer_context_default_params().flash_attn;
+            eng->ctx = paraformer_start_engine(w.get(), params, warm);
+            g_degraded = true;
+        }
         if (!eng->ctx) {
-            std::fprintf(stderr, "pf-api: engine %d init failed\n", i);
+            std::fprintf(stderr, "pf-api: engine %d (%s) init or warmup failed\n", i, eng->requested.c_str());
             return 3;
         }
-        eng->name = params.use_gpu ? device : "CPU";
-        const double t0 = now_ms();
-        paraformer_warmup(eng->ctx, warm.data(), (int) warm.size());
-        eng->worker = std::thread(worker_loop, eng);
-        g_engines.push_back(eng);
-        std::fprintf(stderr, "pf-api: engine %d (%s) ready in %.0f ms\n", i, eng->name.c_str(), now_ms() - t0);
+        if (!vad_init(*eng)) {
+            std::fprintf(stderr, "pf-api: cannot initialize server VAD for engine %d\n", i);
+            return 3;
+        }
+        eng->name = paraformer_backend_name(eng->ctx.get());
+        if (i == 0 && eng->name.rfind("HTP", 0) == 0) {
+            eng->watchdog = watchdog.get();
+            if (prefer_idle_htp) g_preferred_engine = eng.get();
+        }
+        eng->flash_attn = params.flash_attn;
+        eng->placement = paraformer_warmup_placement(eng->ctx.get());
+        const auto& p = eng->placement;
+        std::fprintf(stderr, "pf-api: engine %d requested=%s actual=%s flash_attn=%d encoder=%d/%d decoder=%d/%d ready in %.0f ms\n",
+                     i, eng->requested.c_str(), eng->name.c_str(), eng->flash_attn, p.encoder_device_ops, p.encoder_total_ops,
+                     p.decoder_device_ops, p.decoder_total_ops, now_ms() - t0);
+        g_engines.push_back(eng.get());
+        engines.push_back(std::move(eng));
     }
+    w.reset();
 
     httplib::Server srv;
-    srv.set_read_timeout(120, 0);
-    srv.set_write_timeout(120, 0);
-    srv.set_payload_max_length(64u * 1024u * 1024u);
+    srv.new_task_queue = [] { return new httplib::ThreadPool(12, 12, 8); };
+    srv.set_read_timeout(10, 0);
+    srv.set_write_timeout(5, 0);
+    srv.set_payload_max_length(2u * 1024u * 1024u);
 
-    spk_init();
-    vad_init();
+    if (!(g_speaker_threshold >= -1.0f && g_speaker_threshold <= 1.0f) ||
+        !(g_speaker_max_s >= 0.025f && g_speaker_max_s <= 30.0f) || !spk_init()) {
+        std::fprintf(stderr, "pf-api: invalid or unsupported speaker scoring configuration\n");
+        return 3;
+    }
 
-    srv.Get("/health", [](const httplib::Request&, httplib::Response& res) {
-        json j = {{"status", "ok"},
+    srv.Get("/health", [htp_watchdog_limit](const httplib::Request&, httplib::Response& res) {
+        json backends = json::array();
+        for (const auto* eng : g_engines) {
+            const auto& p = eng->placement;
+            backends.push_back({{"requested", eng->requested}, {"actual", eng->name},
+                                {"flash_attn", eng->flash_attn}, {"watchdog_ms", eng->watchdog ? htp_watchdog_limit.count() : 0},
+                                {"encoder_device_ops", p.encoder_device_ops}, {"encoder_total_ops", p.encoder_total_ops},
+                                {"decoder_device_ops", p.decoder_device_ops}, {"decoder_total_ops", p.decoder_total_ops}});
+        }
+        json j = {{"status", g_degraded ? "degraded" : "ok"},
                   {"engines", g_engines.size()},
-                  {"queue", g_queue.size()},
+                  {"backends", std::move(backends)},
+                  {"routing", g_preferred_engine ? "prefer_idle_htp" : "shared_queue"},
+                  {"queue", queue_depth()},
                   {"speaker_gate", g_speaker_enabled},
                   {"server_vad", g_vad_enabled},
                   {"partials", g_partials},
@@ -1365,13 +1728,28 @@ int main(int argc, char** argv) {
     });
 
     srv.Get("/metrics", [](const httplib::Request&, httplib::Response& res) {
+        size_t queued, queued_bytes;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            queued = g_queue.size();
+            queued_bytes = g_queue_bytes;
+        }
         json j = {{"requests", g_requests.load()},
                   {"rejected", g_rejected.load()},
                   {"failed", g_failed.load()},
+                  {"deadline_expired", g_deadline_expired.load()},
+                  {"cancelled_queued", g_cancelled_queued.load()},
+                  {"cpu_fallback", g_degraded},
                   {"partials", g_partials_run.load()},
                   {"partials_skipped", g_partials_skipped.load()},
                   {"speaker_deferred", g_speaker_deferred.load()},
-                  {"queue", g_queue.size()},
+                  {"speaker_started", g_speaker_started.load()},
+                  {"speaker_assessed", g_speaker_assessed.load()},
+                  {"queue", queued},
+                  {"queue_bytes", queued_bytes},
+                  {"queue_bytes_limit", g_queue_bytes_limit},
+                  {"inflight", g_inflight.load()},
+                  {"ws_sessions", g_ws_sessions.load()},
                   {"engines", g_engines.size()}};
         res.set_content(j.dump(), "application/json");
     });
@@ -1402,9 +1780,23 @@ int main(int argc, char** argv) {
 
     std::fprintf(stderr, "pf-api: model '%s', %zu engines, queue %zu, partials %s, listening on %s:%d\n",
                  g_model_id.c_str(), g_engines.size(), g_queue_limit, g_partials ? "on" : "off", bind_addr, port);
-    if (!srv.listen(bind_addr, port)) {
+    if (!srv.bind_to_port(bind_addr, port)) {
         std::fprintf(stderr, "pf-api: cannot listen on %s:%d\n", bind_addr, port);
         return 4;
     }
-    return 0;
+#ifdef XASR_SPEAKER
+    if (g_speaker_enabled) g_speaker_worker = std::make_unique<SpeakerWorker>();
+#endif
+    for (auto* eng : g_engines) eng->worker = std::thread(worker_loop, eng);
+    const bool ok = srv.listen_after_bind();
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_stop = true;
+    }
+    g_cv.notify_all();
+    for (auto* eng : g_engines) eng->worker.join();
+#ifdef XASR_SPEAKER
+    g_speaker_worker.reset();
+#endif
+    return ok ? 0 : 4;
 }
