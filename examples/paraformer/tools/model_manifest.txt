@@ -1,0 +1,18 @@
+# Model artifacts the Paraformer example is measured against.
+#
+# Format: <sha256>  <bytes>  <repo path>  <description>
+#
+# Every number in README.md and PRODUCTION.md is only comparable when it is
+# produced from these exact files. Verify with `tools/fetch_models.py --verify-only`
+# before trusting a result: a slightly different conversion silently moves the
+# logit gaps that hotwords_vehicle.txt was tuned against, and the profile then
+# looks broken for no visible reason.
+#
+# The Q8_0 pair is what the shipping configuration uses. The f32 file is the
+# source for `tools/requant.cpp`; the Q4_K file exists only to reproduce the
+# quantization A/B and is not a shipping profile.
+
+e73232ecf7e484907fd58f6a481fa27c1ceff454a1bc441d4a032a3a63e9783f  237454336  paraformer-zh-q8_0.gguf   8404-vocab zh checkpoint, Q8_0, 60000 h zh+en training. Ships.
+87c2845b1100a629bef15dfaafdbeb30be9ac5b3b5a07077e413979533d26638  239295840  paraformer-en-q8_0.gguf   10020-vocab en checkpoint, Q8_0, 50000 h English. Comparison arm only.
+a41d43bc2a34dbdd66e7e741baa466577f9137a16f93f454b35658b0db861c42  444785792  paraformer-en-f32.gguf    F32 source for requant; produces the Q8_0 above.
+c3dc70409857d7450895d8ae586f1bef23755a7635cc79cb1ff2ffb08720260e  128687104  paraformer-zh-q4_k.gguf   Q4_K of the zh checkpoint, A/B arm only. Slower on v73; do not ship.

@@ -1,4 +1,16 @@
-# Whole-word gains plus span rewrites (see design doc section 21).
+# DEPRECATED - do not use this file for evaluation.
+#
+# These rules were folded into `hotwords_vehicle.txt` in 2026-11-18, where
+# `1.5 two` is narrowed to `1.5 l>two`. The global form is what made this file
+# unsafe as a shipping profile: tuned on pure-English clips, it fires after `to`
+# in `set the 主驾 temperature to 二十一度`, inserting a token that the
+# downstream parser reads as `to | two | 21` = 11 degrees. Measured mixed
+# command field is 70% with this file against 80% with no profile at all.
+#
+# Kept only because PRODUCTION.md once cited it as a replay arm and the history
+# of that measurement is worth being able to reproduce.
+#
+# Original contents below, unchanged.
 3.2 set
 1.5 two
 3.8 se@@>at
