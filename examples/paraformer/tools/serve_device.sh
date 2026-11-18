@@ -3,13 +3,24 @@
 #
 #   examples/paraformer/tools/serve_device.sh [port]
 #
-# Pushes nothing; expects /data/local/tmp/llama.cpp to already hold bin/, lib/,
-# the model, web/ and the speaker and VAD models. Prints the console URL.
+# Pushes the console page, then starts the service. Binaries, libs and models
+# are expected to be in place already (that is the deployment step, not this
+# script) -- but web/ is pushed every time, because a stale page silently keeps
+# talking to an older event schema and looks like a server bug.
 set -eu
 
 PORT="${1:-8899}"
 DIR=/data/local/tmp/llama.cpp
 ADB="${ADB:-adb}"
+HERE=$(cd "$(dirname "$0")" && pwd)
+
+# The console ships with the binary, so push it rather than trusting whatever
+# copy happens to be on the device.
+if [ -d "$HERE/../web" ]; then
+    $ADB shell -T "mkdir -p $DIR/web"
+    $ADB push "$HERE/../web/." "$DIR/web/" </dev/null >/dev/null 2>&1 \
+        || { echo "failed to push the console from $HERE/../web" >&2; exit 1; }
+fi
 
 $ADB shell -T "p=\$(pidof llama-paraformer-api); [ -n \"\$p\" ] && kill \$p; sleep 2"
 # keep the SoC awake so the process is not reaped while testing

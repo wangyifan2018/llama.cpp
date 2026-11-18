@@ -198,6 +198,25 @@ def main():
     punct = json.loads(body).get("text", "") if st == 200 else ""
     check("punctuate", st == 200 and (punct.endswith("。") or punct.endswith(".")), punct[:40])
 
+    # The test console is part of the deliverable and had no check at all, which
+    # is how it shipped for a while serving a text hint instead of the page when
+    # started from the repo root. Fail loudly if / is not the real console.
+    st, hdr, body = http_json(base + "/")
+    page = body.decode("utf-8", "replace") if isinstance(body, bytes) else str(body)
+    is_page = st == 200 and "<!doctype html>" in page.lower() and "座舱" in page
+    check("test console served at /", is_page,
+          (hdr.get("Content-Type", "") if hdr else "") or page[:60])
+    if is_page:
+        # The page and the server have to agree on the event names, otherwise
+        # the console silently shows nothing. The page matches on the suffix
+        # (`t.endsWith('delta')`) rather than the full name, so check for the
+        # suffixes it actually keys on plus the metrics fields it reads.
+        check("console listens for delta/completed/metrics",
+              "endsWith('delta')" in page and "endsWith('completed')" in page
+              and "x.pf.metrics" in page)
+        check("console uses the metrics fields the server sends",
+              "queue_ms" in page and "infer_ms" in page and "vad_pieces" in page)
+
     if args.expect_gate:
         score = hdr.get("X-Speaker-Score")
         state = hdr.get("X-Speaker-Status")

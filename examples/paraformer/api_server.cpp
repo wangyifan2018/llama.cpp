@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
 #include <deque>
 #include <filesystem>
 #include <functional>
@@ -1768,7 +1769,13 @@ int main(int argc, char** argv) {
     // measurement used an explicit address, so no number here moves.
     const char* bind_addr = "127.0.0.1";
     const char* warmup = nullptr;
-    const char* web_dir = "web";
+    // The console is the first thing anyone opens after starting the service,
+    // so the default has to find it from wherever the binary is launched. A
+    // bare "web" only works from inside examples/paraformer, which means the
+    // documented `./build/bin/llama-paraformer-api model.gguf` from the repo
+    // root lands on the text hint instead of the page. Try the layouts that
+    // actually occur, in order, and keep the explicit flag authoritative.
+    const char* web_dir = nullptr;
     int port = 8080;
     int n_engines = 2;
     int threads = 2;
@@ -1967,12 +1974,23 @@ int main(int argc, char** argv) {
             bytes.resize((size_t) std::max(0L, n));
             if (std::fread(bytes.data(), 1, bytes.size(), f) == bytes.size()) {
                 parse_wav(std::string(bytes.data(), bytes.size()), warm, err);
+            } else {
+                err = "read failed";
             }
             std::fclose(f);
+        } else {
+            err = std::strerror(errno);
         }
         if (warm.empty()) {
-            std::fprintf(stderr, "pf-api: invalid warmup WAV %s: %s\n", warmup, err.c_str());
-            return 3;
+            // Warmup exists to hide the one-off first-packet cost, not to
+            // gate startup. Exiting here means a mistyped path -- or a device
+            // where the file was never pushed -- turns into "the service is
+            // down", which is a much worse failure than a slower first
+            // request. Fall back to silence and say so loudly.
+            std::fprintf(stderr,
+                         "pf-api: cannot use warmup WAV '%s' (%s); "
+                         "falling back to 1.2 s of silence\n",
+                         warmup, err.empty() ? "no usable audio" : err.c_str());
         }
     }
     if (warm.empty()) {
@@ -2115,6 +2133,41 @@ int main(int argc, char** argv) {
     srv.Post("/asr/segment", handle_segment);
 
     // Test console: static page at /, served from --web-dir when present.
+    static std::string auto_web_dir;
+    if (!web_dir) {
+        // Walk up from the working directory and from the executable's own
+        // directory, so the console is found whether the service is started
+        // from the repo root, from examples/paraformer, or from a build tree.
+        static const char* kCandidates[] = {
+            "web", "examples/paraformer/web", "../web", "../examples/paraformer/web",
+        };
+        std::vector<std::string> roots = {"."};
+        if (argc > 0) {
+            std::string exe = argv[0];
+            const auto slash = exe.find_last_of('/');
+            if (slash != std::string::npos) {
+                roots.push_back(exe.substr(0, slash));
+                // build/bin/llama-paraformer-api -> repo root is two levels up
+                // and then examples/paraformer/web; covered by the candidates
+                // below, so only the binary directory itself is added here.
+                roots.push_back(exe.substr(0, slash) + "/../..");
+            }
+        }
+        for (const std::string& root : roots) {
+            for (const char* cand : kCandidates) {
+                const std::string probe = root + "/" + cand + "/index.html";
+                if (std::FILE* f = std::fopen(probe.c_str(), "rb")) {
+                    std::fclose(f);
+                    auto_web_dir = root + "/" + cand;
+                    web_dir = auto_web_dir.c_str();
+                    std::fprintf(stderr, "pf-api: serving the test console from %s\n", web_dir);
+                    break;
+                }
+            }
+            if (web_dir) break;
+        }
+        if (!web_dir) web_dir = "web";
+    }
     if (!srv.set_mount_point("/", web_dir)) {
         std::fprintf(stderr, "pf-api: web dir '%s' not found, / serves a short hint\n", web_dir);
         srv.Get("/", [](const httplib::Request&, httplib::Response& res) {

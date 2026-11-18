@@ -47,13 +47,27 @@ PF_WAV="$PF_MODELS/tingting/hvac_zh01.wav"
 python3 examples/paraformer/tools/smoke_production.py --port 18785 --wav "$PF_WAV"
 ```
 
-The macOS ARM64 CPU run passed all 18 checks with VAD, speaker scoring, and previews disabled. A separate loopback TCP run rejected unaligned and non-finite audio, then returned a nonempty transcript for the same WAV.
+The smoke test now also fetches `/` and asserts it is the test console rather than the "no web dir" hint, and that the page still keys on the event names and metric fields the server actually sends. That check exists because the console shipped for a while serving a text hint when the service was started from the repo root, and nothing failed.
+
+The macOS ARM64 CPU run passed all 23 checks with VAD, speaker scoring, and previews disabled. A separate loopback TCP run rejected unaligned and non-finite audio, then returned a nonempty transcript for the same WAV.
+
+### Test console
+
+`examples/paraformer/web/index.html` is a single-file console served at `/` by the API binary: record from the microphone or replay a WAV, watch the partial deltas, then read the final transcript with endpoint-to-final, queue, and inference times. `tools/serve_device.sh` pushes the current page to the phone before starting the service, so the page and the binary cannot drift apart.
+
+The page is found automatically: the binary probes `web/`, `examples/paraformer/web/`, and the same two relative to its own directory, so starting it from the repo root or from `examples/paraformer` both work. `--web-dir` still overrides. Three defects were found by actually opening it rather than reading it:
+
+- **WAV replay resampled every 20 ms chunk instead of the whole buffer.** The interpolation restarted at each chunk boundary, so a 48 kHz file produced a discontinuity every 320 samples and lost about 2 samples per chunk — 203 samples (12.7 ms) on a 2 s clip, with a seam the model had to read through. Resampling once up front made a 48 kHz fixture score the same as the 16 kHz one.
+- **The level trace was pre-filled with 360 zeros.** A 2 s clip only yields ~100 levels, so the live waveform was pushed into the rightmost sliver of the canvas and looked clipped.
+- **The connection badge never left 等待结果**, because there is no idle event; it is now reset when a segment resolves. The speaker chip also printed the raw enum (`disabled`, `not_assessed`), which reads as a bug on a service that has the gate off on purpose.
+
+Reading it against the server also removed two dead paths: the metrics handler read `speaker_score`, which only ever arrives on the `completed` event, and the language badge was never assigned by anything.
 
 ### Android verification
 
 Cross-build both server binaries using [the Android build](README.md#openai-compatible-api) with the existing `build-android-xasr` release configuration and `XASR_SPEAKER=ON`. Run the API binary with the same options as the host replay, using device paths for the model and WAV. Add `--vad-model onnx/model/silero_vad.onnx`, include `onnx/bin` in `LD_LIBRARY_PATH`, and forward the loopback port with ADB. Pass `--expect-vad` to the smoke test.
 
-An isolated API instance on SM6650 passed 20/20 checks with one CPU engine, two threads, VAD enabled, and previews and speaker scoring disabled. This verifies the ARM64 implementation and runs separately from the installed HTP service. The baseline observations, host and Android raw output, build logs, and source, model and binary hashes are archived in `$PF_RUN/lifecycle.Ojlk2S`.
+An isolated API instance on SM6650 passed 20/20 checks with one CPU engine, two threads, VAD enabled, and previews and speaker scoring disabled. That run predates the three console checks; the console itself was re-verified on SM6650 separately, with the page served over the ADB-forwarded port, a 48 kHz WAV replayed through it, and the transcript matching the CLI. This verifies the ARM64 implementation and runs separately from the installed HTP service. The baseline observations, host and Android raw output, build logs, and source, model and binary hashes are archived in `$PF_RUN/lifecycle.Ojlk2S`.
 
 ## Backend readiness and inference status
 

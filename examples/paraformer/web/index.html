@@ -3,6 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Without this the browser requests /favicon.ico, the mount point has no such
+     file, and every page load leaves a 404 in the console that looks like a
+     broken asset. An inline empty icon keeps the log clean. -->
+<link rel="icon" href="data:,">
 <title>座舱 ASR 测试台</title>
 <style>
   :root{
@@ -105,7 +109,7 @@
       <span class="badge" id="bConn"><i></i>未连接</span>
       <span class="badge" id="bVad"><i></i>VAD ?</span>
       <span class="badge" id="bGate"><i></i>声纹 ?</span>
-      <span class="badge" id="bLang"><i></i>语言 -</span>
+      <span class="badge" id="bPartial"><i></i>预览 ?</span>
     </div>
   </header>
 
@@ -174,7 +178,12 @@
 
   let ws = null, media = null, actx = null, node = null, recording = false;
   let pending = [], sentSamples = 0, committedAt = 0, segments = 0, lastPartial = '';
-  const trace = new Array(360).fill(0);
+  // Rolling level history. Starts empty rather than pre-filled with zeros: a
+// 2 s clip only produces about 100 levels, so 360 pre-filled zeros pushed the
+// real waveform into the rightmost sliver of the canvas and made it look like
+// the audio had been clipped.
+  const trace = [];
+  const TRACE_MAX = 360;
   const history = [];
   let dpr = Math.min(devicePixelRatio || 1, 2);
 
@@ -207,13 +216,16 @@
     wctx.lineWidth = 1 * dpr;
     wctx.beginPath(); wctx.moveTo(0, h / 2); wctx.lineTo(w, h / 2); wctx.stroke();
     if (!trace.length) return;
+    // When the clip is shorter than the window, draw it across the full width
+    // instead of leaving the left side blank.
+    const n = trace.length;
     const g = wctx.createLinearGradient(0, 0, 0, h);
     g.addColorStop(0, recording ? 'rgba(251,113,133,.85)' : 'rgba(56,189,248,.7)');
     g.addColorStop(1, recording ? 'rgba(251,113,133,.10)' : 'rgba(56,189,248,.06)');
     wctx.beginPath();
     wctx.moveTo(0, h / 2);
-    for (let i = 0; i < trace.length; i++) {
-      const x = (i / (trace.length - 1)) * w;
+    for (let i = 0; i < n; i++) {
+      const x = (i / Math.max(1, n - 1)) * w;
       wctx.lineTo(x, h / 2 - trace[i] * (h / 2 - 6 * dpr));
     }
     wctx.lineTo(w, h / 2);
@@ -221,8 +233,8 @@
     wctx.fillStyle = g;
     wctx.fill();
     wctx.beginPath();
-    for (let i = 0; i < trace.length; i++) {
-      const x = (i / (trace.length - 1)) * w;
+    for (let i = 0; i < n; i++) {
+      const x = (i / Math.max(1, n - 1)) * w;
       const y = h / 2 - trace[i] * (h / 2 - 6 * dpr);
       i ? wctx.lineTo(x, y) : wctx.moveTo(x, y);
     }
@@ -258,9 +270,27 @@
     b.innerHTML = '<i></i>' + text;
   }
 
+  // There is no "idle" event, so the connection badge has to be put back
+  // explicitly once a segment resolves. Without this it stays on 等待结果
+  // forever after the first commit, which reads as "the server never answered"
+  // even though the transcript arrived.
+  function settleConn() {
+    if (recording) return;
+    if (ws && ws.readyState === 1) setBadge('bConn', 'on', '已连接');
+  }
+
+  // Map the server's speaker_status values onto Chinese. They are distinct
+  // outcomes -- `disabled` means the gate is off on purpose, `not_assessed`
+  // means it was on but skipped this clip -- and printing the raw enum in a
+  // Chinese UI looked like a bug in both cases.
+  const SPK_STATUS = {
+    disabled: '未启用', not_assessed: '未评分', in_progress: '评分中',
+    silence: '静音', busy: '忙碌', ok: '已评分', mismatch: '非司机'
+  };
+
   function pushLevel(v) {
     trace.push(Math.max(-1, Math.min(1, v)));
-    trace.shift();
+    while (trace.length > TRACE_MAX) trace.shift();
     $('level').style.width = Math.min(100, Math.abs(v) * 200).toFixed(0) + '%';
     ring.classList.toggle('hot', recording && Math.abs(v) > 0.02);
   }
@@ -280,6 +310,8 @@
       $('modelName').textContent = h.model || 'paraformer';
       setBadge('bVad', h.server_vad ? 'on' : '', 'VAD ' + (h.server_vad ? '开' : '关'));
       setBadge('bGate', h.speaker_gate ? 'on' : '', '声纹 ' + (h.speaker_gate ? '开' : '关'));
+      setBadge('bPartial', h.partials ? 'on' : '', '预览 ' + (h.partials ? '开' : '关'));
+      if (typeof h.queue === 'number') $('mQueue').innerHTML = h.queue + '<small>条</small>';
       log('health', JSON.stringify(h));
     } catch (e) { log('health', 'fail ' + e.message); }
   }
@@ -311,6 +343,7 @@
           $('mSegs').textContent = segments;
           if (ms) { history.push(ms); $('mE2E').innerHTML = ms + '<small>ms</small>'; updatePct(); }
           const spk = m.speaker_score;
+          const status = m.speaker_status;
           if (typeof spk === 'number') {
             const ok = !!m.speaker_ok;
             const el = $('chipSpk');
@@ -318,18 +351,26 @@
             el.textContent = (ok ? '司机' : '非司机') + ' ' + spk.toFixed(3);
           } else {
             $('chipSpk').className = 'chip spk-none';
-            $('chipSpk').textContent = '说话人 未评分';
+            // `disabled`, `not_assessed`, `in_progress`, `silence`, `busy` are
+            // different outcomes and the console used to collapse them into
+            // "未评分", which reads like a bug on a service that has the gate
+            // switched off on purpose.
+            $('chipSpk').textContent = '说话人 ' + (SPK_STATUS[status] || status || '未评分');
+          }
+          settleConn();
+          if (typeof m.vad_pieces === 'number') {
+            $('chipPieces').textContent = '分段 ' + m.vad_pieces;
           }
           log('completed', ms + ' ms · ' + (text || '(空)'));
         } else if (t === 'x.pf.metrics') {
+          // The server sends queue_ms, infer_ms, vad_ms and backend here. It
+          // does not send speaker_score -- that arrives on the completed event
+          // -- and this branch used to read it anyway, so the speaker chip was
+          // only ever updated by whichever event happened to land first.
           if (typeof m.queue_ms === 'number') $('mQueue').innerHTML = Math.round(m.queue_ms) + '<small>ms</small>';
           if (typeof m.infer_ms === 'number') $('mInfer').innerHTML = Math.round(m.infer_ms) + '<small>ms</small>';
-          if (typeof m.speaker_score === 'number') {
-            const ok = !!m.speaker_ok;
-            const el = $('chipSpk');
-            el.className = 'chip ' + (ok ? 'spk-ok' : 'spk-bad');
-            el.textContent = (ok ? '司机' : '非司机') + ' ' + m.speaker_score.toFixed(3);
-          }
+          if (typeof m.vad_ms === 'number' && m.vad_ms > 0) log('vad', Math.round(m.vad_ms) + ' ms');
+          if (m.backend) log('backend', m.backend);
         } else if (t === 'error') {
           log('error', JSON.stringify(m.error || m));
           toast('服务端错误：' + ((m.error && m.error.message) || 'unknown'), true);
@@ -353,6 +394,12 @@
   }
 
   function feed(samples, srcRate) {
+    // Resample only when the caller hands over a whole buffer. Per-chunk
+    // resampling restarts the interpolation at every 20 ms boundary, which
+    // puts a discontinuity into the audio the model is scoring; a WAV played
+    // back at 48 kHz then decodes worse than the same file sent at 16 kHz.
+    // playFile() resamples once up front, so srcRate is 16000 by the time it
+    // gets here.
     if (srcRate !== 16000) {
       const ratio = srcRate / 16000;
       const out = new Int16Array(Math.max(1, Math.floor(samples.length / ratio)));
@@ -424,6 +471,16 @@
     recording = false;
     pending = []; sentSamples = 0; lastPartial = ''; segments = 0; committedAt = 0;
     history.length = 0;
+    trace.length = 0;
+    btnRec.classList.remove('rec');
+    btnRec.innerHTML = '<span class="icon">●</span><small>开始</small>';
+    // Clear is reachable while a clip is playing back, so it has to undo the
+    // record-path state too, not only the counters.
+    $('btnStop').disabled = true;
+    $('btnFile').disabled = false;
+    if (node) { node.disconnect(); node = null; }
+    if (media) { media.getTracks().forEach(t => t.stop()); media = null; }
+    if (actx) { actx.close(); actx = null; }
     $('chipSent').textContent = '已发 0.00 s';
     $('final').textContent = '等待音频...'; $('final').classList.add('empty');
     $('partial').textContent = '';
@@ -431,38 +488,66 @@
     $('mE2E').textContent = '—'; $('mQueue').textContent = '—'; $('mInfer').textContent = '—';
     $('chipSpk').className = 'chip spk-none'; $('chipSpk').textContent = '说话人 -';
     $('chipPieces').textContent = '分段 -';
+    $('fileHint').textContent = '';
     updatePct();
-    if (ws && ws.readyState === 1) ws.send(JSON.stringify({type: 'input_audio_buffer.clear'}));
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({type: 'input_audio_buffer.clear'}));
+      setBadge('bConn', 'on', '已连接');
+    }
     log('clear', '');
   }
 
   async function playFile(file) {
+    if (recording) return;
     await connect();
     const buf = await file.arrayBuffer();
     const ctx = new AudioContext();
     const audio = await ctx.decodeAudioData(buf);
     const ch = audio.getChannelData(0);
-    const i16 = new Int16Array(ch.length);
-    for (let i = 0; i < ch.length; i++) i16[i] = Math.max(-1, Math.min(1, ch[i])) * 32767;
-    $('fileHint').textContent = file.name + ' · ' + (audio.length / audio.sampleRate).toFixed(2) + ' s';
+    // Resample once here rather than per 20 ms chunk inside feed().
+    let pcm;
+    if (audio.sampleRate === 16000) {
+      pcm = new Int16Array(ch.length);
+      for (let i = 0; i < ch.length; i++) pcm[i] = Math.max(-1, Math.min(1, ch[i])) * 32767;
+    } else {
+      const ratio = audio.sampleRate / 16000;
+      const n = Math.max(1, Math.floor(ch.length / ratio));
+      pcm = new Int16Array(n);
+      for (let i = 0; i < n; i++) {
+        const p = i * ratio, i0 = Math.floor(p), i1 = Math.min(i0 + 1, ch.length - 1);
+        const v = ch[i0] + (ch[i1] - ch[i0]) * (p - i0);
+        pcm[i] = Math.max(-1, Math.min(1, v)) * 32767;
+      }
+    }
+    await ctx.close();
+    $('fileHint').textContent = file.name + ' · ' + (pcm.length / 16000).toFixed(2) + ' s';
+    $('btnFile').disabled = true;
+    $('btnStop').disabled = false;
+    $('btnClear').disabled = false;
+    $('final').textContent = ''; $('final').classList.add('empty');
+    $('partial').textContent = ''; lastPartial = '';
     recording = true;
     btnRec.classList.add('rec');
+    btnRec.innerHTML = '<span class="icon">■</span><small>停止</small>';
     setBadge('bConn', 'rec', '回放中');
-    log('file', file.name);
+    log('file', file.name + ' ' + audio.sampleRate + ' Hz -> 16000');
     let i = 0;
     const tick = () => {
-      if (!recording) return;
-      if (i >= i16.length) {
+      if (!recording) { $('btnFile').disabled = false; return; }
+      if (i >= pcm.length) {
         recording = false;
         btnRec.classList.remove('rec');
+        btnRec.innerHTML = '<span class="icon">●</span><small>开始</small>';
+        $('btnStop').disabled = true; $('btnFile').disabled = false;
         if (pending.length) { feed(new Int16Array(pending), 16000); pending = []; }
         committedAt = performance.now();
         ws.send(JSON.stringify({type: 'input_audio_buffer.commit'}));
         setBadge('bConn', 'on', '等待结果');
+        log('commit', (sentSamples / 16000).toFixed(2) + ' s');
         return;
       }
-      const n = Math.min(i16.length - i, Math.floor(320 * (audio.sampleRate / 16000)));
-      feed(i16.slice(i, i + n), audio.sampleRate);
+      const n = Math.min(pcm.length - i, 320);
+      feed(pcm.slice(i, i + n), 16000);
       i += n;
       setTimeout(tick, 20);
     };
