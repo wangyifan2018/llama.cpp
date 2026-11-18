@@ -21,6 +21,7 @@
 // run concurrently; the second engine is always CPU.
 
 #include "paraformer.h"
+#include "core/device_select.h"
 #include "core/engine_start.h"
 #include "core/segment_limits.h"
 #include "ggml-backend.h"
@@ -308,12 +309,22 @@ int main(int argc, char** argv) {
     if (n_engines > 4)
         n_engines = 4; // one device engine plus up to three CPU engines
 
+    ggml_backend_load_all();
+
+    // Same default as the API server, and ordered before setenv for the same
+    // reason: a probe that runs after the environment is written prints one
+    // device and runs another.
+    if (!device_set) {
+        const bool htp = pf_htp_present();
+        device = pf_default_device();
+        pf_report_device(device, htp, false);
+    }
+    const bool device_accel = std::strcmp(device, "CPU") != 0;
+
     // The HTP backend is selected via a device env read by crispasr_init_gpu_backend.
-    if (device_set && std::strcmp(device, "CPU") != 0) {
+    if (device_accel) {
         setenv("PARAFORMER_DEVICE", device, 1);
     }
-
-    ggml_backend_load_all();
 
     std::vector<float> warm;
     if (warmup && !read_wav_bytes(warmup, warm)) {
@@ -344,14 +355,14 @@ int main(int argc, char** argv) {
     params.n_threads = threads;
     params.verbosity = 0;
 
-    // Engine 0: requested device (HTP when a device is given).
+    // Engine 0: the selected device (HTP when one is registered or requested).
     // Engine 1: CPU, from the same canonical weights.
     struct EngineSpec {
         bool use_gpu;
         const char* name;
     };
     std::vector<EngineSpec> specs;
-    specs.push_back({device_set && std::strcmp(device, "CPU") != 0, device});
+    specs.push_back({device_accel, device});
     for (int i = 1; i < n_engines; ++i)
         specs.push_back({false, "CPU"});
 

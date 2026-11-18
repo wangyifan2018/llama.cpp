@@ -1,0 +1,49 @@
+# Paraformer ASR service.
+#
+# Install as /vendor/etc/init/paraformer-asr.rc, the launcher as
+# /vendor/bin/paraformer-asr, and the config as
+# /vendor/etc/paraformer/paraformer-asr.conf.
+#
+# Why this shape:
+#
+#   - HTP needs the DSP user PD, and /dev/adsprpc-smd is system:system 0664. The
+#     service therefore runs as system with the system group rather than as a
+#     dedicated uid. A new uid would need explicit access to that node and to the
+#     vendor libraries, and getting it wrong shows up as a runtime EACCES on the
+#     DSP node, not as a startup failure. Use the group that already has access.
+#
+#   - Not a oneshot: init restarts the process when it exits. The server exits 75
+#     from its watchdog when one backend call overruns, 3 when an engine cannot
+#     initialise, 2 on a model load failure and 4 when the port cannot be bound.
+#     init treats them all the same way, and the launcher's backoff keeps a
+#     persistent failure from becoming a tight loop that recompiles DSP graphs
+#     forever.
+#
+#   - SIGTERM starts the server's drain: accepted requests finish before the
+#     listener closes. That is why the launcher execs the binary rather than
+#     running it as a child.
+
+service paraformer_asr /vendor/bin/paraformer-asr
+    class main
+    user system
+    group system readproc
+    priority -10
+    writepid /dev/cpuset/foreground/tasks
+    # Logcat gets the startup lines; the launcher also appends to a file,
+    # because a support engineer reads that after the car has been out all day.
+    stdout_log_level I
+    stderr_log_level I
+    # Restart forever. init has its own backoff for fast crashes; the launcher
+    # adds a longer ramp for repeated HTP init failures.
+    restarts 0
+    restart_period 0
+    # A boot-time thermal or DSP hiccup must not take the rest of the boot down
+    # with it: the car can be started in a cold garage.
+    shutdown critical
+
+# Restart on demand without needing root to run `stop`/`start`.
+on property:vendor.paraformer.restart=1
+    restart paraformer_asr
+
+on property:vendor.paraformer.stop=1
+    stop paraformer_asr

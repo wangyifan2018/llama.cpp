@@ -1,4 +1,5 @@
 #include "paraformer.h"
+#include "core/device_select.h"
 #include "core/segment_limits.h"
 
 #include "ggml-backend.h"
@@ -101,6 +102,21 @@ int main(int argc, char ** argv) {
     }
 
     ggml_backend_load_all();
+    // Same default as the API server: use HTP when one is registered, CPU when
+    // not, and never override an explicit --device. The CLI needs its own
+    // switch because the backend there is chosen from CRISPASR_PARAFORMER_GPU
+    // and PARAFORMER_DEVICE, not from a device argument.
+    if (!requested_device) {
+        const bool htp = pf_htp_present();
+        const char* picked = pf_default_device();
+        pf_report_device(picked, htp, false);
+        if (htp) {
+            setenv("PARAFORMER_DEVICE", picked, 1);
+            setenv("CRISPASR_PARAFORMER_GPU", "1", 1);
+            params.use_gpu = true;
+            requested_device = picked;
+        }
+    }
     const auto init_begin = pf_clock::now();
     std::unique_ptr<paraformer_context, decltype(&paraformer_free)> model(
         paraformer_init_from_file(argv[1], params), paraformer_free);
