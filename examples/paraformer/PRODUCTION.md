@@ -297,6 +297,8 @@ TTS bounds what this measures. There is no far field, no road noise, no micropho
 
 The fallback is unchanged: decoding-time bias cannot repair this. Hotwords and span rewrites act on tokens the model already produced, and 26-36% character error is the acoustic model choosing wrong characters, not a formatting problem. The paths are in-domain fine-tuning, or a speaker-adaptive front end.
 
+Measured rather than assumed: running the sweep with `PF_HOTWORDS=hotwords_vehicle_replace.txt`, the profile tuned on Tingting, moved every voice down by 1.0-2.3 points en WER and left zh CER bit-identical. Eddy 35.11 to 34.35, Sandy 48.85 to 46.56, Rocko 33.59 to 32.06, Shelley 41.98 to 39.69, Tingting unchanged at 13.74. The bias still helps off-domain, it simply cannot reach the error that matters, and it costs nothing when it does not apply. That means the existing profile does not have to be re-tuned per voice, but it also means it is not where the remaining failures live.
+
 Fixtures and scores are reproducible with:
 
 ```sh
