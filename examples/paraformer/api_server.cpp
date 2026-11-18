@@ -1309,7 +1309,7 @@ static json session_object(const WsSession& s) {
 // One terminal event for one segment: the client sees a committed item followed
 // by its transcript, exactly as it would after an explicit commit.
 static void ws_emit_segment(const std::shared_ptr<WsSession>& s, const std::string& item, const SegmentReply& reply,
-                            double duration) {
+                            double duration, bool flushed = false) {
     // Streaming sessions get the running transcript as a partial as well, so a
     // client can render one growing line while each closed segment stays a
     // terminal result of its own.
@@ -1338,7 +1338,11 @@ static void ws_emit_segment(const std::shared_ptr<WsSession>& s, const std::stri
     // Tail latency is what a driver feels: from the last syllable to the text on
     // screen. In streaming mode the detector waits g_vad_silence_ms before it can
     // know the utterance ended, so that wait belongs to the number.
-    const double tail = (s->stream_vad ? (double) g_vad_silence_ms : 0.0) + reply.queue_ms + reply.infer_ms;
+    // The endpoint wait only belongs to a segment the detector closed. A flushed
+    // segment was produced because the client committed, so the audio was already
+    // cut and nothing was waited for: its tail is queue plus inference.
+    const double silence_wait = (s->stream_vad && !flushed) ? (double) g_vad_silence_ms : 0.0;
+    const double tail = silence_wait + reply.queue_ms + reply.infer_ms;
     ws_queue_event(*s, "x.pf.metrics", {{"item_id", item}, {"queue_ms", reply.queue_ms},
                                        {"infer_ms", reply.infer_ms}, {"vad_ms", reply.vad_ms},
                                        {"tail_ms", tail}, {"backend", reply.backend}});
@@ -1347,7 +1351,7 @@ static void ws_emit_segment(const std::shared_ptr<WsSession>& s, const std::stri
 #ifdef XASR_SPEAKER
 // Feed one append into the session detector and transcribe every segment it
 // closed. Runs on the WebSocket thread; the detector is owned by the session.
-static void stream_vad_drain(const std::shared_ptr<WsSession>& s) {
+static void stream_vad_drain(const std::shared_ptr<WsSession>& s, bool from_flush = false) {
     auto* vad = (const SherpaOnnxVoiceActivityDetector*) s->vad;
     if (!s->stream_vad || !vad) {
         return;
@@ -1381,7 +1385,7 @@ static void stream_vad_drain(const std::shared_ptr<WsSession>& s) {
         const std::string item = "item_" + std::to_string(++s->stream_items);
         const double duration = (double) piece.size() / 16000.0;
         const auto deadline = pf_clock::now() + g_deadline;
-        const bool ok = submit(std::move(piece), 1, [s, item, duration, deadline](SegmentReply reply) {
+        const bool ok = submit(std::move(piece), 1, [s, item, duration, deadline, from_flush](SegmentReply reply) {
             std::lock_guard<std::mutex> lock(s->m);
             if (s->closed) {
                 return;
@@ -1393,7 +1397,7 @@ static void stream_vad_drain(const std::shared_ptr<WsSession>& s) {
                 ws_final_error(*s, item, reply);
                 return;
             }
-            ws_emit_segment(s, item, reply, duration);
+            ws_emit_segment(s, item, reply, duration, from_flush);
         }, false, [s] {
             std::lock_guard<std::mutex> lock(s->m);
             return s->closed;
@@ -1426,7 +1430,7 @@ static void stream_vad_finish(const std::shared_ptr<WsSession>& s) {
         return;
     }
     SherpaOnnxVoiceActivityDetectorFlush(vad);
-    stream_vad_drain(s);
+    stream_vad_drain(s, true);
 }
 #endif
 
