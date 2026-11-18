@@ -28,6 +28,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -195,6 +196,21 @@ static std::string g_model_id = "paraformer-zh";
 // by not imposing a header that existing clients do not send.
 static std::string g_api_key;
 static std::atomic<uint64_t> g_auth_rejected{0};
+
+// Shutdown. SIGTERM means "finish what you accepted and exit", which is what a
+// service manager expects: dropping in-flight requests turns a rolling restart
+// into a burst of client-visible failures on every deploy.
+static std::atomic<bool> g_draining{false};
+static std::chrono::milliseconds g_shutdown_grace{5000};
+
+// Requests accepted but not yet answered, across their whole life: queued,
+// being decoded, and being written back. `g_inflight` above counts only the
+// middle stage - it is incremented when a worker pops a task - so it reads zero
+// while a request is still sitting in the queue or already has its answer and
+// is being serialised. Draining on g_inflight would therefore declare success
+// with clients still waiting, which is exactly the failure this exists to
+// prevent.
+static std::atomic<int> g_accepted{0};
 static std::atomic<uint64_t> g_requests{0};
 static std::atomic<int> g_inflight{0}; // tasks a worker is currently running
 static std::atomic<uint64_t> g_rejected{0};
@@ -300,6 +316,32 @@ static bool authorized(const httplib::Request& req, httplib::Response& res) {
     reply_error(res, 401, "missing or invalid bearer token", "authentication_error", "", "invalid_api_key");
     g_auth_rejected.fetch_add(1);
     return false;
+}
+
+// ---- Shutdown ----
+
+// The handler only records the request: everything it could do here (close the
+// socket, wake the accept loop) is not async-signal-safe. The main thread does
+// the work once listen_after_bind() returns.
+//
+// Declared before the definition because -Wmissing-prototypes wants a visible
+// prototype, and it has to keep C linkage to be a valid sa_handler.
+extern "C" void pf_on_term(int);
+extern "C" void pf_on_term(int) {
+    g_draining.store(true);
+}
+
+static void install_shutdown_handlers() {
+    struct sigaction sa;
+    std::memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = pf_on_term;
+    sigemptyset(&sa.sa_mask);
+    // No SA_RESTART: the accept loop must return so main() can begin draining.
+    sa.sa_flags = 0;
+    sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGINT, &sa, nullptr);
+    // A client that vanishes mid-write must not kill the process.
+    std::signal(SIGPIPE, SIG_IGN);
 }
 
 // ---- WAV ----
@@ -1411,7 +1453,17 @@ static void set_speaker_headers(httplib::Response& res, const SpeakerResult& spe
     }
 }
 
+// RAII so that an added early return cannot forget to decrement. A counter
+// that leaks upward would make every future shutdown wait the full grace.
+struct AcceptedGuard {
+    AcceptedGuard() { g_accepted.fetch_add(1); }
+    ~AcceptedGuard() { g_accepted.fetch_sub(1); }
+    AcceptedGuard(const AcceptedGuard&) = delete;
+    AcceptedGuard& operator=(const AcceptedGuard&) = delete;
+};
+
 static void handle_transcription(const httplib::Request& req, httplib::Response& res) {
+    AcceptedGuard accepted;
     if (!req.form.has_file("file")) {
         reply_error(res, 400, "missing form field 'file'", "invalid_request_error", "file");
         return;
@@ -1487,6 +1539,7 @@ static void handle_transcription(const httplib::Request& req, httplib::Response&
 }
 
 static void handle_segment(const httplib::Request& req, httplib::Response& res) {
+    AcceptedGuard accepted;
     if (req.body.size() % sizeof(float) != 0 || req.body.empty()) {
         reply_error(res, 400, "body must be non-empty float32 PCM", "invalid_request_error", "body");
         return;
@@ -1535,7 +1588,7 @@ int main(int argc, char** argv) {
                      "[--seg-gap-ms N] [--punct-gap-ms N] "
                      "[--web-dir DIR] [--speaker-model FILE] [--enroll-dir DIR] [--speaker-threshold F] [--speaker-max-s S] "
                      "[--vad-model FILE] [--vad-split-s S] [--vad-threshold F] [--vad-min-silence S] "
-                     "[--vad-min-speech S] [--api-key TOKEN | PF_API_KEY]\n",
+                     "[--vad-min-speech S] [--api-key TOKEN | PF_API_KEY] [--shutdown-grace-ms N]\n",
                      argv[0]);
         return 1;
     }
@@ -1572,6 +1625,8 @@ int main(int argc, char** argv) {
             bind_addr = argv[++i];
         } else if (std::strcmp(argv[i], "--api-key") == 0 && i + 1 < argc) {
             g_api_key = argv[++i];
+        } else if (std::strcmp(argv[i], "--shutdown-grace-ms") == 0 && i + 1 < argc) {
+            g_shutdown_grace = std::chrono::milliseconds(std::max(0, std::atoi(argv[++i])));
         } else if (std::strcmp(argv[i], "--queue") == 0 && i + 1 < argc) {
             g_queue_limit = (size_t) std::max(1, std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--queue-mib") == 0 && i + 1 < argc) {
@@ -1678,6 +1733,8 @@ int main(int argc, char** argv) {
     if (g_api_key.empty()) {
         if (const char* env = std::getenv("PF_API_KEY")) g_api_key = env;
     }
+
+    install_shutdown_handlers();
     g_degraded = recover_on_cpu;
     if (device_set && std::strcmp(device, "CPU") != 0) {
         setenv("PARAFORMER_DEVICE", device, 1);
@@ -1854,6 +1911,7 @@ int main(int argc, char** argv) {
                   {"queue_bytes", queued_bytes},
                   {"queue_bytes_limit", g_queue_bytes_limit},
                   {"inflight", g_inflight.load()},
+                  {"accepted", g_accepted.load()},
                   {"ws_sessions", g_ws_sessions.load()},
                   {"engines", g_engines.size()}};
         res.set_content(j.dump(), "application/json");
@@ -1922,7 +1980,57 @@ int main(int argc, char** argv) {
     if (g_speaker_enabled) g_speaker_worker = std::make_unique<SpeakerWorker>();
 #endif
     for (auto* eng : g_engines) eng->worker = std::thread(worker_loop, eng);
+
+    // A signal can arrive at any time, including while the accept loop is
+    // blocked in poll(). This thread only observes the flag; it does NOT stop
+    // the server yet. Calling srv.stop() here would close every active
+    // connection, which tears down the very handlers the drain is waiting for:
+    // measured, the guard dropped to zero before the drain loop started and
+    // only the already-buffered response reached the client. So the sequence is
+    // drain first, stop second, and both live on this thread so the accept loop
+    // keeps running until nothing is left to finish.
+    std::thread drain_watch([&srv] {
+        while (!g_draining.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        std::fprintf(stderr, "pf-api: shutdown requested; draining before closing the listener\n");
+
+        // Wait for requests that have been accepted to be answered. New
+        // requests can still arrive during this window - that is deliberate:
+        // the alternative is refusing connections while the operator watches a
+        // rolling restart, and the grace bound keeps it from lasting forever.
+        const auto drain_start = pf_clock::now();
+        const int initial = g_accepted.load();
+        std::fprintf(stderr, "pf-api: drain start, accepted=%d inflight=%d, grace %lld ms\n", initial,
+                     g_inflight.load(), (long long) g_shutdown_grace.count());
+        while (g_accepted.load() > 0 && pf_clock::now() - drain_start < g_shutdown_grace) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        const int left = g_accepted.load();
+        if (left > 0) {
+            // Deliberately not "their clients will see a reset": stopping the
+            // listener does not itself tear down an in-flight handler, so a
+            // request that finishes microseconds later still gets a full 200.
+            // Measured with grace=120ms and three queued requests: the warning
+            // fired and all three clients still received complete bodies, only
+            // after the listener had closed. Say what is true - the grace ran
+            // out, the outcome is no longer guaranteed - instead of predicting
+            // a failure that may not happen and sending a postmortem the wrong
+            // way.
+            std::fprintf(stderr,
+                         "pf-api: grace expired with %d request(s) still accepted; closing the listener, "
+                         "their responses are no longer guaranteed\n",
+                         left);
+        }
+        std::fprintf(stderr, "pf-api: closing the listener\n");
+        srv.stop();
+    });
+
     const bool ok = srv.listen_after_bind();
+
+    g_draining.store(true);
+    drain_watch.join();
+
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_stop = true;
@@ -1932,5 +2040,8 @@ int main(int argc, char** argv) {
 #ifdef XASR_SPEAKER
     g_speaker_worker.reset();
 #endif
+    if (g_accepted.load() == 0 && g_inflight.load() == 0) {
+        std::fprintf(stderr, "pf-api: shut down cleanly\n");
+    }
     return ok ? 0 : 4;
 }

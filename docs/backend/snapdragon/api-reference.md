@@ -53,6 +53,31 @@
 放行（正确 token、小写 `bearer`）、探针开放和 WS 升级两条路径；`--no-auth` 是
 针对未设 token 服务的镜像检查。
 
+### 优雅退出
+
+`SIGTERM` / `SIGINT` 的语义是"把已接受的请求答完再退"，这是滚动重启时服务管理器
+期待的行为；直接断连会把每次发布变成一批客户端可见的失败。`--shutdown-grace-ms`
+（默认 5000）是等待上限，到期后照样关监听并在日志里说明，不会假装排空成功。
+
+```
+pf-api: shutdown requested; draining before closing the listener
+pf-api: drain start, accepted=3 inflight=1, grace 5000 ms
+pf-api: closing the listener
+pf-api: shut down cleanly
+```
+
+三个细节都是实测踩出来的，不是设计时想到的：
+
+- **排空等的是 `accepted` 而不是 `inflight`**。`inflight` 只在 worker 弹出任务时
+  自增，请求还在队列里、或者已有答案正在序列化时它读 0。按它排空会在客户端仍在
+  等待时宣布成功——正是这个功能要防的失效。
+- **`srv.stop()` 必须放在排空之后**。它先撕掉活跃连接，于是排空等待的 handler
+  提前结束：计数归零、日志写 "clean"、客户端只收到已缓冲的字节。曾把这个顺序写反，
+  现象是 `accepted=0` 却仍有 1.66 s 的在途请求返回完整 200。
+- **宽限期到期后仍在跑的请求通常还是能拿到完整响应**，因为关监听不会杀掉正在执行
+  的 handler。所以超时文案只写"结果不再保证"，不去预言 reset——预言错了会把事后
+  排查引向错误方向。
+
 显式指定的加速后端不可用时，服务默认启动失败。`--allow-cpu-fallback` 允许启动时改用 CPU，此时 `/health` 返回 HTTP 200 和 `status: degraded`，`/metrics` 返回 `cpu_fallback: true`。正常启动的状态为 `ok`。
 
 ## 3. POST /v1/audio/transcriptions

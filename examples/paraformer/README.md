@@ -297,6 +297,37 @@ python3 tools/check_auth.py --port 8080 --wav clip.wav --key "$PF_API_KEY"
 python3 tools/check_auth.py --port 8080 --wav clip.wav --no-auth   # open server
 ```
 
+### Shutdown
+
+`SIGTERM` and `SIGINT` mean "finish what you already accepted, then exit", which
+is what a service manager expects from a rolling restart. On the signal the
+server stops accepting new work only after the accepted requests are answered:
+
+```
+pf-api: shutdown requested; draining before closing the listener
+pf-api: drain start, accepted=3 inflight=1, grace 5000 ms
+pf-api: closing the listener
+pf-api: shut down cleanly
+```
+
+`--shutdown-grace-ms` bounds the wait (5000 ms default); when it runs out the
+listener closes anyway and the log says so instead of pretending the drain
+succeeded. Three details are load-bearing and each was measured:
+
+- The counter being drained is `accepted`, not `inflight`. `inflight` counts
+  only tasks a worker has popped, so it reads zero for a request that is still
+  queued or already has its answer and is being written back. Draining on it
+  declares success with clients still waiting — the exact failure this exists
+  to prevent.
+- The listener is stopped *after* the drain, not before. `srv.stop()` tears down
+  active connections, so calling it first ends the handlers the drain is waiting
+  for: the guard drops to zero, the log says "clean", and only the already
+  buffered bytes reach the client.
+- A request that finishes just after the grace expires still gets a complete
+  response, because closing the listener does not kill a running handler. That
+  is why the timeout message says the outcome is "no longer guaranteed" rather
+  than predicting a reset.
+
 ### Binding
 
 The default `--bind` is `127.0.0.1`. A service that accepts unauthenticated
