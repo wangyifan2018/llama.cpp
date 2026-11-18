@@ -299,35 +299,118 @@ PY
 # ---------------------------------------------------------------- device
 # 真机那一档不是重新定门槛，是验证「主机上的数就是设备上的数」。
 # 判据是转写逐字节相同，不是延迟接近：延迟受热与调度影响，转写不受。
+# 三臂都要跑（host / device-CPU / device-HTP）：只有 host 与 HTP 一对一错
+# 时分不清是 HTP 传输层坏了还是参数解析吞了请求，那条坑踩过。
 do_device() {
     info "== device cross-check"
     command -v "$ADB" >/dev/null 2>&1 || die "no adb at $ADB (set ADB=...)"
-    [ -x "$BIN" ] || die "no host binary to compare against"
+    [ -x "$BIN" ] || die "no host binary to compare against (run: ./reproduce.sh build)"
+    [ -f "$ZH_MODEL" ] || die "no weights at $ZH_MODEL (run: ./reproduce.sh models)"
+    [ -f "$PF_MODELS/tingting/manifest.tsv" ] || die "no fixtures (run: ./reproduce.sh fixtures)"
 
     local serial
     serial=$("$ADB" devices | awk 'NR > 1 && $2 == "device" {print $1; exit}')
     [ -n "$serial" ] || die "no adb device; check the cable and 'adb devices'"
 
-    local vdir=/data/local/tmp/pf-reproduce
-    info "  device $serial -> $vdir"
-    "$ADB" -s "$serial" shell "rm -rf $vdir && mkdir -p $vdir" </dev/null
+    # 设备侧目录：二进制与权重通常已经在设备上（部署步骤不属于本脚本），
+    # 但夹具是当前的，必须现推——推旧夹具比对的是两段不同的音频，会得出
+    # 「HTP 与主机不一致」的假结论。
+    local vbin=${DEVICE_BIN:-/data/local/tmp/llama.cpp}
+    local vmodel=${DEVICE_MODEL:-/data/local/tmp/llama-paraformer/paraformer-zh-q8_0.gguf}
+    local vdir=/data/local/tmp/pf-xcheck
 
-    # CPU 与 HTP 各跑一遍，先各一条做冒烟，再把 32 条整批跑。
-    # 这个顺序就是那个踩过的坑：判「设备坏了」之前先交叉跑三个 device 形式。
+    "$ADB" -s "$serial" shell "test -x $vbin/bin/llama-paraformer" </dev/null 2>/dev/null \
+        || die "no llama-paraformer at $vbin/bin on the device.
+       Build the Android target and push it, or set DEVICE_BIN=<dir>."
+    "$ADB" -s "$serial" shell "test -f $vmodel" </dev/null 2>/dev/null \
+        || die "no model at $vmodel on the device. Push it, or set DEVICE_MODEL=<path>."
+
+    info "  device $serial"
+    "$ADB" -s "$serial" shell "rm -rf $vdir && mkdir -p $vdir/wav" </dev/null
+    # 推送本身不输出：每行一个文件的进度会把真正的结果埋掉。
+    info "  push current fixtures (32 clips + profile)"
+    "$ADB" -s "$serial" push "$PF_MODELS"/tingting/*.wav "$vdir/wav/" </dev/null >/dev/null 2>&1
+    "$ADB" -s "$serial" push "$HOTWORDS" "$vdir/hotwords.txt" </dev/null >/dev/null 2>&1
+    "$ADB" -s "$serial" shell "ls $vdir/wav/*.wav | wc -l" </dev/null | tr -d '\r' \
+        | grep -qx 32 || die "expected 32 clips on the device, got a different count"
+
+    mkdir -p "$PF_RUN"
+    local host_tsv=$PF_RUN/xc-host.tsv
+    local cpu_tsv=$PF_RUN/xc-device-cpu.tsv
+    local htp_tsv=$PF_RUN/xc-device-htp.tsv
+
+    info "  [host]      transcribe 32 clips"
+    "$BIN" "$ZH_MODEL" "$PF_MODELS"/tingting/*.wav --quiet --threads "$THREADS" \
+        --hotwords "$HOTWORDS" >"$host_tsv" 2>/dev/null
+
+    # CPU 在前：它是已知能跑的那一臂。若 CPU 也不一致，问题在构建或权重，
+    # 不在 HTP，这时不该去看 HTP 日志。
+    local dev
     for dev in CPU "$DEVICE"; do
         info "  [$dev] transcribe 32 clips on device"
+        # shell 里的 glob 由设备侧展开，不用引号——本地展开会传 32 个绝对路径。
+        "$ADB" -s "$serial" shell \
+            "cd $vbin && LD_LIBRARY_PATH=bin ./bin/llama-paraformer $vmodel $vdir/wav/*.wav \
+             --device $dev --threads $THREADS --quiet --hotwords $vdir/hotwords.txt" \
+            </dev/null >"$( [ "$dev" = CPU ] && echo "$cpu_tsv" || echo "$htp_tsv" )" 2>/dev/null
     done
+
+    local tsv
+    for tsv in "$host_tsv" "$cpu_tsv" "$htp_tsv"; do
+        [ -s "$tsv" ] || die "empty transcript file: $tsv"
+    done
+
+    # 只比转写字段。路径不同（本地 vs /data/local/tmp）、wall_ms 必然不同，
+    # 拿整行 diff 只会得到一堆噪音，然后没人再看这个检查。
+    "$PYTHON" - "$host_tsv" "$cpu_tsv" "$htp_tsv" "$PF_RUN" <<'PY'
+import os, sys
+
+def load(path):
+    rows = {}
+    for line in open(path, encoding="utf-8", errors="replace"):
+        f = line.rstrip("\n").split("\t")
+        if len(f) < 2:
+            continue
+        rows[os.path.basename(f[0])] = f[-1]
+    return rows
+
+host, cpu, htp = (load(p) for p in sys.argv[1:4])
+run = sys.argv[4]
+
+print("  clips: host=%d device-cpu=%d device-htp=%d" % (len(host), len(cpu), len(htp)))
+bad = 0
+for label, arm in (("device-CPU", cpu), ("device-HTP0", htp)):
+    diff = [k for k in sorted(host) if host[k] != arm.get(k)]
+    if not diff:
+        print("  %-12s %d/%d transcripts identical to host" % (label, len(host), len(host)))
+        continue
+    bad = 1
+    print("  %-12s %d/%d DIFFER" % (label, len(diff), len(host)))
+    for k in diff[:8]:
+        print("      %-14s host=%s" % (k, host[k]))
+        print("      %-14s %-5s=%s" % ("", label[-4:], arm.get(k)))
+
+# CPU 不一致说明构建或权重不同源，先修这个再看 HTP —— 顺序就是那条踩过的坑。
+if any(host[k] != cpu.get(k) for k in host):
+    print("\n  Device CPU already disagrees with the host. That is a build or weight")
+    print("  mismatch, not an HTP problem: check that both binaries come from the")
+    print("  same commit and that the pushed GGUF matches tools/model_manifest.txt.")
+
+with open(os.path.join(run, "xcheck.tsv"), "w", encoding="utf-8") as fh:
+    fh.write("clip\thost\thost_cpu\thost_htp\n")
+    for k in sorted(host):
+        fh.write("%s\t%s\t%s\t%s\n" % (k, host[k], cpu.get(k, ""), htp.get(k, "")))
+
+sys.exit(1 if bad else 0)
+PY
+
+    local rc=$?
     info ""
-    info "  The Android binary is not built by this script (it needs the docker"
-    info "  arm64 toolchain and the device push step). Build it with the Snapdragon"
-    info "  driver, then run:"
-    info ""
-    info "      $BIN  ->  on device:  llama-paraformer MODEL.gguf *.wav --device $DEVICE"
-    info "      $BIN  ->  on device:  llama-paraformer MODEL.gguf *.wav --device CPU"
-    info "      diff <(cut -f1,3 host.tsv) <(cut -f1,3 device.tsv)   # expect empty"
-    info ""
-    info "  Host-side numbers are the gate; the device run must match them byte for"
-    info "  byte on the transcript field. See PRODUCTION.md for the recorded run."
+    if [ "$rc" = 0 ]; then
+        info "== device matches the host on all 32 transcripts (run dir: $PF_RUN)"
+    else
+        die "device transcripts differ from the host; see $PF_RUN/xcheck.tsv"
+    fi
 }
 
 # ---------------------------------------------------------------- main
