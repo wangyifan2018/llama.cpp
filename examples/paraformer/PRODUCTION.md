@@ -383,6 +383,20 @@ The profile above was tuned on 32 clips of windows, temperature, seat heat and a
 
 `wrong=0` in both arms: no clip in the expanded set reversed an on/off direction with the profile on. The 32-clip and mixed arms are unchanged at 71.9% / 100.0% / 0.60% / 6.87%, so this block is additive.
 
+Per domain, which is the view that shows where the remaining gap is:
+
+| Domain | clips | base | shipped | wrong direction |
+|---|---:|---:|---:|---:|
+| Lights (fog/headlight/hazard/trunk/dome/footwell/ambient) | 16 | 69% | **100%** | 0 |
+| Seats (position/backrest/massage/heater/ventilation) | 12 | 75% | **100%** | 0 |
+| Windows and roof (incl. sunroof, sunshade) | 8 | 75% | **100%** | 0 |
+| Media (play/pause/track/volume/radio/playlist) | 12 | 92% | **100%** | 0 |
+| HVAC modes (defrost, defog, airflow, auto, purifier) | 16 | 69% | **94%** | 0 |
+| Ordering (`Luckin latte`, `Americano`) | 8 | 88% | 88% | 0 |
+| Navigation (landmarks, place names) | 12 | 50% | **58%** | 0 |
+
+Navigation is the open one. It is not a control-syntax problem — `navigate` itself is fixed — it is that six of the twelve clips name a place the model has never heard, and proper nouns are exactly what a logit profile cannot supply. Ordering sits flat for the same reason. Every domain whose commands are made of common words is at 100%.
+
 Every English gain is a span rewrite and the reason is the same one §15 found: the wrong sequence has a different length from the right one, so no gain can reach it. Two things about *shape* decide whether such a rule fires at all, and both were wrong on the first attempt:
 
 - **The last piece must not carry `@@`.** A piece without `@@` ends a word, so `R 99.0 re@@+r => re@@+ar@@` renders `rearfot lights`. The same rule on the *wrong* side matters as much: a span written `t+al` does not match a model that emitted `t@@ al`, so the rule silently never fires while `PF_REPLACE_LOG` reports a deficit of 8.89 — which reads like a model limitation and is not. Correcting the span moved `footwell` from 8.89 to **1.41**.
