@@ -1,0 +1,32 @@
+win_zh01.wav	zh	把左前车窗打开一半
+win_zh02.wav	zh	关闭右后车窗
+win_zh03.wav	zh	别开左后车窗，只开右后车窗
+win_zh04.wav	zh	把副驾驶车窗降到三分之一
+hvac_zh01.wav	zh	把主驾空调调到二十一度
+hvac_zh02.wav	zh	把副驾空调调到二十二度
+hvac_zh03.wav	zh	打开内循环，风量调到三档
+hvac_zh04.wav	zh	空调别关，把后排出风关掉
+seat_zh01.wav	zh	打开副驾驶座椅加热二档
+seat_zh02.wav	zh	关闭主驾座椅加热
+seat_zh03.wav	zh	把左后座椅通风调到一档
+seat_zh04.wav	zh	关掉按摩，座椅通风保持开启
+light_zh01.wav	zh	把氛围灯调成暖白色
+light_zh02.wav	zh	打开后排右侧阅读灯
+light_zh03.wav	zh	别关氛围灯，把顶灯关掉
+light_zh04.wav	zh	把脚窝灯亮度调到百分之四十
+win_en01.wav	en	Open the front left window halfway
+win_en02.wav	en	Close the rear right window
+win_en03.wav	en	Do not open the rear left window, only the rear right window
+win_en04.wav	en	Lower the passenger window by one third
+hvac_en01.wav	en	Set the driver temperature to twenty one degrees
+hvac_en02.wav	en	Set the passenger temperature to twenty two degrees
+hvac_en03.wav	en	Turn on recirculation and set the fan to level three
+hvac_en04.wav	en	Leave the air conditioning on and turn off the rear vents
+seat_en01.wav	en	Set the passenger seat heater to level two
+seat_en02.wav	en	Turn off the driver seat heater
+seat_en03.wav	en	Set the rear left seat ventilation to level one
+seat_en04.wav	en	Turn off the massage and leave seat ventilation on
+light_en01.wav	en	Set the ambient lights to warm white
+light_en02.wav	en	Turn on the rear right reading light
+light_en03.wav	en	Leave the ambient lights on and turn off the dome light
+light_en04.wav	en	Set the footwell lights to forty percent
