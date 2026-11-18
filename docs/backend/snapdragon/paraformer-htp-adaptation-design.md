@@ -1115,3 +1115,40 @@ zh CER 0.60%（不变）、en WER 6.87%（不变）；延迟无变化（每个�
 `massage`→`massaician`、`vents`→`reevent`、`lights`→`likes`、`footwell`→`footwall`。
 全部是**词表缺形**或**多 token 粘连**，`R` 规则的 margin 也接不住（deficit 超一大截）。
 这些只能靠重训、或上真正的语义后处理层。
+
+## 31. 混说热词的 SM6650 真机复核（2026-11-18）
+
+**设备是在的，上一轮"HTP 全挂"的归因是错的。** 本轮设备 load average 13.3、uptime 4 天 5 小时，
+与上一轮记录的 13.4 / 4 天完全相同，但 HTP 一次就通。区别是**上一轮的 `--device HTP0:0`
+被 `main.cpp:108` 的严格字符串比较挡住**（`requested_device` 是 `HTP0:0`，`paraformer_backend_name`
+返回 `HTP0`，`strcmp` 不等 → 打印 `requested HTP0:0, initialized HTP0` 后 `return 2`）。
+这个失败**长得像 HTP 报错**：session 已经建好、`ggml-hex` 日志齐全、进程以 rc=2 静默退出，
+只有把 stdout/stderr 分开重定向才看得出 rc 是应用层返回而不是传输层失败。
+上一轮把它记成 `remote_handle64_invoke method 3` / `0x27` 的设备故障，**实际是命令行契约问题**。
+教训：**判定"HTP 坏了"之前，先用 `--device HTP0` 和 CPU 路径各跑一条**——CPU 通、HTP0 通、
+HTP0:0 不通，就一定是参数解析，不是设备。
+
+**真机四指标与主机逐位一致**（混说 15 句 + 纯夹具 32 条，`--device HTP0`）：
+
+| 指标 | 无热词 | 本轮 profile | 主机同口径 |
+|---|---:|---:|---:|
+| 混说 command | 80.0% | **100.0%** | 80.0% → 100.0% |
+| 32 条 cabin command | 56.2% | **65.6%** | 56.2% → 65.6% |
+| 32 条 device | 69.0% | 73.8% | 同 |
+| 32 条 state | 64.3% | 71.4% | 同 |
+| 32 条 value | 77.8% | 88.9% | 同 |
+| 中文 CER | 0.60% | 0.60% | 不变 |
+| 英文 WER | 12.21% | 8.40% | 同 |
+
+**逐条比转写**：混说 15 句里 13 句两臂逐字节相同，只有 `mx_zh05`（`we are right`→`rear right`）
+和 `mx_zh08`（`footal`→`footwell`）变化，正是设计要打的两个点，其余零副作用。
+真机转写与主机转写逐条一致，包括这两处修复——说明 span rewrite 的 margin 2.6 在 HTP 上与
+host CPU 上判定相同（`deficit 2.39` 不变，因为 logits 走的是同一套量化权重）。
+
+**延迟**（`--device HTP0`，单条独立进程、含 init）：wall p50/p95/p99 = 1093/1166/1207 ms。
+这个数**不能当稳态延迟看**：它是每进程冷启动，`init` 289 ms 加首包 sched alloc 都在里面。
+稳态 p50/p95 290/380 ms 是 §9 的服务化口径（`--warmup` 预热 + 常驻进程），两者不可混用。
+
+**结论**：精度这一项达标，混说 command 100%、中文 CER 0.60%、听写英文 8.40%。
+热词 profile 在设备上生效且零副作用，可以随二进制一起发。剩余英文错误（6 条）是词表缺形
+与多 token 粘连，属于重训或语义后处理层的活，不再是偏置能接的范围。

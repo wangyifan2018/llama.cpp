@@ -105,9 +105,22 @@ int main(int argc, char ** argv) {
     if (!model) {
         return 2;
     }
-    if (requested_device && std::strcmp(requested_device, paraformer_backend_name(model.get())) != 0) {
-        fprintf(stderr, "paraformer: requested %s, initialized %s\n", requested_device, paraformer_backend_name(model.get()));
-        return 2;
+    // The device request is checked against what actually initialised, so a
+    // typo fails loudly instead of silently running on CPU. Compare device
+    // names, not the raw request: crispasr_init_gpu_backend() resolves the
+    // virtual-session form `HTP0:0` to the registered device `HTP0` and picks
+    // the session through GGML_HEXAGON_DEVICES, so an exact strcmp rejects a
+    // request it just honoured. That failure looks like a transport error --
+    // the session is up and all the ggml-hex logging is normal -- and it was
+    // recorded as an HTP outage once already; see design doc §31.
+    if (requested_device) {
+        const char* actual = paraformer_backend_name(model.get());
+        const size_t prefix = std::strcspn(requested_device, ":");
+        const bool same_device = std::strncmp(requested_device, actual, prefix) == 0 && actual[prefix] == '\0';
+        if (!same_device) {
+            fprintf(stderr, "paraformer: requested %s, initialized %s\n", requested_device, actual);
+            return 2;
+        }
     }
     const double init_ms =
         std::chrono::duration<double, std::milli>(pf_clock::now() - init_begin).count();
