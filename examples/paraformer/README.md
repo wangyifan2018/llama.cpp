@@ -65,10 +65,19 @@ With the existing punctuation layer, the 32-clip cabin command field goes
 en WER 12.21% → 8.40%, zh CER unchanged, no regressions or false triggers.
 See design doc §13–14.
 
+These gains and gaps belong to the **zh checkpoint** (`hotwords_vehicle.txt`
+uses `set` and `se@@`, neither of which exists in the en vocab). The profile is
+not portable: loading it against the en checkpoint logs `hotword token not in
+vocab` and applies nothing. Regenerate the gaps per checkpoint before tuning.
+
 ## Status (2026-11-17, host CPU, Q8_0)
 
 - Weight: `cstr/paraformer-zh-GGUF`, Q8_0, sha256 `e73232ec…`.
-- 32-clip `tingting` cabin fixture: Chinese CER 0.60%, English WER 12.21%.
+- 32-clip `tingting` cabin fixture: Chinese CER 0.60%. The English column of
+  that same fixture is not quotable - Tingting has no `en_US` variant, so its
+  English clips are Mandarin-accented speech and measure the voice. English is
+  measured on the eight native `en_US` voices instead; see the checkpoint
+  section below for 39.50% (zh checkpoint) and 24.14% (en checkpoint).
 - Raw command field 56.2%; after punctuation-only post-processing 68.8%.
   The raw number is depressed because Paraformer emits no punctuation and the
   semantic evaluator splits clauses on `，`/`,`. This is a post-processing gap,
@@ -255,15 +264,46 @@ python3 tools/score_voice.py --dir /tmp/voice-sandy --url http://127.0.0.1:8899
 ```
 
 `score_voice.py` reports the same zh CER and en WER used in
-[PRODUCTION.md](PRODUCTION.md). Eleven voices measured there separate two
-effects that the first five-voice sweep had merged. The multilingual voices
-cannot synthesise Mandarin well enough to measure with - Whisper small, an
-independent acoustic model, scores 46-69% zh CER on the same clips, worse than
-this engine. Their English output is clean native speech, and there this
-engine scores 33.59-49.62% against Whisper's 7.63-9.92%, so English command
-accuracy is the real weakness. Use a Mandarin voice for Mandarin fixtures:
-Meijia scores 0.00% zh CER. These are TTS clips: speaker variety without
-channel variety.
+[PRODUCTION.md](PRODUCTION.md). Which voices may be scored is fixed by
+`tools/voice_languages.tsv`: the multilingual novelty voices cannot synthesise
+Mandarin well enough to measure with - Whisper small, an independent acoustic
+model, scores 46-69% zh CER on the same clips, worse than this engine - so
+their Mandarin rows measure the TTS. Their English output is clean native
+speech, and there Whisper scores 3.39% WER against 24.14% for this engine, so
+English is a real gap rather than a fixture artefact. Use a Mandarin voice for
+Mandarin fixtures: Meijia scores 0.00% zh CER. These are TTS clips: speaker
+variety without channel variety.
+
+**English needs the English checkpoint.** FunASR publishes a separate
+`paraformer-en` (vocab 10020, 50000 h English) alongside `paraformer-zh`
+(vocab 8404, 60000 h Mandarin+English). Both load in this engine unchanged -
+the vocabulary size comes from GGUF metadata - and on 8 native `en_US` voices
+the English checkpoint scores 24.14% WER against the Mandarin checkpoint's
+39.50% at matched Q8_0. The two are complementary: the English checkpoint fed
+Mandarin emits pinyin (`把左前车窗打开一半` → `buto qian chehechuang da kai
+yiban`), so a bilingual product needs both and a per-utterance choice.
+
+The checkpoints use opposite sub-word conventions, which cost a full debugging
+round here: `paraformer-zh` marks continuation with a trailing `@@`, so an
+unmarked token ends a word; `paraformer-en` marks a word *start* with a leading
+`▁` (U+2581), so an unmarked token *continues* a word. Reading the English
+vocab with the zh rule split `recirculation` into `rec ir rc ulation` and made
+the English checkpoint look identical to the Mandarin one. `pf_detect_word_marker`
+now counts both markers over the whole vocab at load - the tables are 0-vs-
+thousands, so the winner is unambiguous - and both decode paths share one
+`pf_append_token`. Hotword files do not transfer between checkpoints: the
+English vocab has `▁set` and no `@@` tokens, so a zh profile silently applies
+nothing.
+
+Reproduce with `tools/compare_checkpoints.py`, which reads `voice_languages.tsv`
+and scores both checkpoints on the same wav files with the same rule:
+
+```sh
+python3 tools/compare_checkpoints.py \
+    --zh "$PF_MODELS/paraformer-zh-q8_0.gguf" \
+    --en "$PF_MODELS/paraformer-en-q8_0.gguf" \
+    --dir /tmp/voice-Eddy --dir /tmp/voice-Rocko --out /tmp/ckpt-ab.json
+```
 
 See `docs/backend/snapdragon/paraformer-htp-adaptation-design.md` for the
 stage-split, length-bucket, overlap/stitch and bilingual plan.
