@@ -298,6 +298,15 @@ The second ABBA run pinned one busy thread each to CPUs 6 and 7. `/proc/stat` me
 
 The ABBA launchers, per-request results with `backend`, health, artifact hashes, and resource snapshots are in `$PF_RUN/routing.vjddv2`. Use `bash "$PF_OUT/route.sh" "$PF_OUT"` and `bash "$PF_OUT/pressure.sh" "$PF_OUT"` from the repo with that run directory as `PF_OUT`. The recorded pressure hash is from the phone. The initial routing executable was reconstructed from the archived source version after the manifest file was reused for the pressure run. It matches the logged transfer size. The model and backend libraries were identical in both runs.
 
+A later REST check on the decomposed graph agrees with the third worker being worth it but not free. Four aligned 2.32 s clips, six rounds per arm, restarting between arms:
+
+| Engines | Four-lane wall p50 | p95 | RSS |
+|---:|---:|---:|---:|
+| 1 HTP + 1 CPU | 479 ms | 711 ms | 397 MB |
+| 1 HTP + 2 CPU | **374 ms** | **648 ms** | 704 MB |
+
+The four-lane tail is arithmetic rather than scheduling: two workers each run two 320 ms requests back to back, and `pf_rejected` and `pf_deadline_expired` both stayed at zero, so nothing was shed to hit that number. A third worker removes one round of serialisation for 307 MB, against 6.7 GB available on this device. The default stays at two. Reaching for the third worker is a memory-budget decision, and the earlier finding still applies -- it needs a repeated run under representative CPU contention before it becomes a baseline.
+
 ### Reordering the queue does not help
 
 Shortest-first dequeue was tried to protect short commands from a long upload and then reverted. The idea was that with two workers, arrival order puts a short command behind a long one and pays a full long decode, while shortest-first finishes the shorts inside one long decode.
