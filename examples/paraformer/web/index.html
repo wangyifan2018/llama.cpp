@@ -129,6 +129,9 @@
         <div class="row">
           <button class="ghost" id="btnStop" disabled>停止并提交</button>
           <button class="ghost danger" id="btnClear" disabled>清空</button>
+          <label class="hint" style="display:flex;gap:6px;align-items:center;cursor:pointer">
+            <input type="checkbox" id="chkVad"> 连续断句（服务端 VAD）
+          </label>
           <button class="ghost" id="btnFile">WAV 回放</button>
           <input id="file" type="file" accept="audio/wav" hidden>
           <span class="hint" id="fileHint"></span>
@@ -138,6 +141,7 @@
         <div class="result">
           <div class="final empty" id="final">等待音频...</div>
           <div class="partial" id="partial"></div>
+          <ol id="segments" style="margin:10px 0 0;padding-left:20px;color:#cfe3f7"></ol>
           <div class="meta">
             <span class="chip" id="chipPieces">分段 -</span>
             <span class="chip spk-none" id="chipSpk">说话人 -</span>
@@ -322,7 +326,15 @@
     const url = proto + '//' + location.host + '/v1/realtime';
     return new Promise((resolve, reject) => {
       ws = new WebSocket(url);
-      ws.onopen = () => { setBadge('bConn', 'on', '已连接'); log('ws', 'open'); resolve(); };
+      ws.onopen = () => {
+        setBadge('bConn', 'on', '已连接');
+        log('ws', 'open');
+        if ($('chkVad').checked) {
+          ws.send(JSON.stringify({type: 'session.update', session: {
+            turn_detection: {type: 'server_vad', silence_duration_ms: 500, min_speech_duration_ms: 200, threshold: 0.5}}}));
+        }
+        resolve();
+      };
       ws.onerror = () => { setBadge('bConn', '', '连接失败'); toast('WebSocket 连接失败', true); reject(new Error('ws')); };
       ws.onclose = () => { setBadge('bConn', '', '未连接'); log('ws', 'closed'); };
       ws.onmessage = (ev) => {
@@ -338,7 +350,16 @@
           const ms = committedAt ? Math.round(performance.now() - committedAt) : 0;
           committedAt = 0;
           const text = m.transcript || '';
-          $('final').textContent = text || '(空)';
+          if ($('chkVad').checked) {
+            const li = document.createElement('li');
+            li.textContent = text || '(空)';
+            li.style.marginBottom = '4px';
+            $('segments').appendChild(li);
+            $('mSegs').textContent = $('segments').children.length;
+            $('final').textContent = text || '(空)';
+          } else {
+            $('final').textContent = text || '(空)';
+          }
           $('final').classList.toggle('empty', !text);
           $('partial').textContent = '';
           lastPartial = '';
@@ -488,6 +509,7 @@
     $('final').textContent = '等待音频...'; $('final').classList.add('empty');
     $('partial').textContent = '';
     $('mSegs').textContent = '0';
+    $('segments').innerHTML = '';
     $('mE2E').textContent = '—'; $('mQueue').textContent = '—'; $('mInfer').textContent = '—';
     $('chipSpk').className = 'chip spk-none'; $('chipSpk').textContent = '说话人 -';
     $('chipPieces').textContent = '分段 -';

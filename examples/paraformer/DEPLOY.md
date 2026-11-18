@@ -109,9 +109,18 @@ device/state/value 90.5/90.5/100%，zh CER 0.60%，en WER 6.87%，wrong=0。
 
 ## 6. 实时接口行为（`/v1/realtime`）
 
-- `input_audio_buffer.append`（base64 PCM16）→ 预览事件，`commit` → 终稿。
-- 预览从 **0.8 s** 音频开始，最长到 **6 s**；两次间隔 ≥600 ms 且新增音频 ≥800 ms，队列非空时让路。
-- 预览发送 **`x.pf.partial`（完整假设）**，客户端直接替换该行；只有在假设"扩展"时才额外发
-  `conversation.item.input_audio_transcription.delta`，供只认 append 的客户端使用。
-  这样模型自我修正时是替换而不是丢事件。
-- 终稿事件 `...completed` 带 `speaker_score` / `speaker_ok`（启用声纹时）。
+两种用法，**推荐第一种**：
+
+**a) 连续流 + 服务端断句**（`session.update` 带 `turn_detection.type = "server_vad"`）：
+客户端只推 `input_audio_buffer.append`，服务端 VAD 判定声学停顿后，每次发一对
+`input_audio_buffer.committed` + `...transcription.completed`。结果延迟 = 停顿阈值
+（默认 500 ms）+ 推理（约 280 ms）。段落音频含尾部静音，因此不会出现客户端切太早导致的末尾丢字。
+停顿时长可配（`silence_duration_ms`），短于阈值的停顿不断句。
+
+**b) 客户端自己切段**：`append` 到切点后 `commit`，服务端返回该段终稿。适合前端 VAD 已经可靠的场景。
+
+预览（`x.pf.partial`）**默认关闭**（`--partials` 才开）：它是整段假设的刷新，与断句结果无关；
+座舱需要的是"一段一个结果"，不是边说话边改字。启用时每次发完整假设，客户端整行替换，
+只有在假设扩展时才额外发 append 式 `delta`。
+
+终稿事件带 `speaker_score` / `speaker_ok`（启用声纹时）。

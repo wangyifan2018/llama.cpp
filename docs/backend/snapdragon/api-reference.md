@@ -222,6 +222,37 @@ partial 的节流：新增音频 ≥ `--partial-ms`（默认 800 ms）且距上�
 要开预览必须**同时**放宽两个阈值，例如 `--partial-min-s 0.8 --partial-max-s 8`，
 并接受短句上的错字停留。
 
+## 5.1 连续流 + 服务端断句（推荐）
+
+客户端只负责推音频，断句由服务端 VAD 决定：中间出现声学停止就出一次结果，不需要客户端 commit。
+
+```json
+// 客户端首帧
+{"type":"session.update","session":{"turn_detection":{
+  "type":"server_vad","silence_duration_ms":500,"min_speech_duration_ms":200,"threshold":0.5}}}
+// 服务端确认
+{"type":"session.updated","session":{"turn_detection":{"type":"server_vad"}}}
+```
+
+之后持续 `input_audio_buffer.append`（20 ms 一片）即可，每次判定到停顿服务端发一对事件：
+
+```json
+{"type":"input_audio_buffer.committed","item_id":"item_1","previous_item_id":null}
+{"type":"conversation.item.input_audio_transcription.completed","item_id":"item_1",
+ "transcript":"把主驾空调调到二十一度","vad_pieces":1,"usage":{"type":"duration","seconds":2.3}}
+{"type":"x.pf.metrics","item_id":"item_1","queue_ms":1,"infer_ms":278,"vad_ms":16}
+```
+
+要点：
+
+- **结果延迟 = `silence_duration_ms` + 推理时间**：500 ms 停顿 + 约 280 ms 推理，即最后一个字之后
+  约 0.8 s 出结果。这是"服务端断句"的固有代价，比客户端自己切段晚一个停顿时长。
+- 段落音频由检测器给出，**包含尾部静音**，因此不会出现"客户端切太早、末尾被截断"的问题。
+- 停顿短于 `silence_duration_ms` 不会断句；一句话中间的长停顿会把它切成两段（实测 2 s 停顿
+  切出两段，500 ms 停顿不切）。
+- 仍然可以显式 `commit`（例如用户手动结束），服务端会把剩余音频作为最后一段。
+- 预览（`x.pf.partial`）默认**关闭**；它是"整段假设的刷新"，与断句结果无关。
+
 ## 6. 错误
 
 ```json

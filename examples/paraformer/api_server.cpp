@@ -241,7 +241,9 @@ static double g_partial_max_s = 6.0;    // stop partials past this much audio
 // hypothesis on every preview (x.pf.partial), so a revised guess replaces the
 // previous one instead of being dropped.
 static double g_partial_min_s = 0.8;
-static bool g_partials = true;
+// Text previews are off by default: a cabin client wants one result per
+// utterance, not a line that revises itself. Enable with --partials.
+static bool g_partials = false;
 static std::atomic<uint64_t> g_partials_run{0};
 static std::atomic<uint64_t> g_partials_skipped{0};
 
@@ -1171,6 +1173,13 @@ struct WsSession {
     std::deque<std::string> outbox;
     std::deque<WsCommit> pending;
     std::vector<float> pcm;       // 16 kHz mono
+    // Streaming mode: the server owns the endpoint. Appends feed a detector and
+    // every closed segment is transcribed and emitted on its own, so a client can
+    // stream without running its own VAD. The handle stays opaque so a build
+    // without sherpa still compiles; it is never created there.
+    const void* vad = nullptr;
+    bool stream_vad = false;
+    uint64_t stream_items = 0;
     std::string language = "zh";
     std::string partial_text;
     uint64_t gen = 0;             // invalidates previews on commit or clear
@@ -1216,6 +1225,72 @@ static json session_object(const WsSession& s) {
                 {"audio", {{"input", {{"format", {{"type", "audio/pcm"}, {"rate", 16000}}}}}}},
                 {"input_audio_transcription", {{"model", g_model_id}, {"language", s.language}}}};
 }
+
+// One terminal event for one segment: the client sees a committed item followed
+// by its transcript, exactly as it would after an explicit commit.
+static void ws_emit_segment(const std::shared_ptr<WsSession>& s, const std::string& item, const SegmentReply& reply,
+                            double duration) {
+    json body = {{"item_id", item},
+                 {"content_index", 0},
+                 {"transcript", reply.text},
+                 {"vad_pieces", reply.pieces},
+                 {"usage", {{"type", "duration"}, {"seconds", duration}}}};
+    if (reply.silence) body["empty"] = "silence";
+    set_speaker_json(body, reply.speaker);
+    ws_queue_event(*s, "input_audio_buffer.committed", {{"item_id", item}, {"previous_item_id", nullptr}});
+    ws_queue_event(*s, "conversation.item.input_audio_transcription.completed", std::move(body));
+    ws_queue_event(*s, "x.pf.metrics", {{"item_id", item}, {"queue_ms", reply.queue_ms},
+                                       {"infer_ms", reply.infer_ms}, {"vad_ms", reply.vad_ms},
+                                       {"backend", reply.backend}});
+}
+
+#ifdef XASR_SPEAKER
+// Feed one append into the session detector and transcribe every segment it
+// closed. Runs on the WebSocket thread; the detector is owned by the session.
+static void stream_vad_feed(const std::shared_ptr<WsSession>& s, const std::vector<float>& samples) {
+    auto* vad = (const SherpaOnnxVoiceActivityDetector*) s->vad;
+    if (!s->stream_vad || !vad || samples.empty()) {
+        return;
+    }
+    for (size_t off = 0; off < samples.size(); off += 512) {
+        const size_t n = std::min<size_t>(512, samples.size() - off);
+        SherpaOnnxVoiceActivityDetectorAcceptWaveform(vad, samples.data() + off, (int32_t) n);
+    }
+    while (!SherpaOnnxVoiceActivityDetectorEmpty(vad)) {
+        const SherpaOnnxSpeechSegment* seg = SherpaOnnxVoiceActivityDetectorFront(vad);
+        std::vector<float> piece(seg->samples, seg->samples + seg->n);
+        SherpaOnnxDestroySpeechSegment(seg);
+        SherpaOnnxVoiceActivityDetectorPop(vad);
+        if (piece.empty()) {
+            continue;
+        }
+        const std::string item = "item_" + std::to_string(++s->stream_items);
+        const double duration = (double) piece.size() / 16000.0;
+        const auto deadline = pf_clock::now() + g_deadline;
+        const bool ok = submit(std::move(piece), 1, [s, item, duration, deadline](SegmentReply reply) {
+            std::lock_guard<std::mutex> lock(s->m);
+            if (s->closed) {
+                return;
+            }
+            if (pf_clock::now() >= deadline) {
+                reply = deadline_reply();
+            }
+            if (reply.status != 200) {
+                ws_final_error(*s, item, reply);
+                return;
+            }
+            ws_emit_segment(s, item, reply, duration);
+        }, false, [s] {
+            std::lock_guard<std::mutex> lock(s->m);
+            return s->closed;
+        }, deadline, s.get());
+        if (!ok) {
+            g_rejected.fetch_add(1);
+            ws_queue_event(*s, "error", error_body("server is busy, retry later", "rate_limit_error"));
+        }
+    }
+}
+#endif
 
 // Schedule a partial decode of the audio received so far.
 static void maybe_schedule_partial(const std::shared_ptr<WsSession>& s) {
@@ -1312,6 +1387,57 @@ static void ws_handle_text(const std::shared_ptr<WsSession>& s, const std::strin
             ws_send_error(*s, "session and input_audio_transcription must be objects", "invalid_request_error", "session");
             return;
         }
+        if (sess.contains("turn_detection") && sess["turn_detection"].is_object()) {
+#ifdef XASR_SPEAKER
+            const json& td = sess["turn_detection"];
+            const std::string kind = td.value("type", "none");
+            bool enabled = false;
+            bool missing_model = false;
+            {
+            // The lock covers the detector swap only: ws_queue_event below also
+            // takes s->m, so queueing inside this scope deadlocks the session.
+            std::lock_guard<std::mutex> lock(s->m);
+            if (kind == "server_vad") {
+                if (!g_vad_model.empty()) {
+                    SherpaOnnxVadModelConfig cfg;
+                    std::memset(&cfg, 0, sizeof(cfg));
+                    cfg.silero_vad.model = g_vad_model.c_str();
+                    cfg.silero_vad.threshold = (float) td.value("threshold", 0.5);
+                    cfg.silero_vad.min_silence_duration = (float) td.value("silence_duration_ms", 500) / 1000.0f;
+                    cfg.silero_vad.min_speech_duration = (float) td.value("min_speech_duration_ms", 200) / 1000.0f;
+                    cfg.silero_vad.window_size = 512;
+                    cfg.silero_vad.max_speech_duration = (float) g_vad_split_s;
+                    cfg.sample_rate = 16000;
+                    cfg.num_threads = 1;
+                    cfg.provider = "cpu";
+                    if (s->vad) {
+                        SherpaOnnxDestroyVoiceActivityDetector((const SherpaOnnxVoiceActivityDetector*) s->vad);
+                    }
+                    s->vad = SherpaOnnxCreateVoiceActivityDetector(&cfg, 60.0f);
+                    s->stream_vad = s->vad != nullptr;
+                    s->stream_items = 0;
+                    s->pcm.clear();
+                    enabled = s->stream_vad;
+                } else {
+                    missing_model = true;
+                }
+            } else if (s->vad) {
+                SherpaOnnxDestroyVoiceActivityDetector((const SherpaOnnxVoiceActivityDetector*) s->vad);
+                s->vad = nullptr;
+                s->stream_vad = false;
+            }
+            }
+            if (missing_model) {
+                ws_send_error(*s, "server_vad needs --vad-model", "invalid_request_error", "turn_detection");
+            } else {
+                ws_queue_event(*s, "session.updated",
+                               {{"session", {{"turn_detection", {{"type", enabled ? "server_vad" : "none"}}}}}});
+            }
+#else
+            ws_send_error(*s, "server_vad is not compiled in", "invalid_request_error", "turn_detection");
+#endif
+            return;
+        }
         if (sess.contains("input_audio_transcription") && sess["input_audio_transcription"].contains("language")) {
             const auto& language = sess["input_audio_transcription"]["language"];
             if (!language.is_string() || language.get_ref<const std::string&>().size() > 32) {
@@ -1341,8 +1467,15 @@ static void ws_handle_text(const std::shared_ptr<WsSession>& s, const std::strin
                 ws_queue_event(*s, "error", error_body("segment exceeds 30 s, commit or clear first", "invalid_request_error"));
                 return;
             }
-            s->pcm.insert(s->pcm.end(), f.begin(), f.end());
+            // In streaming mode the detector owns the audio: it copies what it
+            // needs, so the session buffer is only a fallback for a later commit.
+            if (!s->stream_vad) {
+                s->pcm.insert(s->pcm.end(), f.begin(), f.end());
+            }
         }
+#ifdef XASR_SPEAKER
+        stream_vad_feed(s, f);
+#endif
         maybe_schedule_partial(s);
         return;
     }
