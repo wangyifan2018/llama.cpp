@@ -39,6 +39,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1577,6 +1578,135 @@ static void handle_segment(const httplib::Request& req, httplib::Response& res) 
     res.set_content(body.dump(), "application/json");
 }
 
+// ---- Metrics ----
+
+// One snapshot read once, rendered in two formats. Two separate readers is how
+// /metrics and /metrics.json start disagreeing: the counters move between the
+// two requests and a dashboard silently plots a different number than the
+// script that gates the deploy.
+struct Metrics {
+    uint64_t requests;
+    uint64_t rejected;
+    uint64_t failed;
+    uint64_t deadline_expired;
+    uint64_t cancelled_queued;
+    uint64_t auth_rejected;
+    bool cpu_fallback;
+    uint64_t partials;
+    uint64_t partials_skipped;
+    uint64_t speaker_deferred;
+    uint64_t speaker_started;
+    uint64_t speaker_assessed;
+    size_t queue;
+    size_t queue_bytes;
+    size_t queue_bytes_limit;
+    int inflight;
+    int accepted;
+    int ws_sessions;
+    size_t engines;
+};
+
+static Metrics collect_metrics() {
+    Metrics m;
+    m.requests = g_requests.load();
+    m.rejected = g_rejected.load();
+    m.failed = g_failed.load();
+    m.deadline_expired = g_deadline_expired.load();
+    m.cancelled_queued = g_cancelled_queued.load();
+    m.auth_rejected = g_auth_rejected.load();
+    m.cpu_fallback = g_degraded;
+    m.partials = g_partials_run.load();
+    m.partials_skipped = g_partials_skipped.load();
+    m.speaker_deferred = g_speaker_deferred.load();
+    m.speaker_started = g_speaker_started.load();
+    m.speaker_assessed = g_speaker_assessed.load();
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        m.queue = g_queue.size();
+        m.queue_bytes = g_queue_bytes;
+    }
+    m.queue_bytes_limit = g_queue_bytes_limit;
+    m.inflight = g_inflight.load();
+    m.accepted = g_accepted.load();
+    m.ws_sessions = g_ws_sessions.load();
+    m.engines = g_engines.size();
+    return m;
+}
+
+static json metrics_json(const Metrics& m) {
+    return json{{"requests", m.requests},
+                {"rejected", m.rejected},
+                {"failed", m.failed},
+                {"deadline_expired", m.deadline_expired},
+                {"cancelled_queued", m.cancelled_queued},
+                {"auth_rejected", m.auth_rejected},
+                {"cpu_fallback", m.cpu_fallback},
+                {"partials", m.partials},
+                {"partials_skipped", m.partials_skipped},
+                {"speaker_deferred", m.speaker_deferred},
+                {"speaker_started", m.speaker_started},
+                {"speaker_assessed", m.speaker_assessed},
+                {"queue", m.queue},
+                {"queue_bytes", m.queue_bytes},
+                {"queue_bytes_limit", m.queue_bytes_limit},
+                {"inflight", m.inflight},
+                {"accepted", m.accepted},
+                {"ws_sessions", m.ws_sessions},
+                {"engines", m.engines}};
+}
+
+// Prometheus exposition, text format 0.0.4.
+//
+// Deliberately no "_total" on any name. A name ending in _total is, by
+// convention, a monotonically increasing counter, and Prometheus converts it on
+// scrape to a series with the suffix stripped. Naming a gauge with it - queue,
+// inflight, accepted, engines all go up and down - makes rate() and
+// increase() produce nonsense, which is worse than the name being slightly
+// less idiomatic. Same reason there is no HELP on the gauges beyond one line:
+// what each one counts is the thing a reader actually needs.
+static std::string metrics_prometheus(const Metrics& m) {
+    std::ostringstream o;
+    auto counter = [&o](const char* name, const char* help, uint64_t v) {
+        o << "# HELP " << name << ' ' << help << '\n';
+        o << "# TYPE " << name << " counter\n";
+        o << name << ' ' << v << '\n';
+    };
+    auto gauge = [&o](const char* name, const char* help, auto v) {
+        o << "# HELP " << name << ' ' << help << '\n';
+        o << "# TYPE " << name << " gauge\n";
+        o << name << ' ' << v << '\n';
+    };
+
+    counter("pf_requests", "Transcription and segment requests started.", m.requests);
+    counter("pf_rejected", "Requests refused by admission control.", m.rejected);
+    counter("pf_failed", "Requests that ended in an error response.", m.failed);
+    counter("pf_deadline_expired", "Requests that reached --deadline-ms.", m.deadline_expired);
+    counter("pf_cancelled_queued", "Queued requests dropped before a worker took them.", m.cancelled_queued);
+    counter("pf_auth_rejected", "Requests refused for a missing or wrong bearer token.", m.auth_rejected);
+    counter("pf_partials", "Partial decodes run for realtime sessions.", m.partials);
+    counter("pf_partials_skipped", "Partial decodes skipped to keep a commit first.", m.partials_skipped);
+    counter("pf_speaker_started", "Speaker scoring jobs started.", m.speaker_started);
+    counter("pf_speaker_assessed", "Speaker scoring jobs that produced a score.", m.speaker_assessed);
+    counter("pf_speaker_deferred", "Speaker scoring jobs left without a result.", m.speaker_deferred);
+
+    // 1/0 rather than a label so an alert reads `pf_cpu_fallback == 1` without
+    // having to know which label value means degraded.
+    //
+    // Gauges are emitted through the integer overload on purpose. Streaming a
+    // size_t through double prints 8.38861e+06 for 8388608 - Prometheus parses
+    // it, so nothing breaks loudly, but the value in the series no longer
+    // equals the configured cap and an alert built on it is off by 8 bytes.
+    gauge("pf_cpu_fallback", "1 when engines are running on CPU after a fallback.", (int) (m.cpu_fallback ? 1 : 0));
+    gauge("pf_queue_depth", "Tasks waiting for a worker.", m.queue);
+    gauge("pf_queue_bytes", "Audio bytes held by queued tasks.", m.queue_bytes);
+    gauge("pf_queue_bytes_limit", "Configured cap on pf_queue_bytes.", m.queue_bytes_limit);
+    gauge("pf_inflight", "Tasks a worker is currently running.", m.inflight);
+    gauge("pf_accepted", "Requests accepted and not yet answered, queued or running.", m.accepted);
+    gauge("pf_ws_sessions", "Open realtime sessions.", m.ws_sessions);
+    gauge("pf_engines", "Engines in this process.", m.engines);
+    return o.str();
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
@@ -1889,32 +2019,16 @@ int main(int argc, char** argv) {
     });
 
     srv.Get("/metrics", [](const httplib::Request&, httplib::Response& res) {
-        size_t queued, queued_bytes;
-        {
-            std::lock_guard<std::mutex> lock(g_mutex);
-            queued = g_queue.size();
-            queued_bytes = g_queue_bytes;
-        }
-        json j = {{"requests", g_requests.load()},
-                  {"rejected", g_rejected.load()},
-                  {"failed", g_failed.load()},
-                  {"deadline_expired", g_deadline_expired.load()},
-                  {"cancelled_queued", g_cancelled_queued.load()},
-                  {"auth_rejected", g_auth_rejected.load()},
-                  {"cpu_fallback", g_degraded},
-                  {"partials", g_partials_run.load()},
-                  {"partials_skipped", g_partials_skipped.load()},
-                  {"speaker_deferred", g_speaker_deferred.load()},
-                  {"speaker_started", g_speaker_started.load()},
-                  {"speaker_assessed", g_speaker_assessed.load()},
-                  {"queue", queued},
-                  {"queue_bytes", queued_bytes},
-                  {"queue_bytes_limit", g_queue_bytes_limit},
-                  {"inflight", g_inflight.load()},
-                  {"accepted", g_accepted.load()},
-                  {"ws_sessions", g_ws_sessions.load()},
-                  {"engines", g_engines.size()}};
-        res.set_content(j.dump(), "application/json");
+        const Metrics m = collect_metrics();
+        res.set_content(metrics_prometheus(m), "text/plain; version=0.0.4; charset=utf-8");
+    });
+
+    // Kept as the machine-readable twin of /metrics. Every in-tree consumer
+    // (smoke_production.py, check_admission.py, bench_ws_realtime.py) parses
+    // this JSON, so /metrics can serve the exposition format without breaking
+    // them; external scrapers get the format their name implies.
+    srv.Get("/metrics.json", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(metrics_json(collect_metrics()).dump(), "application/json");
     });
 
     srv.Post("/v1/audio/transcriptions", handle_transcription);

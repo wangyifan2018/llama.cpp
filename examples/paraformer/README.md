@@ -274,7 +274,7 @@ build-x-asr/bin/llama-paraformer-api MODEL.gguf --port 8080 --api-key "$PF_API_K
 `PF_API_KEY` is preferred over `--api-key` because an argument is readable in
 `/proc/<pid>/cmdline` by every local process. The flag wins if both are set.
 
-`/health`, `/v1/models` and `/metrics` stay open: a container healthcheck has no
+`/health`, `/v1/models`, `/metrics` and `/metrics.json` stay open: a container healthcheck has no
 way to hold a credential, and refusing it turns a running service into a
 permanently unhealthy one. They expose engine counts and queue depth, not
 audio — if that is still too much, put the service behind a proxy that
@@ -296,6 +296,43 @@ probes and the WebSocket path against a running server:
 python3 tools/check_auth.py --port 8080 --wav clip.wav --key "$PF_API_KEY"
 python3 tools/check_auth.py --port 8080 --wav clip.wav --no-auth   # open server
 ```
+
+### Metrics
+
+`/metrics` serves Prometheus exposition text (version 0.0.4) with a `pf_` prefix:
+
+```
+# TYPE pf_requests counter
+pf_requests 3
+# TYPE pf_queue_depth gauge
+pf_queue_depth 0
+# TYPE pf_queue_bytes_limit gauge
+pf_queue_bytes_limit 8388608
+```
+
+`/metrics.json` is the same snapshot with the application's own field names. Both
+are rendered from one `collect_metrics()` call, because two readers is how the
+dashboard and the deploy gate start disagreeing about the same counter.
+
+Two naming decisions that format validation cannot catch:
+
+- **Nothing ends in `_total`.** The suffix means "monotonically increasing
+  counter", and Prometheus rewrites the series name on scrape. `queue`,
+  `inflight`, `accepted`, `engines` all move both ways; giving them the suffix
+  makes `rate()` and `increase()` return garbage that looks like data.
+- **Sizes are integers.** Streaming a `size_t` through `double` prints
+  `8.38861e+06` for 8388608. Prometheus accepts it happily, so nothing breaks
+  loudly, and an alert on the queue cap is off by 8 bytes forever.
+
+`tools/check_metrics.py` asserts both, plus the exposition grammar and text/JSON
+agreement:
+
+```sh
+python3 tools/check_metrics.py --port 8080
+```
+
+In-tree consumers (`smoke_production.py`, `check_admission.py`,
+`bench_ws_realtime.py`) read `/metrics.json`; keep both endpoints.
 
 ### Shutdown
 

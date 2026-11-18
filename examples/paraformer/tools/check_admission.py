@@ -29,7 +29,9 @@ async def append(ws, pcm):
 
 
 def metrics(http):
-    return json.loads(http_json(http + '/metrics')[2])
+    # /metrics is the Prometheus exposition text; /metrics.json is the same
+    # snapshot in JSON. These assertions want fields, so they read the JSON twin.
+    return json.loads(http_json(http + '/metrics.json')[2])
 
 
 def check_deadline(error):

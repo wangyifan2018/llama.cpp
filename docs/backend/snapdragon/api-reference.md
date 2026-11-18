@@ -20,7 +20,8 @@
 |---|---|---|
 | GET | `/health` | 探活、能力和预热图的后端落点。`backends` 包含各引擎请求与实际设备、`flash_attn` 和两阶段计算节点数 |
 | GET | `/v1/models` | OpenAI 形状的模型列表 + `capabilities` |
-| GET | `/metrics` | 计数：`requests, rejected, failed, partials, partials_skipped, queue, engines` |
+| GET | `/metrics` | Prometheus 文本格式（0.0.4），`pf_` 前缀，见下 | 
+| GET | `/metrics.json` | 同一份快照的 JSON，字段名与应用内部一致 |
 | POST | `/v1/audio/transcriptions` | OpenAI 兼容转写（multipart/form-data） |
 | POST | `/asr/segment` | 设备端低开销转写（body 直接是 float32 PCM） |
 | WS | `/v1/realtime` | 实时：append / commit / clear，返回 partial 与最终结果 |
@@ -52,6 +53,46 @@
 覆盖拒绝（无 token / 错 token / 缺 Bearer scheme / 空 token / 同长度错 token）、
 放行（正确 token、小写 `bearer`）、探针开放和 WS 升级两条路径；`--no-auth` 是
 针对未设 token 服务的镜像检查。
+
+### 指标
+
+`/metrics` 返回 Prometheus 文本格式（version=0.0.4），`/metrics.json` 是同一份快照的
+JSON。两者由同一个采集函数渲染：分成两个读取点的话，计数在两个请求之间会走，仪表盘
+上画的数和部署门禁读的数就成了两个值。
+
+字段（JSON 名 → 文本名）：
+
+| JSON | Prometheus | 类型 | 含义 |
+|---|---|---|---|
+| `requests` | `pf_requests` | counter | 已开始的转写/分段请求 |
+| `rejected` | `pf_rejected` | counter | 被准入控制拒绝 |
+| `failed` | `pf_failed` | counter | 以错误响应结束 |
+| `deadline_expired` | `pf_deadline_expired` | counter | 达到 `--deadline-ms` |
+| `cancelled_queued` | `pf_cancelled_queued` | counter | 出队前被丢弃 |
+| `auth_rejected` | `pf_auth_rejected` | counter | token 缺失或错误 |
+| `partials` | `pf_partials` | counter | 实时会话里真正跑的 partial |
+| `partials_skipped` | `pf_partials_skipped` | counter | 为了让 COMMIT 优先而跳过的 partial |
+| `speaker_started` | `pf_speaker_started` | counter | 提交给评分线程 |
+| `speaker_assessed` | `pf_speaker_assessed` | counter | 取到分数 |
+| `speaker_deferred` | `pf_speaker_deferred` | counter | 未取到结果 |
+| `cpu_fallback` | `pf_cpu_fallback` | gauge | 1 表示已回落到 CPU |
+| `queue` | `pf_queue_depth` | gauge | 等待 worker 的任务数 |
+| `queue_bytes` | `pf_queue_bytes` | gauge | 排队任务持有的音频字节 |
+| `queue_bytes_limit` | `pf_queue_bytes_limit` | gauge | 上面那个的上限 |
+| `inflight` | `pf_inflight` | gauge | worker 正在执行的任务数 |
+| `accepted` | `pf_accepted` | gauge | 已接受且尚未答复（含排队与执行中） |
+| `ws_sessions` | `pf_ws_sessions` | gauge | 活跃实时会话 |
+| `engines` | `pf_engines` | gauge | 本进程的引擎数 |
+
+两条命名约定是刻意的：**没有任何名字带 `_total`**，后缀按惯例意味着单调递增的
+counter，Prometheus 抓取时还会把它当 `_total` 前身改写序列名；`queue`、`inflight`、
+`accepted`、`engines` 都是可升可降的 gauge，带上后缀会让 `rate()` / `increase()`
+算出垃圾。**尺寸类指标按整数输出**：`size_t` 走 `double` 会打成 `8.38861e+06`，
+Prometheus 照收不误，但序列里的值已经不等于配置的上限。
+
+校验用 [`tools/check_metrics.py`](../../../examples/paraformer/tools/check_metrics.py)：
+格式合法性、`_total` 与类型一致性、整型输出、以及文本与 JSON 逐值一致。后者只在两次
+JSON 读数相同时才强制逐值比较——计数器在两次请求之间会走，否则会把正常流量报成不一致。
 
 ### 优雅退出
 

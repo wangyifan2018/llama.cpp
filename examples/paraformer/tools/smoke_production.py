@@ -265,7 +265,7 @@ def main():
     asyncio.run(ws_commit_lifecycle(ws_url, pcm))
 
     # 8. queue accounting
-    status, _, body = http_json(base + "/metrics")
+    status, _, body = http_json(base + "/metrics.json")
     m = json.loads(body)
     check("metrics", status == 200 and m.get("requests", 0) > 0, json.dumps(m))
 

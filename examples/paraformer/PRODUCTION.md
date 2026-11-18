@@ -59,7 +59,7 @@ An isolated API instance on SM6650 passed 20/20 checks with one CPU engine, two 
 
 The API and framed TCP service start listening only after their configured engines initialize and warm up. The framed benchmark service also retains `--no-warmup` for measuring cold starts. When CIF emits no tokens during a silence warmup, a zero embedding exercises the decoder graph. Warmup verifies that both stages execute some compute on the selected backend. `/health` keeps the engine count and reports `backends` with the requested and actual device and compute-node counts for both warmup graphs. Views and reshapes are excluded. Fbank, CIF and output conversion also run on the host and are outside these graph totals.
 
-An unavailable requested accelerator or failed warmup exits before listening by default. `--allow-cpu-fallback` opts into a CPU startup retry. The API reports HTTP 200 and `status: degraded` in that case, and `/metrics` reports `cpu_fallback: true`. A valid no-token decode returns empty text successfully. Failed graph allocation or compute returns an inference error through plain, timestamped, and windowed decoding. The graph cache drops failed stages instead of reusing them. The temporary source GGUF bytes are released after the backend buffers are materialized.
+An unavailable requested accelerator or failed warmup exits before listening by default. `--allow-cpu-fallback` opts into a CPU startup retry. The API reports HTTP 200 and `status: degraded` in that case, and `/metrics.json` reports `cpu_fallback` as true (`/metrics` exposes it as `pf_cpu_fallback 1`). A valid no-token decode returns empty text successfully. Failed graph allocation or compute returns an inference error through plain, timestamped, and windowed decoding. The graph cache drops failed stages instead of reusing them. The temporary source GGUF bytes are released after the backend buffers are materialized.
 
 The host run verified strict failure with missing HTP, strict failure with a sub-frame warmup WAV, and successful CPU fallback with `degraded` and `requested=HTP0:0 actual=CPU`. Both ordinary CPU and fallback CPU passed 20 smoke checks. With the same WAV in a separate SM6650 instance, HTP performed 1454/1504 encoder and 559/575 decoder compute nodes. All 66 nodes outside HTP were `FLASH_ATTN_EXT`. Both engines warmed up and the mixed instance passed 20 smoke checks, including empty text from a valid sub-frame PCM request. This is a placement and API check at the warmup shape. Compare attention paths within the same API binary before changing the serving default.
 
@@ -107,7 +107,7 @@ The build log, device hashes, launcher, fixture generators and per-transport out
 
 The API runs CAM++ scoring on one CPU thread and admits at most one scorer task, including its active task. It tries to schedule scoring only when a final request is admitted, the ASR queue and workers are idle, and the scorer slot is free. It copies at most the first 1.5 s by default. Final replies inspect the result once at ASR completion. A slower scorer can finish independently as the ASR result is delivered. The requester does not receive a later update for that result.
 
-Both REST endpoints and WS final responses distinguish `disabled`, `assessed`, and `not_assessed`. `speaker_ok` exists only for `assessed`. The not-assessed reasons are `busy`, `in_progress`, `no_audio_in_prefix`, `no_embedding`, and `silence`. `/metrics` reports scorer starts and final assessment counts. Supplying a speaker configuration with unavailable model support or enrollment fails before listen. The raw PCM endpoint follows the same policy as WAV and WS.
+Both REST endpoints and WS final responses distinguish `disabled`, `assessed`, and `not_assessed`. `speaker_ok` exists only for `assessed`. The not-assessed reasons are `busy`, `in_progress`, `no_audio_in_prefix`, `no_embedding`, and `silence`. `/metrics.json` reports `speaker_started`, `speaker_assessed` and `speaker_deferred`. Supplying a speaker configuration with unavailable model support or enrollment fails before listen. The raw PCM endpoint follows the same policy as WAV and WS.
 
 On SM6650 with the same binary on both arms, six rounds of four aligned WS requests completed with identical transcripts in 24/24 pairs. Enabled scoring started once per round. Six responses carried a score and 18 returned `not_assessed` with `busy`. Endpoint-to-final P50/P95 was 527/724 ms with scoring off and 547/729 ms with scoring on. This was one short off/on comparison. The enabled configuration passed 26 smoke checks. A sub-frame request returned `not_assessed` with `in_progress`, and WS silence returned `not_assessed` with `silence`. Synthetic enrollment and independent synthetic speech yielded example scores of 0.926 and 0.339. These samples establish response semantics and exercise the scorer. Cabin false accept and false reject rates are still open.
 
@@ -117,7 +117,7 @@ Build Android with `XASR_SPEAKER=ON` and launch [the API](README.md#speaker-gate
 PF_WAV="$PF_MODELS/tingting/hvac_zh01.wav"
 python3 examples/paraformer/tools/smoke_production.py --port 18789 --wav "$PF_WAV" --expect-backend HTP0:0 --expect-gate
 python3 examples/paraformer/tools/bench_ws_realtime.py --url ws://127.0.0.1:18789/v1/realtime \
-    --metrics http://127.0.0.1:18789/metrics --wav "$PF_WAV" --sessions 4 --rounds 6 --out speaker-on.jsonl
+    --metrics http://127.0.0.1:18789/metrics.json --wav "$PF_WAV" --sessions 4 --rounds 6 --out speaker-on.jsonl
 ```
 
 The Android launcher, synthetic enrollment fixture identifiers and hashes, raw response JSON, per-commit JSONL, and counters before and after each arm are in `$PF_RUN/speaker.5xc2A3`.
@@ -153,7 +153,7 @@ Run the two Android API arms with `--device HTP0:0 --engines 2 --threads 2 --no-
 PF_CACHE="${PF_CACHE:-$HOME/pf-cache}"
 PF_WAVS="$PF_MODELS/tingting"
 python3 examples/paraformer/tools/bench_ws_realtime.py --url ws://127.0.0.1:18791/v1/realtime \
-    --metrics http://127.0.0.1:18791/metrics --sessions 4 --rounds 2 \
+    --metrics http://127.0.0.1:18791/metrics.json --sessions 4 --rounds 2 \
     --wavs "$PF_CACHE/cabin-asr-probe/long-perf/zh-10.wav" "$PF_WAVS/hvac_zh01.wav" \
     "$PF_WAVS/light_en01.wav" "$PF_WAVS/light_en03.wav" --start-offsets-ms 0 7700 8050 7570 \
     --out mixed.jsonl

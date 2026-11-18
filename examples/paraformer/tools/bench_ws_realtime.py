@@ -3,7 +3,7 @@
 
 Opens N WebSocket sessions that append 20 ms chunks in real time and commit at
 the end, then reports per-session endpoint-to-final plus the server counters from
-/metrics. Used to check that partial decodes never sit in front of a commit.
+/metrics.json. Used to check that partial decodes never sit in front of a commit.
 
     python3 bench_ws_realtime.py --url ws://127.0.0.1:8899/v1/realtime --wav a.wav --sessions 4 --rounds 3
 """
@@ -70,7 +70,7 @@ def pct(v, q):
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="ws://127.0.0.1:8899/v1/realtime")
-    ap.add_argument("--metrics", default="http://127.0.0.1:8899/metrics")
+    ap.add_argument("--metrics", default="http://127.0.0.1:8899/metrics.json")
     audio = ap.add_mutually_exclusive_group(required=True)
     audio.add_argument("--wav", help="replay the same WAV on all lanes")
     audio.add_argument("--wavs", nargs="+", help="provide one WAV per lane")
