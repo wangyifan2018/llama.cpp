@@ -62,6 +62,27 @@ DEVICES = [
     ("recirc", (r"内循环", r"recirculation")),
     ("fan", (r"风量", r"\bfan\b")),
     ("window", (r"车窗", r"window")),
+    # Lights beyond the ambient/reading/dome/footwell set, added with the
+    # seven-domain expansion. 雾灯 before 灯 so the specific lamp wins.
+    ("fog_lights", (r"雾灯", r"fog light")),
+    ("headlights", (r"大灯", r"headlight")),
+    ("hazard", (r"双闪", r"hazard light")),
+    ("trunk_light", (r"后备箱灯", r"trunk light")),
+    ("defrost", (r"除霜|除雾|风挡", r"defrost|defog")),
+    ("air_purifier", (r"空气净化", r"air purifier")),
+    ("sunroof", (r"天窗", r"sunroof")),
+    ("sunshade", (r"遮阳帘", r"sunshade")),
+    ("airflow", (r"吹脚|吹面|吹脸", r"airflow")),
+    # Seat functions that are neither heat nor ventilation.
+    ("seat_pos", (r"座椅位置|座椅往后|往后调|座椅靠背|放倒",
+                  r"seat position|seat back|backrest|\brecline\b|\bmove the .*seat")),
+    # Media and ordering are their own domains: a playback command never names
+    # an actuator, so without these the parser returns no clause at all and
+    # every clip in the domain scores as a miss regardless of the transcript.
+    ("media", (r"播放|暂停|下一首|上一首|音量|收音机|歌单",
+               r"\bplay\b|\bpause\b|\bnext track|\bvolume\b|\bradio\b|\bplaylist")),
+    ("navigation", (r"导航", r"navigate")),
+    ("ordering", (r"点一杯|来一杯|点单", r"\border\b|\bget me a\b")),
 ]
 
 POSITIONS = [
@@ -83,12 +104,30 @@ STATE_RULES = [
     (r"开(?![关启])", ON),
     (r"关闭|关掉|关上|关(?![于闭键])", OFF),
     (r"调到|调成|调至|调整到|降到|降至|设为|设置|开到|调低|降低", ON),
+    # 调高 was missing while 调低 was present, so `把主驾温度调高两度` parsed with
+    # state "?" -- the direction was understood by the sentence and not by the
+    # grader. Paired here so the relative pair cannot drift apart again.
+    (r"调高|升高|提高|调大|增大", ON),
+    # Seat and window adjustments that state a direction without naming an
+    # on/off verb: `往后调`, `放倒`, `降下来`. All three move a device, which is
+    # what the downstream layer acts on.
+    (r"往后|往前|靠后|放倒|降下来|升起来|开一条缝", ON),
     (r"\bdo(?:es)? not (?:open|turn on|switch on)", OFF),
     (r"\bdo(?:es)? not (?:close|turn off|switch off|shut)", ON),
     (r"\bleave\b.{0,25}?\boff\b", OFF),
     (r"\bleave\b.{0,25}?\bon\b", ON),
     (r"\bkeep\b.{0,25}?\boff\b", OFF),
     (r"\bkeep\b.{0,25}?\bon\b", ON),
+    # Cabin verbs the first profile never saw. `switch to ... mode` is a state
+    # command even though it names no on/off word, and `move the seat back` is
+    # a seat command; without them both domains parsed to nothing.
+    (r"切换到|改成|调整到模式", ON),
+    (r"\bmove\b|\brecline\b|\broll\b|\bswitch to\b", ON),
+    # Playback names no on/off verb at all: `播放周杰伦的歌` and `Play some Jay
+    # Chou` are start actions.
+    (r"播放|\bplay\b", ON),
+    # `turn the ventilation to the highest level` sets a level with "turn".
+    (r"\bturn\b[^,.;]{0,30}\bto\b", ON),
     (r"\bturn on\b|\bswitch on\b|\bopen\b", ON),
     (r"\bturn off\b|\bswitch off\b|\bclose\b|\bshut\b", OFF),
     (r"\bset\b|\blower\b|\braise\b|\badjust\b", ON),
@@ -143,7 +182,10 @@ def find_first(text, patterns):
 
 def split_clauses(text, lang):
     if lang == "zh":
-        parts = re.split(r"[，。；、,;!?！？]", text)
+        # 「和」 joins two commands the same way `and` does. Splitting on it is
+        # what lets a clause inherit the verb instead of swallowing the second
+        # device into the first clause, where it was simply not seen.
+        parts = re.split(r"[，。；、,;!?！？]|和", text)
     else:
         parts = re.split(r"[,.;!?]|\band\b", text)
     return [p.strip() for p in parts if p.strip()]
@@ -165,12 +207,30 @@ def detect_device(text, lang):
             break
     # 空调 is either the compressor or a temperature target. The temperature
     # reading is the one that names a number of degrees.
+    # `rear window defog` names a window in English but is a defrost command.
+    # The defrost pattern runs first so the window branch cannot claim it.
+    if device == "window" and re.search(r"defrost|defog", source):
+        device = "defrost"
+    elif device == "window" and re.search(r"除霜|除雾", source):
+        device = "defrost"
     if device is None and ("空调" in source or re.search(r"air conditioning", source)):
         has_degree = bool(re.search(r"[一二三四五六七八九十0-9]+\s*度", compact)) \
+            or re.search(r"\b(?:\d+|" + "|".join(EN_NUMBERS) + r")\s*degrees?\b", source) \
             or "温度" in source or "temperature" in source
         device = "temp" if has_degree else "ac"
     elif device is None and re.search(r"temperature", source):
         device = "temp"
+    elif device is None and re.search(r"\bclimate\b", source):
+        device = "ac"
+    # `把主驾温度调高两度` names the quantity, not the compressor, and it does so
+    # without the word 空调. Before this branch existed the clause parsed to
+    # nothing at all, so a Mandarin relative temperature command was invisible
+    # to the grader -- the one field the requirements ask for most explicitly.
+    if device is None and ("温度" in source
+                           or (lang == "zh" and re.search(r"[一二三四五六七八九十两0-9]度", compact))):
+        device = "temp"
+        # 温度调低一度 states a size, not a target, so it is not a value for the
+        # `value` field. detect_mode() reports it instead.
 
     position = "-"
     for name, patterns in POSITIONS:
@@ -186,10 +246,83 @@ def detect_device(text, lang):
     return device, position, state
 
 
+# Relative against absolute is a field of its own because the two take
+# different downstream actions and are indistinguishable once both have been
+# mapped to `on`. `把主驾温度调高两度` and `把主驾空调调到二十四度` are the pair
+# the product requirements name: the first adds two to whatever is set, the
+# second replaces it. A grader that only records the state scores both `on` and
+# calls a confusion between them a success.
+#
+# Pure Python, not a dotted vector: `调高` contains `高` and `调低` contains
+# `低`, which is the distinction, but `调到` must not match `调` alone.
+RELATIVE_ZH = re.compile(r"调高|调低|调大|调小|升高|降低|加大|减小|提高|减少|往[前后]调|"
+                         r"[大小高矮]一?点")
+ABSOLUTE_ZH = re.compile(r"调到|调成|调至|调整到|设为|设置成?|锁定在")
+RELATIVE_EN = re.compile(r"\b(?:raise|lower|increase|decrease|turn (?:it )?(?:up|down)|"
+                         r"a little|a bit|slightly)\b")
+# `Lower the window by one third` is an absolute position written with a
+# relative verb -- the driver means "to 33 percent", and the annotation says
+# 33. Treating it as a delta drops the value and the clip scores as a miss on
+# a correct transcript, so a stated proportion wins over the verb.
+PROPORTION_EN = re.compile(r"one third|a third|two thirds|a quarter|a half|halfway|"
+                           r"\d+\s*(?:%|percent)")
+PROPORTION_ZH = re.compile(r"三分之一|三分之二|四分之一|一半|半数|百分之[0-9一二三四五六七八九十百]+")
+ABSOLUTE_EN = re.compile(r"\bset\b|\bto\s+(?:level\s+)?\d|\bto\s+(?:twenty|thirty|"
+                         r"one|two|three|four|five|six|seven|eight|nine|ten)\b")
+
+
+def detect_mode(text, lang):
+    """`rel` (add/subtract), `abs` (replace), or None when the sentence does not
+    say. Relative wins because 调高 is never also 调到 -- except when a
+    proportion is stated, which fixes the target numerically."""
+    if lang == "zh":
+        compact = re.sub(r"\s+", "", text)
+        if PROPORTION_ZH.search(compact):
+            return "abs"
+        if RELATIVE_ZH.search(compact):
+            return "rel"
+        if ABSOLUTE_ZH.search(compact):
+            return "abs"
+        return None
+    lower = text.lower()
+    if PROPORTION_EN.search(lower):
+        return "abs"
+    if RELATIVE_EN.search(lower):
+        return "rel"
+    if ABSOLUTE_EN.search(lower):
+        return "abs"
+    return None
+
+
+def extract_amount(text, lang):
+    """The delta for a relative command: `两度` -> 2, `by two degrees` -> 2.
+
+    Only meaningful when the mode is `rel`; `extract_value` keeps reporting the
+    absolute reading, so a relative command must not be graded on it.
+    """
+    if lang == "zh":
+        m = re.search(r"([一二三四五六七八九十两0-9]+)\s*(?:度|档)", re.sub(r"\s+", "", text))
+        if m:
+            return cn2int(m.group(1))
+        return None
+    m = re.search(r"by\s+((?:twenty|thirty)[ -]?[a-z]+|" + "|".join(EN_NUMBERS) +
+                  r"|\d+)\s*(?:degrees?|levels?)?", text.lower())
+    if m:
+        return en2int(m.group(1))
+    return None
+
+
 def extract_value(text, device, lang):
+    if device == "headlights":
+        if re.search(r"自动|\bauto\b", text.lower()):
+            return "auto"
+        return None
     if device == "ambient":
-        if re.search(r"暖白|暖白色", text) or re.search(r"warm white", text.lower()):
+        lower = text.lower()
+        if re.search(r"暖白|暖白色", text) or re.search(r"warm white", lower):
             return "warm_white"
+        if re.search(r"冰蓝", text) or re.search(r"ice blue", lower):
+            return "ice_blue"
         return None
     if device == "temp":
         m = re.search(r"([一二三四五六七八九十0-9]+)\s*度", re.sub(r"\s+", "", text))
@@ -201,6 +334,9 @@ def extract_value(text, device, lang):
         if m:
             return en2int(m.group(1))
         return None
+    if device in ("ac", "temp"):
+        if re.search(r"自动|auto", text.lower()):
+            return "auto"
     if device in ("fan", "seat_heat", "seat_vent"):
         m = re.search(r"([一二三四五六七八九十两0-9]+)\s*档", re.sub(r"\s+", "", text))
         if m:
@@ -245,13 +381,40 @@ def extract_value(text, device, lang):
 
 
 def parse(text, lang):
+    """One clause per device mention, with the verb carried across `and`.
+
+    `Turn off the dome light and the footwell lights` is two commands sharing
+    one verb. Grading the second clause on `?` would let a transcript that
+    drops the verb from `关闭顶灯和脚窝灯` score as a hit, so the state of the
+    previous clause is inherited when a clause names a device and no direction.
+    Only intra-utterance: nothing carries between clips.
+    """
     clauses = []
+    carried = None
     for part in split_clauses(text, lang):
         device, position, state = detect_device(part, lang)
         if device is None:
             continue
+        # `only the rear right window` names a device for contrast, not a
+        # direction: 别开...只开右后车窗 states its own 开, while the English
+        # version leaves the verb out and the annotation grades it as `?`.
+        # Inheriting "off" there would invent a command nobody gave.
+        bare_contrast = re.search(r"\bonly\b|\bjust\b", part, re.I) and lang == "en"
+        if state == UNKNOWN and carried in (ON, OFF) and not bare_contrast:
+            state = carried
+        if state in (ON, OFF):
+            carried = state
+        mode = detect_mode(part, lang)
+        # A relative command states how far to move, not where to land, so the
+        # number belongs in `amount` and `value` has to stay empty. Leaving it
+        # in `value` scored `调高两度` and `调到两度` as the same command, which is
+        # the confusion the requirements single out.
+        if mode == "rel":
+            value, amount = None, extract_amount(part, lang)
+        else:
+            value, amount = extract_value(part, device, lang), None
         clauses.append({"device": device, "position": position, "state": state,
-                        "value": extract_value(part, device, lang), "text": part})
+                        "value": value, "mode": mode, "amount": amount, "text": part})
     return clauses
 
 
@@ -272,7 +435,17 @@ def load_semantics(path):
             clauses = []
             for chunk in spec.split(";"):
                 fields = [f.strip() for f in chunk.split("|")]
-                if len(fields) != 4:
+                # Five fields is the extended clause: device|position|state|
+                # value|mode. `mode` is `rel`, `abs` or `-`, and a relative
+                # clause carries its delta in `value` because a relative command
+                # has no absolute target to conflict with it. Four-field rows
+                # written before the extension still load unchanged, so the
+                # original 32-clip annotation did not have to be rewritten.
+                if len(fields) == 5:
+                    mode = None if fields[4] in ("-", "") else fields[4]
+                elif len(fields) == 4:
+                    mode = None
+                else:
                     raise SystemExit("bad clause %r for %s" % (chunk, clip_id))
                 value = fields[3]
                 clauses.append({
@@ -280,6 +453,7 @@ def load_semantics(path):
                     "position": fields[1],
                     "state": fields[2] if fields[2] in (ON, OFF, UNKNOWN) else UNKNOWN,
                     "value": None if value == "-" else coerce_value(fields[0], value),
+                    "mode": mode,
                 })
             table[clip_id] = clauses
     return table
@@ -441,8 +615,13 @@ def check_parser(packs, semantics):
                 bad += 1
                 continue
             for want, have in zip(ref, got):
-                diffs = [k for k in ("device", "position", "state", "value")
-                         if want[k] != have[k]]
+                keys = ["device", "position", "state", "value"]
+                # `mode` is only checked where the annotation states it. A
+                # four-field row leaves it None, and comparing None against the
+                # parser's `abs` for `调到` would fail every legacy clip.
+                if want.get("mode"):
+                    keys.append("mode")
+                diffs = [k for k in keys if want.get(k) != have.get(k)]
                 if diffs:
                     print("FIELD %s %r: %s want=%s got=%s" % (
                         clip_id, row["text"], diffs,

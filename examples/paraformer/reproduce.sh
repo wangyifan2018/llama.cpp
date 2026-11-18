@@ -13,14 +13,19 @@
 #   --strict   门槛从「实测值」收紧到「文档值」；默认已经是文档值
 #   --keep     保留中间 run 目录（默认保留在 $PF_RUN，本来就是保留的）
 #
-# 这是「拿到仓库的人能不能跑出这组数」的答案。门槛不是装饰：四个数字里
-# 任何一个掉出容差，脚本非零退出并指出是哪一条、掉了多少。
+# 这是「拿到仓库的人能不能跑出这组数」的答案。门槛不是装饰：任何一个数字
+# 掉出容差，脚本非零退出并指出是哪一条、掉了多少。
 #
-# 四个门槛（README.md 的 shipped profile 行）：
+# 五个门槛（README.md / PRODUCTION.md 的 shipped profile 行）：
 #   32 条 cabin command 字段   71.9%
 #   15 条混说 command 字段    100.0%
 #   中文 CER                    0.60%
 #   听写英文 WER                6.87%
+#   84 条扩展域 command 字段   91.7%   （夹具存在时才跑，见下面 have_exp）
+#
+# 前四个的分母是「窗、温度、座椅加热、氛围灯」这四类，第五个是雾灯/除霜/
+# 空调模式/座椅/天窗/导航/点单/多媒体。分开设门槛的理由写在 GATE_CABIN_EXP 的
+# 注释里：混在一起会让 71.9% 这个数失去含义。
 #
 # 为什么必须重算而不是比对存档：存档在作者机器上。夹具由 macOS `say` 渲染，
 # 同一句文本在别的 TTS 上不是同一段音频，所以本脚本的门槛是「这一步产出的
@@ -46,6 +51,13 @@ GATE_CABIN=${GATE_CABIN:-71.9}
 GATE_MIXED=${GATE_MIXED:-100.0}
 GATE_ZH_CER=${GATE_ZH_CER:-0.60}
 GATE_EN_WER=${GATE_EN_WER:-6.87}
+# 七个新增域（雾灯/除霜/空调模式/座椅/天窗/导航/点单/多媒体）84 条夹具的
+# command 字段门槛。这组夹具覆盖的是「产品要的车控」，而 32 条那组只有窗、温度、
+# 座椅加热和氛围灯。两者分开设门槛，因为分母不同、难度不同：84 条里有专有名词
+# （瑞幸、王府井、天安门）这些热词接不住的样本，混进 32 条那组的百分比里只会
+# 让 71.9% 这个数变得没有含义。
+GATE_CABIN_EXP=${GATE_CABIN_EXP:-91.7}
+BASE_CABIN_EXP=${BASE_CABIN_EXP:-72.6}
 TOL=${TOL:-0.05}          # 绝对百分点；0.05 只吸收打印精度
 
 # 基线臂（无热词）在这些数上，用来区分「profile 退化」和「夹具坏了」。
@@ -86,7 +98,9 @@ do_check() {
     for f in "$HOTWORDS" "$HERE/tools/model_manifest.txt" \
              "$HERE/tools/fetch_models.py" "$HERE/tools/cabin_commands.tsv" \
              "$HERE/tools/cabin_mixed.tsv" "$HERE/tools/eval_mixed.py" \
-             "$HERE/tools/gen_voice_fixtures.py"; do
+             "$HERE/tools/gen_voice_fixtures.py" \
+             "$HERE/tools/cabin_expanded.tsv" "$HERE/tools/vehicle_semantics_expanded.tsv" \
+             "$HERE/tools/check_vocab_coverage.py"; do
         [ -f "$f" ] && note "ok      $(basename "$f")" || { note "MISSING $f"; bad=1; }
     done
 
@@ -121,6 +135,13 @@ do_check() {
         note "ok      mixed fixtures at $PF_RUN/mixed-tingting"
     else
         note "MISSING mixed fixtures (run: ./reproduce.sh fixtures)"
+    fi
+    # 扩展域夹具由 cabin_expanded.tsv 渲染，渲染需要 macOS say，所以这里只报
+    # 有没有，不因此判失败：缺了它第五个门槛跳过，前四个照样跑完。
+    if [ -f "$PF_RUN/cabin-expanded/manifest.tsv" ]; then
+        note "ok      expanded-domain fixtures at $PF_RUN/cabin-expanded"
+    else
+        note "MISSING expanded-domain fixtures (5th gate will be skipped)"
     fi
 
     if command -v say >/dev/null 2>&1; then
@@ -179,10 +200,21 @@ do_fixtures() {
         "$PYTHON" "$HERE/tools/gen_voice_fixtures.py" --voice Tingting \
             --manifest "$HERE/tools/cabin_mixed.tsv" --out "$PF_RUN/mixed-tingting" >/dev/null
     fi
+
+    # 84 条扩展域。夹具名必须带 .wav：generator 用 id 列做文件名，缺后缀
+    # 就渲染出一堆没有扩展名的文件，而 CLI 的 glob 只收 *.wav，于是 84 条
+    # 全部"存在但没跑"，门禁读到空文件才报错。这个坑踩过一次。
+    if [ -f "$PF_RUN/cabin-expanded/lt2_zh01.wav" ]; then
+        note "reuse $PF_RUN/cabin-expanded"
+    else
+        note "render 84 expanded-domain clips with Tingting"
+        "$PYTHON" "$HERE/tools/gen_voice_fixtures.py" --voice Tingting \
+            --manifest "$HERE/tools/cabin_expanded.tsv" --out "$PF_RUN/cabin-expanded" >/dev/null
+    fi
 }
 
 # ---------------------------------------------------------------- eval
-# 一次 CLI 调用产出一个 tsv，两份 tsv 喂给打分工具有四个数。
+# 一次 CLI 调用产出一个 tsv，两份 tsv 喂给打分工具有五个数。
 # 打分逻辑不在这里重写：eval_vehicle.py 是 x-asr 和 paraformer 共用的解析器，
 # 复制一份就会漂移，两个引擎的数字就不再可比。
 do_eval() {
@@ -215,6 +247,28 @@ do_eval() {
     "$BIN" "$ZH_MODEL" "$PF_RUN"/mixed-tingting/*.wav --quiet --threads "$THREADS" \
         --hotwords "$HOTWORDS" >"$mixed_hot" 2>"$PF_RUN/mixed-hot.err"
 
+    # 扩展域 84 条。第 5 个门禁，独立分母，只在夹具存在时跑：它不是所有
+    # 移植都能复现的（需要同一套 TTS 渲染 + 同一棵中文权重），但一旦存在就
+    # 必须过，否则新增的七个域退回「没人测过」的状态。
+    local exp_base=$PF_RUN/cabin-expanded-base.tsv
+    local exp_hot=$PF_RUN/cabin-expanded-hot.tsv
+    local exp_dir=$PF_RUN/cabin-expanded
+    local have_exp=0
+    if [ -f "$exp_dir/manifest.tsv" ]; then
+        have_exp=1
+        note "transcribe 84 expanded-domain clips, no profile"
+        "$BIN" "$ZH_MODEL" "$exp_dir"/*.wav --quiet --threads "$THREADS" \
+            >"$exp_base" 2>"$PF_RUN/cabin-expanded-base.err"
+        note "transcribe 84 expanded-domain clips, shipped profile"
+        "$BIN" "$ZH_MODEL" "$exp_dir"/*.wav --quiet --threads "$THREADS" \
+            --hotwords "$HOTWORDS" >"$exp_hot" 2>"$PF_RUN/cabin-expanded-hot.err"
+        for f in "$exp_base" "$exp_hot"; do
+            [ -s "$f" ] || die "empty transcript file: $f"
+        done
+    else
+        note "skip 84 expanded-domain clips (no $exp_dir/manifest.tsv)"
+    fi
+
     for f in "$cabin_base" "$cabin_hot" "$mixed_base" "$mixed_hot"; do
         [ -s "$f" ] || die "empty transcript file: $f"
     done
@@ -232,6 +286,17 @@ do_eval() {
     "$PYTHON" "$HERE/tools/eval_mixed.py" \
         --run base="$mixed_base" --run hot="$mixed_hot" >"$PF_RUN/mixed-grade.txt"
     grep -E '^(base|hot)[[:space:]]' "$PF_RUN/mixed-grade.txt" | sed 's/^/  /' || true
+
+    # --- 扩展域：同一个解析器，另一份标注，另一份夹具
+    local exp_json=$PF_RUN/cabin-expanded-grade.json
+    if [ "$have_exp" = 1 ]; then
+        "$PYTHON" "$HERE/../x-asr/tools/eval_vehicle.py" \
+            --semantics "$HERE/tools/vehicle_semantics_expanded.tsv" \
+            --pack cabin-expanded="$exp_dir/manifest.tsv" \
+            --run base="$exp_base" --run hot="$exp_hot" \
+            --json "$exp_json" >"$PF_RUN/cabin-expanded-grade.txt"
+        grep -E '^(base|hot)[[:space:]]' "$PF_RUN/cabin-expanded-grade.txt" | sed 's/^/  /' || true
+    fi
 
     # 从 JSON 取数，不从人读的表格里 grep：表格列宽变了 grep 会静默取错列。
     # 混说那边 eval_mixed.py 只打印 n/d，所以按分数重算，不解析百分数字符串。
@@ -261,6 +326,18 @@ PY
     mixed_base_pct=$(sed -n 2p <<<"$got")
     [ -n "$mixed_hot_pct" ] && [ -n "$mixed_base_pct" ] || die "could not parse mixed rates from $PF_RUN/mixed-grade.txt"
 
+    local exp_hot_cabin=- exp_base_cabin=-
+    if [ "$have_exp" = 1 ]; then
+        read -r exp_hot_cabin exp_base_cabin < <("$PYTHON" - "$exp_json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+hot, base = d["arms"]["hot"]["cabin-expanded"], d["arms"]["base"]["cabin-expanded"]
+print("%.2f %.2f" % (100.0 * hot["command_ok"] / hot["command_clips"],
+                     100.0 * base["command_ok"] / base["command_clips"]))
+PY
+)
+    fi
+
     info ""
     info "  metric                          shipped    gate    baseline"
     info "  ------------------------------------------------------------------"
@@ -268,6 +345,9 @@ PY
     printf '  %-30s %7s%% %7s%% %10s%%\n' "15-clip mixed command"  "$mixed_hot_pct" "$GATE_MIXED" "$mixed_base_pct"
     printf '  %-30s %7s%% %7s%% %10s%%\n' "Mandarin CER"           "$hot_zh" "$GATE_ZH_CER" "$base_zh"
     printf '  %-30s %7s%% %7s%% %10s\n'  "English WER"            "$hot_en" "$GATE_EN_WER" "-"
+    if [ "$have_exp" = 1 ]; then
+        printf '  %-30s %7s%% %7s%% %10s%%\n' "84-clip expanded command" "$exp_hot_cabin" "$GATE_CABIN_EXP" "$exp_base_cabin"
+    fi
 
     local fail=0
     ge "$hot_cabin"      "$GATE_CABIN"  "$TOL" || { note "cabin command REGRESSED";      fail=1; }
@@ -277,6 +357,10 @@ PY
         "$hot_zh" "$GATE_ZH_CER" "$TOL" || { note "Mandarin CER REGRESSED"; fail=1; }
     "$PYTHON" -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= float(sys.argv[2]) + float(sys.argv[3]) else 1)' \
         "$hot_en" "$GATE_EN_WER" "$TOL" || { note "English WER REGRESSED"; fail=1; }
+    if [ "$have_exp" = 1 ]; then
+        ge "$exp_hot_cabin" "$GATE_CABIN_EXP" "$TOL" \
+            || { note "expanded-domain command REGRESSED"; fail=1; }
+    fi
 
     # 两臂一起掉 = 夹具不同源，不是 profile 退化。分开报，否则下一个人会去调热词。
     if ! ge "$base_cabin" "$BASE_CABIN" 1.0 && ! ge "$hot_cabin" "$GATE_CABIN" "$TOL"; then

@@ -372,7 +372,37 @@ The §13-14 profile scores *below* no hotwords on mixed speech: its global `1.5 
 
 The §15 retune initially dropped the two noun rewrites (`footwall`, `likes`) that `hotwords_vehicle_replace.txt` had carried, on the reasoning that they belonged to the deprecated file. They do not carry the poisoned `two` rule, and restoring them is worth 6.3 points of cabin command and 1.5 points of en WER with mixed command and Mandarin unchanged. The lesson is about the file, not the rules: deprecating a profile should move its good rules out, not discard them with the bad one. See design doc §32.
 
-Accuracy is settled at mixed command 100%, Mandarin CER 0.60% and dictation English 6.87%. The remaining six English errors are missing word forms (`heater`, `massage`, `vents`) and multi-token clumps (`driversee peater`) that no logit bias can reach: `R` can rewrite an observed span but not one the model never emitted.
+### Seven more cabin domains (§33)
+
+The profile above was tuned on 32 clips of windows, temperature, seat heat and ambient light. Everything else a car exposes was absent from that set, so it had never been measured. 84 new clips across seven domains (`tools/cabin_expanded.tsv`, graded by `tools/vehicle_semantics_expanded.tsv`) put the no-profile baseline at **72.6%** and the shipped profile at **91.7%** command:
+
+| Arm | 84-clip command | device | state | Mandarin CER | English WER |
+|---|---:|---:|---:|---:|---:|
+| Q8_0, no hotwords | 72.6% | 76.7% | 73.3% | 0.96% | 31.72% |
+| Q8_0, shipped profile | **91.7%** | **91.9%** | **91.9%** | **0.00%** | **16.74%** |
+
+`wrong=0` in both arms: no clip in the expanded set reversed an on/off direction with the profile on. The 32-clip and mixed arms are unchanged at 71.9% / 100.0% / 0.60% / 6.87%, so this block is additive.
+
+Every English gain is a span rewrite and the reason is the same one §15 found: the wrong sequence has a different length from the right one, so no gain can reach it. Two things about *shape* decide whether such a rule fires at all, and both were wrong on the first attempt:
+
+- **The last piece must not carry `@@`.** A piece without `@@` ends a word, so `R 99.0 re@@+r => re@@+ar@@` renders `rearfot lights`. The same rule on the *wrong* side matters as much: a span written `t+al` does not match a model that emitted `t@@ al`, so the rule silently never fires while `PF_REPLACE_LOG` reports a deficit of 8.89 — which reads like a model limitation and is not. Correcting the span moved `footwell` from 8.89 to **1.41**.
+- **The margin must be the measured deficit, not a guess.** Five rules failed on the first pass purely because the margin sat below the deficit: `backrest` measured 7.84 against a margin of 3.5.
+
+`tools/check_vocab_coverage.py` now derives covers under the first rule, so a replacement span is generated rather than guessed. It also distinguishes `split` from `missing`: a word can be spoken for character by character and still have no contiguous cover.
+
+### What a hotword cannot fix
+
+Thirteen of the 84 clips stay wrong and the group is homogeneous — proper nouns the acoustic model has never seen. `Luckin`, `Wangfujing`, `Tiananmen`, `Hongqiao`, `Americano` and `Jay Chou` are all spellable (3-7 pieces each, verified) but decode as `locking`, `one fuging`, `shinnamon`, `hunkill`, `emy cananel` and `j true`. Their deficits measure 9-11, and a margin that high rewrites unrelated sentences. These need a retrained model or a downstream name matcher.
+
+One case is a vocabulary boundary rather than an acoustic one: `air purifier` decodes as `airpurifier`, and `air` has no standalone form in this vocabulary — only `air@@`, which continues a word. Two words cannot be rendered where the model produced one, so every rewrite candidate ends up joined. Saying `air filter` fixes it; a hotword cannot.
+
+### Why the grader grew a `mode` field
+
+The requirements single out `调高/调低` (relative) against `调到` (absolute), and the grader could not see the difference: both mapped to `state=on`. Worse, `把主驾温度调高两度` parsed to *nothing at all* because `温度` alone did not name a device, while `Raise the driver temperature by two degrees` parsed its delta as an absolute temperature of 2°C. A grader that scores a relative command as an absolute one cannot report on the field the product cares about most, so `mode` (`rel`/`abs`) was added as a fifth clause field, with the delta kept out of `value`. Four-field rows from the original annotation still load, which is why the 32-clip arm is bit-identical. The parser self-check (`--check`) is what caught this: 27 rows disagreed with their annotation before the fix, 0 after.
+
+Two defects behind that number were in the parser, not the annotation, and both had been hiding correct transcripts: `调高` was missing from `STATE_RULES` while `调低` was present, and 「和」 was not a clause separator, so `关掉顶灯和脚窝灯` only ever saw one device.
+
+Accuracy is settled at mixed command 100%, Mandarin CER 0.60% and dictation English 6.87% on the original 32-clip set, and at 91.7% command on the 84-clip seven-domain set. The remaining six English errors on the first set are missing word forms (`heater`, `massage`, `vents`) and multi-token clumps (`driversee peater`) that no logit bias can reach: `R` can rewrite an observed span but not one the model never emitted. §33 later showed that `heater` and `massage` *are* reachable once the span is written with the right word-boundary markers, so "no bias can reach it" has to be re-checked against `PF_DUMP_TOKENS` before it is written down.
 
 On HTP the first and second voice sets got 37/42 and 20/42 device-position clauses, and 18/18 and 5/18 value clauses. Negation and exclusion cases scored 3/4, 1/4 and 2/3 across the two voice sets and the confusable pack. The second voice exposes a release blocker even for the upstream model. Keep the existing profile as a regression arm and avoid deriving new substitutions from the holdout run.
 

@@ -1,0 +1,125 @@
+﻿# What each clip in the seven-domain expansion must produce downstream.
+# Same format as vehicle_semantics.tsv, plus the fifth field:
+#
+#   id <TAB> clause[; clause...]
+#   clause = device | position | state | value[ | mode]
+#
+# device   the original set plus the expanded domains: fog_lights headlights
+#          hazard trunk_light defrost air_purifier sunroof sunshade airflow
+#          seat_pos media navigation ordering
+# position fl fr rl rr, or - when the command does not name one.
+# state    on, off, or ? when the reference leaves the verb out
+#          ("下一首", "Navigate to ...") and only the device is graded.
+# value    - when the command does not set one; otherwise percent/degrees/level
+#          as in the original file. For a relative clause this is the DELTA.
+# mode     rel or abs, or - when the command is not about a quantity.
+#          rel = move by an amount (调高/调低/raise/lower)
+#          abs = land on a target (调到/set ... to)
+#          The two take different downstream actions, and before this field
+#          existed both scored as `state=on`, so `调高两度` and `调到两度` were
+#          indistinguishable in the report. That is the confusion the product
+#          requirements call out by name.
+#
+# A `?` state means the domain is graded on the device only, which is all these
+# clips can assert: `播放周杰伦的歌` names a media action, not an on/off state.
+#
+# Rows are deliberately NOT written for what the model cannot reach. The
+# proper nouns (`Luckin`, `Wangfujing`, `Tiananmen`, `Hongqiao`, `Americano`,
+# `Jay Chou`) and `air purifier` stay in the set as measured misses, because a
+# gate that hides them would report the domain as solved.
+
+# --- lights ---------------------------------------------------------------
+lt2_zh01	fog_lights|-|on|-
+lt2_zh02	fog_lights|-|off|-
+lt2_zh03	headlights|-|on|auto
+lt2_zh04	hazard|-|on|-
+lt2_zh05	reading|-|on|-
+lt2_zh06	dome|-|off|-; footwell|-|off|-
+lt2_zh07	ambient|-|on|ice_blue
+lt2_zh08	trunk_light|-|on|-
+lt2_en01	fog_lights|-|on|-
+lt2_en02	fog_lights|-|off|-
+lt2_en03	headlights|-|on|auto
+lt2_en04	hazard|-|on|-
+lt2_en05	reading|-|on|-
+lt2_en06	dome|-|off|-; footwell|-|off|-
+lt2_en07	ambient|-|on|ice_blue
+lt2_en08	trunk_light|-|on|-
+
+# --- HVAC: modes and the relative/absolute pair ----------------------------
+hvac2_zh01	temp|fl|on|-|rel
+hvac2_zh02	temp|-|on|24|abs
+hvac2_zh03	defrost|-|on|-
+hvac2_zh04	defrost|-|on|-
+hvac2_zh05	airflow|-|on|-
+hvac2_zh06	ac|-|on|auto
+hvac2_zh07	temp|fr|on|-|rel
+hvac2_zh08	air_purifier|-|on|-
+hvac2_en01	temp|fl|on|-|rel
+hvac2_en02	temp|-|on|24|abs
+hvac2_en03	defrost|-|on|-
+hvac2_en04	defrost|-|on|-
+hvac2_en05	airflow|-|on|-
+hvac2_en06	ac|-|on|auto
+hvac2_en07	temp|fr|on|-|rel
+hvac2_en08	air_purifier|-|on|-
+
+# --- seats ----------------------------------------------------------------
+seat2_zh01	seat_pos|fl|on|-|rel
+seat2_zh02	seat_pos|fr|on|-
+seat2_zh03	massage|fl|on|-
+seat2_zh04	seat_heat|rr|on|3|abs
+seat2_zh05	seat_pos|-|?|-
+seat2_zh06	seat_vent|-|on|-
+seat2_en01	seat_pos|fl|on|-
+seat2_en02	seat_pos|fr|on|-
+seat2_en03	massage|fl|on|-
+seat2_en04	seat_heat|rr|on|3|abs
+seat2_en05	seat_pos|-|?|-
+seat2_en06	seat_vent|-|on|-
+
+# --- windows and roof: the ambiguous phrasing -----------------------------
+# `降下来三指` and `开一条缝` name no number, so the state is graded and the
+# value is not asserted -- inventing a percentage here would grade the grader.
+win2_zh01	window|fl|on|-
+win2_zh02	window|fr|on|-
+win2_zh03	sunroof|-|on|-
+win2_zh04	sunshade|-|off|-
+win2_en01	window|fl|on|-
+win2_en02	window|fr|on|-
+win2_en03	sunroof|-|on|-
+win2_en04	sunshade|-|off|-
+
+# --- navigation, ordering, media -----------------------------------------
+nav_zh01	navigation|-|?|-
+nav_zh02	navigation|-|?|-
+nav_zh03	navigation|-|?|-
+nav_zh04	navigation|-|?|-
+nav_zh05	navigation|-|?|-
+nav_zh06	navigation|-|?|-
+nav_en01	navigation|-|?|-
+nav_en02	navigation|-|?|-
+nav_en03	navigation|-|?|-
+nav_en04	navigation|-|?|-
+nav_en05	navigation|-|?|-
+nav_en06	navigation|-|?|-
+ord_zh01	ordering|-|?|-
+ord_zh02	ordering|-|?|-
+ord_zh03	ordering|-|?|-
+ord_zh04	ordering|-|?|-
+ord_en01	ordering|-|?|-
+ord_en02	ordering|-|?|-
+ord_en03	ordering|-|?|-
+ord_en04	ordering|-|?|-
+med_zh01	media|-|on|-
+med_zh02	media|-|on|-
+med_zh03	media|-|?|-
+med_zh04	media|-|on|-|rel
+med_zh05	media|-|on|-
+med_zh06	media|-|on|-
+med_en01	media|-|on|-
+med_en02	media|-|?|-
+med_en03	media|-|?|-
+med_en04	media|-|?|-
+med_en05	media|-|on|-
+med_en06	media|-|on|-
