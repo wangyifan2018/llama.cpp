@@ -18,13 +18,15 @@
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| GET | `/health` | 探活 + 能力：`engines, queue, speaker_gate, server_vad, partials, model` |
+| GET | `/health` | 探活、能力和预热图的后端落点。`backends` 包含各引擎请求与实际设备、`flash_attn` 和两阶段计算节点数 |
 | GET | `/v1/models` | OpenAI 形状的模型列表 + `capabilities` |
 | GET | `/metrics` | 计数：`requests, rejected, failed, partials, partials_skipped, queue, engines` |
 | POST | `/v1/audio/transcriptions` | OpenAI 兼容转写（multipart/form-data） |
 | POST | `/asr/segment` | 设备端低开销转写（body 直接是 float32 PCM） |
 | WS | `/v1/realtime` | 实时：append / commit / clear，返回 partial 与最终结果 |
 | GET | `/` | 浏览器测试台（`--web-dir` 存在时） |
+
+显式指定的加速后端不可用时，服务默认启动失败。`--allow-cpu-fallback` 允许启动时改用 CPU，此时 `/health` 返回 HTTP 200 和 `status: degraded`，`/metrics` 返回 `cpu_fallback: true`。正常启动的状态为 `ok`。
 
 ## 3. POST /v1/audio/transcriptions
 
@@ -59,18 +61,23 @@
 }
 ```
 
-`speaker_score`/`speaker_ok` 仅在服务端开启声纹门控时出现（见 §7）。
+声纹评分完成时才会返回 `speaker_score` 和 `speaker_ok`，具体状态见第 7 节。
+
+`words` 的开始和结束用秒表示，由 CIF 锚点推导。热词改写增减 token 时保留原时间区间，后续词保留原时间。
 
 ### 3.1 响应头（所有格式）
 
 | 头 | 含义 |
 |---|---|
-| `X-Queue-Ms` | 请求在服务端队列里等待的时间（VAD 分段时为 0） |
+| `X-Queue-Ms` | 完整请求进入服务端队列后到 worker 开始处理的时间 |
 | `X-Infer-Ms` | 推理耗时（VAD 分段时为各段之和） |
-| `X-Language` | 检测到的语言：`zh` / `en` / `mixed` |
-| `X-Vad-Pieces` | 本请求实际送进 ASR 的段数（1 表示未拆分） |
+| `X-Vad-Ms` | 能量检查、VAD 和分段规划耗时 |
+| `X-Language` | 检测到的语言为 `zh`、`en` 或 `mixed`，空转写为 `und` |
+| `X-Vad-Pieces` | 本请求实际送进 ASR 的段数。长音频裁剪为一段时也为 1 |
+| `X-ASR-Backend` | 实际处理这次请求的 ASR 引擎 |
 | `X-Empty` | 值为 `silence` 时表示判定为静音、直接返回空文本 |
 | `X-Speaker-Score` / `X-Speaker-Ok` | 声纹相似度与是否通过阈值（开启门控时） |
+| `X-Speaker-Status` / `X-Speaker-Reason` | 评分状态及未评估原因，适用于两个 POST 接口 |
 
 ## 4. POST /asr/segment
 
@@ -81,6 +88,8 @@
 ```
 
 可选 query：`format=json|text`。适合设备内部调用（省掉 WAV 封装）。
+
+两种 POST 接口和 WebSocket 的单段音频上限为 30 秒。HTTP 请求体上限为 2 MiB。原始 PCM 样本必须是有限值。
 
 ## 5. WS /v1/realtime
 
@@ -93,6 +102,10 @@
 | `{"type":"input_audio_buffer.commit"}` | `input_audio_buffer.committed` → `...transcription.completed`（含 `speaker_score`）+ `x.pf.metrics` |
 | `{"type":"input_audio_buffer.clear"}` | `input_audio_buffer.cleared` |
 | 出错 | `{"type":"error","error":{...}}` |
+
+每个已接收的 commit 有独立的 `item_id`，连接存续时会收到对应的最终结果或带同一 `item_id` 的错误。允许连续提交，调用方按 `item_id` 匹配结果。`clear` 丢弃尚未提交的音频和预览。队列满时服务端返回错误，保留尚未接收的音频供客户端重试。
+
+最终事件附带 `vad_pieces`，静音时附带 `empty: silence`。`x.pf.metrics` 里的 `vad_ms`、`queue_ms`、`infer_ms` 和 `backend` 与 HTTP 响应头口径一致。
 
 ```json
 // completed
@@ -116,44 +129,28 @@ partial 的节流：新增音频 ≥ `--partial-ms`（默认 800 ms）且距上�
 | 状态 | 场景 |
 |---|---|
 | 400 | 缺 `file`、非 WAV、采样率/声道/位深不符、`response_format` 不支持 |
-| 429 | 队列满（`--queue`） |
+| 429 | 排队请求数或 PCM 缓冲区超过 `--queue` 或 `--queue-mib` |
 | 500 | 推理失败 |
 | 503 | 排队超时（`--timeout-ms`） |
+| 504 | 从提交最终请求起超过 `--deadline-ms`，`error.code` 为 `deadline_exceeded` |
+
+服务最多接受四个活跃 WS 会话，每个会话最多有四条等待终态的 COMMIT。第五个会话在升级后收到关闭码 1008。单条 COMMIT 超过截止时间时，服务用同一 `item_id` 发送一次 `error`。`/metrics` 提供 `ws_sessions`、`inflight`、`queue_bytes`、`queue_bytes_limit` 和 `deadline_expired`。
 
 ## 7. 说话人门控（可选）
 
-**默认关闭**：只有同时给出 `--speaker-model` 和 `--enroll-dir` 才启用（二进制需以
-`-DXASR_SPEAKER=ON` 构建；否则该参数被忽略）。`/health` 的 `speaker_gate` 字段反映实际状态。
+评分默认关闭。启用时需要 `-DXASR_SPEAKER=ON`，同时提供 `--speaker-model` 和 `--enroll-dir`。请求启用但模型或注册目录不可用时，服务启动失败。注册目录存放司机的 16 kHz WAV，服务在启动时建立质心声纹。`/health` 的 `speaker_gate` 表示评分是否启用。
 
-- 注册：`--enroll-dir` 目录下若干条司机 16 kHz WAV，启动时算质心声纹并打印平均自相似度；
-- 判定：每次 commit 把该段与声纹做余弦，CPU 上与 HTP 的 ASR **并行**；
-- 阈值：`--speaker-threshold`（默认 0.55）；
-- 输出：`X-Speaker-Score`/`X-Speaker-Ok`、`verbose_json` 与 WS completed 事件里的同名字段；
-- **只上报、不拦截**：拒绝与否由调用方（语义层）决定。
+评分使用一个独立 CPU 线程，最多处理一个声纹任务。ASR 有排队或运行中的请求时，后来的请求跳过评分。评分只复制音频前 `--speaker-max-s` 秒，默认 1.5 秒。ASR 完成时立即读取已就绪的评分。阈值 `--speaker-threshold` 默认为 0.55，由调用方根据业务条件决定如何使用结果。
 
-真机参考值（TTS 音色，仅作量级参考）：司机 0.921、乘客 0.363、注册自相似度 0.904。
+REST 响应头为 `X-Speaker-Status` 和 `X-Speaker-Reason`。`verbose_json`、原始 PCM JSON、WS 最终事件分别以 `speaker_status` 和 `speaker_reason` 返回同样的状态。`speaker_score` 和 `speaker_ok` 仅在 `assessed` 时返回，此时 `speaker_ok: false` 表示完成了评分且低于阈值。
 
-**开销（实测，同一二进制只改开关）**：
+| 状态 | 原因 |
+|---|---|
+| `disabled` | 功能关闭 |
+| `assessed` | 评分已完成 |
+| `not_assessed` | `busy`、`in_progress`、`no_audio_in_prefix`、`no_embedding` 或 `silence` |
 
-| 配置 | wall p50 | wall p95 |
-|---|---:|---:|
-| 关闭门控，1 路 | 344 ms | 369 ms |
-| 开门控，1 路 | 342 ms | **369 ms** |
-| 关闭门控，2 路 | 340 ms | 360 ms |
-| 开门控，2 路（初版） | 347 ms | 421 ms |
-| 开门控，2 路（best-effort） | 352 ms | 392 ms |
-| **开门控，2 路（best-effort + 1.5 s 裁剪，当前默认）** | **347 ms** | **377 ms** |
-| 开门控，1 路（1.5 s 裁剪） | 337 ms | 363 ms |
-
-门控是 **best-effort** 的：只要队列里有等待请求、或已有任务在跑，本次就不算声纹
-（响应头出现 `X-Speaker-Deferred: 1`，`/metrics` 的 `speaker_deferred` 计数），
-并且只对**前 `--speaker-max-s`（默认 2 s）**做 embedding，长 commit 不会线性变贵。
-
-结论：**1 路免费（甚至略低于基线），2 路 p95 只多 17 ms**（基线 360 ms）。两处优化：把 embedding
-输入裁到**前 1.5 s**（`--speaker-max-s`，默认 1.5）在压测集上**同时提高了余量**（0.252 -> 0.340，
-尾部静音不再进统计池化），且成本从约 110 ms 降到约 80 ms。
-
-若要彻底零代价，可以改成"先出文本、再用 `x.pf.speaker` 事件补分数"（需要调用方接受两条消息）。
+`X-Speaker-Deferred: 1` 保留给跳过的非静音评分。`/metrics` 里的 `speaker_started`、`speaker_assessed` 和 `speaker_deferred` 分别统计提交给评分线程、有结果、未取得结果的请求。真机对照与数据边界见 [生产化记录](../../../examples/paraformer/PRODUCTION.md)。
 
 ## 8. 服务端 VAD（可选）
 
@@ -163,7 +160,7 @@ partial 的节流：新增音频 ≥ `--partial-ms`（默认 800 ms）且距上�
 | 参数 | 默认 | 作用 |
 |---|---:|---|
 | `--vad-split-s` | 18 | 只有超过该长度的 commit 才可能被拆分；正常短句**原样送 ASR** |
-| `--vad-piece-s` | 15 | 拆分后每段的上限；连续语音段会被合并成整块，避免每遇逗号就切 |
+| `--vad-piece-s` | 15 | 合并相邻语音区间的目标长度。连续长语音交给模型内部分窗 |
 | `--vad-threshold` | 0.5 | silero 语音概率阈值 |
 | `--vad-min-silence` | 0.15 s | 判定段结束所需静音（比常见 0.3–0.5 s 更短，适配短命令） |
 | `--vad-min-speech` | 0.20 s | 最短语音段，低于则丢弃该段 |
@@ -171,10 +168,12 @@ partial 的节流：新增音频 ≥ `--partial-ms`（默认 800 ms）且距上�
 
 行为：
 
-1. 正常 commit（≤ `--vad-split-s`）→ 1 段，音频不改动，只多花约 15–25 ms 的 VAD 检测；
-2. 超长 commit → 按语音段**合并**成 ≤ `--vad-piece-s` 的块，逐块识别后拼接；
-3. 纯静音 → `X-Empty: silence`、空文本（实测未开启时模型会输出"嗯没有没有没有"这类幻觉）；
-4. VAD 检测不到语音但能量不低（如轻声）→ 仍然整段送 ASR，不丢音频。
+1. 普通短句原样送入 ASR。能量低于 `--silence-rms` 时，才额外用 VAD 确认是否存在语音。
+2. 长段按 VAD 语音区间合并，最多保留 100 ms 不重叠的边界上下文。即便只得到一段，也按实际区间裁剪。REST 的词级时间加回分段偏移，保持整段音频的时间基准。
+3. 全零 PCM 直接返回空文本。开启 VAD 时，低能量且无语音也返回空文本。HTTP 保留请求的响应格式，WS 仍返回正式完成事件。
+4. 能量高于阈值且 VAD 没找到语音时，整段交由 ASR 处理。
+
+WAV、原始 PCM 和 WS 的最终转写共用上述流程。一个请求占用一个引擎，直至它的所有片段完成或连接取消。帧协议压测工具单独运行模型内分窗。
 
 ## 9. 示例
 
@@ -209,7 +208,7 @@ asyncio.run(main())
 
 ## 10. 验收脚本
 
-部署后一条命令自检（18 项，全部 PASS 才算通过）：
+部署后运行自检，检查项随启用的能力变化。
 
 ```sh
 python3 examples/paraformer/tools/smoke_production.py --port 8899 \
@@ -219,9 +218,9 @@ python3 examples/paraformer/tools/smoke_production.py --port 8899 \
 
 覆盖：`/health` 能力位、`/v1/models`、四种 `response_format`、`punctuate`、响应头
 （语言/排队/推理/门控）、400 错误（不支持的格式、缺 file）、`/asr/segment`、静音返回空文本、
-WS 单路与四路并发（含一致性）、`/metrics`。退出码 0 表示全部通过。
+WS 单路与四路并发（含一致性）、空提交、连续提交后清空、非有限 PCM、超长音频和 `/metrics`。退出码 0 表示本次启用的检查全部通过。
 
-真机参考输出（SM6650，门控 + VAD 都开）：18 项 PASS，json 355 ms、WS 单路 331 ms、
+最初的真机参考输出（SM6650，门控 + VAD 都开）：18 项 PASS，json 355 ms、WS 单路 331 ms、
 四路并发 max 808 ms 且转写一致。
 
 ## 11. 客户端集成要点

@@ -140,6 +140,8 @@ Q5_K/Q6_K use the same tool. See design doc section 24.
 
 ## API
 
+See [PRODUCTION.md](PRODUCTION.md) for hardening changes, regression replays, and open release checks.
+
 Callers should read [docs/backend/snapdragon/api-reference.md](../../docs/backend/snapdragon/api-reference.md):
 endpoints, request fields, response formats, headers (`X-Queue-Ms`, `X-Infer-Ms`,
 `X-Language`, `X-Vad-Pieces`, `X-Speaker-Score`), error codes, the optional
@@ -153,7 +155,7 @@ utterance per request maps directly onto the engine.
 
 ```sh
 build-x-asr/bin/llama-paraformer-api MODEL.gguf --device HTP0:0 --port 8080 \
-    --engines 2 --threads 2 --queue 64 --timeout-ms 30000 --model-id paraformer-zh-q8_0 \
+    --engines 2 --threads 2 --queue 64 --queue-mib 8 --deadline-ms 30000 --model-id paraformer-zh-q8_0 \
     --warmup hvac_en01.wav
 
 curl -sS localhost:8080/health
@@ -170,14 +172,17 @@ where the silence between two words crosses `--punct-gap-ms` (600 ms default):
 that is acoustic evidence, and it takes the cabin command field from 71.9 to
 78.1 percent where the earlier keyword restorer regressed to 46.9. Errors use the OpenAI envelope `{"error": {...}}`. Every reply carries
 `X-Queue-Ms` and `X-Infer-Ms` so the tail can be split into queueing and
-inference. Overload returns 429 and a queue timeout returns 503. Input must be
+inference. Overload returns 429, a queue timeout returns 503, and a final request
+that reaches `--deadline-ms` returns 504. Input must be
 16 kHz mono 16-bit PCM WAV; other formats are rejected rather than resampled.
 Realtime streaming is the same server on `/v1/realtime` (WebSocket): send
 `input_audio_buffer.append` with base64 PCM16 while the user speaks, then
 `input_audio_buffer.commit` at the VAD endpoint. The server answers with
 `conversation.item.input_audio_transcription.delta` (throttled partials, see
-`--partial-ms`/`--partial-interval-ms`) and `.completed`. Partials never delay a
-commit: commit tasks jump the engine queue.
+`--partial-ms`/`--partial-interval-ms`) and `.completed`. Commit tasks take priority
+over queued previews. The API accepts up to four WebSocket sessions, with up to
+four pending commits per session. Each acknowledged commit receives one terminal
+completion or error with its item ID. See [the production log](PRODUCTION.md#http-and-websocket-admission-and-deadlines) for replay commands.
 
 ```sh
 python3 tools/ws_client.py --url ws://127.0.0.1:8080/v1/realtime --wav a.wav --paced
@@ -186,11 +191,17 @@ python3 tools/ws_client.py --url ws://127.0.0.1:8080/v1/realtime --wav a.wav --p
 See docs/backend/snapdragon/asr-server-api-design.md for the full surface,
 including the Realtime event mapping and what a general ASR server needs.
 
+`--prefer-idle-htp` prioritizes an idle HTP worker and lets CPU workers pull
+from the same queue while HTP is busy. See the [SM6650 routing replay](PRODUCTION.md#backend-scheduling-on-sm6650)
+for the four-request latency and memory measurements. For long-running Android
+deployments, the [process recovery launcher](PRODUCTION.md#process-recovery-on-cpu)
+shows how to rewarm on CPU after the HTP process exits.
+
 ### Speaker gate (optional)
 
-The API can score each committed segment against the enrolled driver's voiceprint
-with CAM++ through sherpa-onnx, on the CPU, while the ASR runs on HTP. It is a
-compile-time option so a plain build has no sherpa dependency:
+The API can score a committed segment against the enrolled driver's voiceprint
+with CAM++ through sherpa-onnx. The optional build runs one scoring task at a
+time on a dedicated CPU thread.
 
 ```sh
 # Android build (sherpa headers and libs mounted into the container)
@@ -206,12 +217,14 @@ bin/llama-paraformer-api MODEL.gguf --device HTP0:0 --port 8899 --engines 2 \
     --speaker-model onnx/model/spk_od.onnx --enroll-dir pf-enroll --speaker-threshold 0.55
 ```
 
-`--enroll-dir` holds a handful of the driver's 16 kHz WAVs; startup prints the clip
-count and the mean self-cosine. Each commit then returns `X-Speaker-Score`,
-`X-Speaker-Ok` (REST) or `speaker_score`/`speaker_ok` (verbose_json and the
-Realtime completed event). Measured on SM6650: enrolment self-cosine 0.904, driver
-0.921, passenger 0.363, and inference stays inside the no-gate noise because the
-110 ms embedding overlaps the 320 ms ASR. The score is reported, not enforced.
+`--enroll-dir` holds 16 kHz WAVs for the enrolled speaker. Startup prints the
+clip count and mean self-cosine. The scoring worker uses at most the first
+1.5 seconds by default. The final transcript carries `assessed` if a result
+is ready, `not_assessed` with a reason for an enabled but incomplete or skipped
+score, or `disabled`. Both REST endpoints expose the state in their headers,
+and the WS final event carries the same state. An assessed score and its
+threshold decision are advisory to the caller. For device measurements and
+the replay command, see [PRODUCTION.md](PRODUCTION.md).
 
 ## Profiling
 
