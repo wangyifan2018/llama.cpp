@@ -88,12 +88,33 @@ references. Then run `./reproduce.sh eval` and read the two arms: the gate's
 absolute thresholds will fail (by design - they describe Tingting), but the
 base-vs-hot delta is the measurement that matters off-Mac.
 
-**3. On the device.** `./reproduce.sh device` prints the commands and the exact
-`diff` to run; it does not build the Android binary, because that needs the
-docker arm64 toolchain and a push step this script does not own. The criterion
-there is byte-identical transcripts on the same clips between host CPU and
-device HTP - not similar latency. Latency moves with thermals and scheduling;
-transcripts do not, and a transcript that differs is a real defect.
+**3. On the device.** `./reproduce.sh device` runs the cross-check itself:
+it pushes the current 32 clips, transcribes them in three arms (host, device
+CPU, device HTP0) and compares the transcript field only. Recorded on SM6650 on
+2026-11-18: **32/32 identical in both device arms**. The criterion is
+byte-identical transcripts - not similar latency. Latency moves with thermals
+and scheduling; transcripts do not, and a transcript that differs is a real
+defect.
+
+It does not build the Android binary; that needs the docker arm64 toolchain and
+a push step this script does not own. Set `DEVICE_BIN` and `DEVICE_MODEL` if the
+binary and weights live somewhere other than `/data/local/tmp/llama.cpp` and
+`/data/local/tmp/llama-paraformer/`.
+
+Two ways this check can lie, both already handled:
+
+* **Stale fixtures.** The device keeps whatever was pushed last. On the first
+  run here it still held a `win_en01.wav` from an earlier round - different
+  bytes, 2348 ms against the current clip's 1990 ms - and decoded `window
+  upwaway` against the host's `window halfway`. That reads exactly like an HTP
+  defect and is not one. The script re-pushes every run and asserts the clip
+  count.
+* **Blaming the wrong layer.** Device CPU runs before HTP. If CPU already
+  disagrees with the host, the cause is a build or weight mismatch and the HTP
+  arm is not evidence. The summary says so rather than leaving it to be guessed.
+
+Failure path is verified as well: pointing `DEVICE_MODEL` at the en checkpoint
+produces 32/32 differing, the explanation above, and exit 1.
 
 ## The one thing to remember
 

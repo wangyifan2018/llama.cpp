@@ -667,10 +667,6 @@ static void paraformer_dump_logits(const paraformer_context* ctx, const float* r
 static bool paraformer_load_model(paraformer_context* ctx) {
     auto& m = ctx->model;
     auto& hp = m.hp;
-    // Keep a reference to wl for require()
-    struct {
-        core_gguf::WeightLoad* tensors_ref;
-    } wl_wrapper;
 
     auto get = [&](const char* name) -> ggml_tensor* {
         auto it = ctx->wl.tensors.find(name);
