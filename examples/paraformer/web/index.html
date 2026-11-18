@@ -163,29 +163,20 @@
         <div class="final empty" id="final">等待音频…</div>
         <div class="chips">
           <span class="chip" id="chipPieces">分段 -</span>
-          <span class="chip" id="chipSpk">说话人 -</span>
           <span class="chip" id="chipSent">已发 0.00 s</span>
         </div>
       </div>
     </section>
 
     <aside class="card">
-      <h2>说话人</h2>
-      <div class="spk">
-        <div class="spkAvatar" id="spkAvatar">?</div>
-        <div class="spkBody">
-          <div class="spkVerdict" id="spkVerdict">未判定</div>
-          <div class="spkScore" id="spkScore">—</div>
-          <button class="ghost" id="btnEnroll">注册我的声音（3 s）</button>
-          <div class="hint" id="spkEnroll">点击后对着麦克风说 3 秒</div>
-        </div>
-      </div>
-      <h2 style="margin-top:16px">实时指标</h2>
+      <h2>实时指标</h2>
       <div class="stats">
         <div class="stat"><div class="k">尾延迟</div><div class="v" id="mE2E">—</div></div>
         <div class="stat"><div class="k">推理</div><div class="v" id="mInfer">—</div></div>
         <div class="stat"><div class="k">排队</div><div class="v" id="mQueue">—</div></div>
+        <div class="stat"><div class="k">VAD</div><div class="v" id="mVad">—</div></div>
         <div class="stat"><div class="k">分段</div><div class="v" id="mSegs">0</div></div>
+        <div class="stat"><div class="k">平均段长</div><div class="v" id="mAvg">—</div></div>
       </div>
       <canvas id="spark"></canvas>
       <div class="hint" id="mPct">p50 / p95 —</div>
@@ -194,10 +185,10 @@
     <section class="card history">
       <h2>识别历史</h2>
       <div class="histwrap"><table>
-        <thead><tr><th style="width:34px">#</th><th>文本</th><th style="width:86px">时长</th>
-          <th style="width:92px">推理</th><th style="width:96px">后端</th></tr></thead>
+        <thead><tr><th style="width:32px">#</th><th>文本</th><th style="width:74px">时长</th>
+          <th style="width:88px">尾延迟</th><th style="width:82px">推理</th><th style="width:92px">后端</th></tr></thead>
         <tbody id="rows">
-          <tr class="empty-row"><td colspan="5">尚无结果</td></tr>
+          <tr class="empty-row"><td colspan="6">尚无结果</td></tr>
         </tbody>
       </table></div>
     </section>
@@ -220,6 +211,7 @@
   let ws = null, media = null, actx = null, node = null, recording = false;
   let pending = [], sentSamples = 0, committedAt = 0, lastPartial = '';
   const rows = new Map();          // item_id -> <tr>
+  let durSum = 0, durCount = 0;
   const history = [];
   const trace = new Array(360).fill(0);
   let dpr = Math.min(devicePixelRatio || 1, 2);
@@ -309,13 +301,6 @@
     drawSpark();
   }
 
-  function showSpeaker(ok, score) {
-    const a = $('spkAvatar');
-    a.className = 'spkAvatar ' + (ok ? 'ok' : 'bad');
-    a.textContent = ok ? '认' : '否';
-    $('spkVerdict').textContent = ok ? '司机（放行）' : '非司机（拦截）';
-    $('spkScore').textContent = '相似度 ' + score.toFixed(3) + ' · 阈值见 /v1/speaker';
-  }
   function resample16(input, srcRate) {
     if (srcRate === 16000) return input;
     const ratio = srcRate / 16000;
@@ -338,65 +323,6 @@
     for (let i = 0; i < n; i++) v.setInt16(44 + i * 2, samples[i], true);
     return new Blob([buf], {type: 'audio/wav'});
   }
-  async function enrollVoice() {
-    const btn = $('btnEnroll');
-    const hint = $('spkEnroll');
-    btn.disabled = true;
-    hint.textContent = '录音中，请说一句话…';
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({audio: {channelCount: 1}});
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const src = ctx.createMediaStreamSource(stream);
-      const proc = ctx.createScriptProcessor(1024, 1, 1);
-      const chunks = [];
-      proc.onaudioprocess = (ev) => {
-        const f = ev.inputBuffer.getChannelData(0);
-        const i16 = new Int16Array(f.length);
-        for (let i = 0; i < f.length; i++) i16[i] = Math.max(-1, Math.min(1, f[i])) * 32767;
-        chunks.push(i16);
-      };
-      src.connect(proc); proc.connect(ctx.destination);
-      await new Promise(r => setTimeout(r, 3000));
-      proc.disconnect(); src.disconnect();
-      stream.getTracks().forEach(t => t.stop());
-      await ctx.close();
-      const total = chunks.reduce((a, c) => a + c.length, 0);
-      const all = new Int16Array(total);
-      let off = 0;
-      for (const c of chunks) { all.set(c, off); off += c.length; }
-      // The server accepts 16 kHz only and rejects anything else, so resample
-      // here: a browser capture is normally 44.1 or 48 kHz.
-      const rate = ctx.sampleRate;
-      const to16 = resample16(all, rate);
-      const blob = wavBlob(to16, 16000);
-      hint.textContent = '上传中…';
-      const fd = new FormData();
-      fd.append('file', blob, 'enroll.wav');
-      const r = await fetch('/v1/speaker/enroll', {method: 'POST', body: fd});
-      const j = await r.json();
-      if (!r.ok) throw new Error((j.error && j.error.message) || 'enroll failed');
-      hint.textContent = '已注册 ' + j.clips + ' 段，自相似度 ' + j.self_cosine.toFixed(3);
-      toast('声纹已更新');
-      refreshSpeaker();
-    } catch (e) {
-      hint.textContent = '注册失败：' + e.message;
-      toast('注册失败：' + e.message, true);
-    } finally {
-      btn.disabled = false;
-    }
-  }
-  async function refreshSpeaker() {
-    try {
-      const s = await (await fetch('/v1/speaker', {cache: 'no-store'})).json();
-      if (s.enabled) {
-        $('spkScore').textContent = '注册 ' + (s.clips > 0 ? s.clips + ' 段' : '（文件）') +
-          ' · 自相似 ' + (s.self_cosine || 0).toFixed(3) + ' · 阈值 ' + s.threshold.toFixed(2);
-      } else {
-        $('spkVerdict').textContent = '未启用';
-      }
-    } catch (e) {}
-  }
-
   function newRow(item) {
     const tbody = $('rows');
     const empty = tbody.querySelector('.empty-row');
@@ -405,7 +331,7 @@
     const tr = document.createElement('tr');
     tr.dataset.item = item || '';
     tr.innerHTML = '<td class="num">' + n + '</td><td class="text"></td>' +
-                   '<td class="num dur">—</td><td class="num inf">—</td><td class="num bk">—</td>';
+                   '<td class="num dur">—</td><td class="num tail">—</td><td class="num inf">—</td><td class="num bk">—</td>';
     tbody.appendChild(tr);
     const wrap = document.querySelector('.histwrap');
     if (wrap) wrap.scrollTop = wrap.scrollHeight;
@@ -444,8 +370,10 @@
           $('partial').textContent = lastPartial;
         } else if (t === 'x.pf.metrics') {
           const tr = rows.get(m.item_id);
+          if (typeof m.vad_ms === 'number') $('mVad').innerHTML = Math.round(m.vad_ms) + '<small>ms</small>';
           if (tr) {
             if (typeof m.infer_ms === 'number') tr.querySelector('.inf').textContent = Math.round(m.infer_ms) + ' ms';
+            if (typeof m.tail_ms === 'number') tr.querySelector('.tail').textContent = Math.round(m.tail_ms) + ' ms';
             if (typeof m.queue_ms === 'number' && m.queue_ms > 1) tr.title = '排队 ' + Math.round(m.queue_ms) + ' ms';
             if (m.backend) {
               tr.querySelector('.bk').textContent = m.backend;
@@ -460,6 +388,7 @@
             const tail = Math.round(m.tail_ms);
             $('mE2E').innerHTML = tail + '<small>ms</small>';
             history.push(tail); updatePct();
+            if (tr) tr.querySelector('.tail').textContent = tail + ' ms';
           }
           if (typeof m.queue_ms === 'number') $('mQueue').innerHTML = Math.round(m.queue_ms) + '<small>ms</small>';
         } else if (t.endsWith('completed')) {
@@ -472,19 +401,10 @@
           tr.querySelector('.text').textContent = text || '(空)';
           const dur = (m.usage && m.usage.seconds) ? m.usage.seconds.toFixed(1) + ' s' : '—';
           tr.querySelector('.dur').textContent = dur;
+          durSum += (m.usage && m.usage.seconds) ? m.usage.seconds : 0;
+          durCount += 1;
+          $('mAvg').innerHTML = (durSum / Math.max(1, durCount)).toFixed(1) + '<small>s</small>';
           $('mSegs').textContent = $('rows').children.length;
-          if (typeof m.speaker_score === 'number') {
-            const ok = !!m.speaker_ok;
-            const c = $('chipSpk');
-            c.className = 'chip ' + (ok ? 'ok' : 'bad');
-            c.textContent = (ok ? '司机' : '非司机') + ' ' + m.speaker_score.toFixed(3);
-            showSpeaker(ok, m.speaker_score);
-          } else if (m.speaker_status && m.speaker_status !== 'assessed') {
-            $('spkVerdict').textContent = '未判定（' + m.speaker_status + '）';
-            $('spkScore').textContent = '—';
-            $('spkAvatar').className = 'spkAvatar';
-            $('spkAvatar').textContent = '?';
-          }
           if (ms && !$('chkVad').checked) { history.push(ms); $('mE2E').innerHTML = ms + '<small>ms</small>'; updatePct(); }
           if (!$('chkVad').checked) { $('partial').textContent = ''; lastPartial = ''; }
           log('done', (text || '(空)').slice(0, 40));
@@ -578,14 +498,14 @@
   function clearAll() {
     recording = false;
     pending = []; sentSamples = 0; lastPartial = ''; committedAt = 0;
-    history.length = 0; rows.clear();
-    $('rows').innerHTML = '<tr class="empty-row"><td colspan="5">尚无结果</td></tr>';
+    history.length = 0; rows.clear(); durSum = 0; durCount = 0;
+    $('rows').innerHTML = '<tr class="empty-row"><td colspan="6">尚无结果</td></tr>';
     $('chipSent').textContent = '已发 0.00 s';
     $('final').textContent = '等待音频…'; $('final').classList.add('empty');
     $('partial').textContent = '';
     $('mSegs').textContent = '0';
     $('mE2E').textContent = '—'; $('mQueue').textContent = '—'; $('mInfer').textContent = '—';
-    $('chipSpk').className = 'chip'; $('chipSpk').textContent = '说话人 -';
+    $('mVad').textContent = '—'; $('mAvg').textContent = '—';
     updatePct();
     if (ws && ws.readyState === 1) ws.send(JSON.stringify({type: 'input_audio_buffer.clear'}));
     log('clear', '');
@@ -629,7 +549,6 @@
   $('btnFile').onclick = () => $('file').click();
   $('file').onchange = (e) => { if (e.target.files[0]) playFile(e.target.files[0]); };
   $('chkVad').onchange = () => applyTurnDetection();
-  $('btnEnroll').onclick = () => enrollVoice();
   addEventListener('keydown', (e) => {
     if (e.code === 'Space' && !e.repeat && document.activeElement.tagName !== 'INPUT') {
       e.preventDefault();
@@ -642,7 +561,7 @@
   });
 
   fit(wave, 156); fit(spark, 54);
-  drawWave(); updatePct(); applyTurnDetection(); refreshSpeaker();
+  drawWave(); updatePct(); applyTurnDetection();
   fetch('/health', {cache: 'no-store'}).then(r => r.json()).then(h => {
     $('modelName').textContent = (h.model || 'paraformer') + ' · HTP ' + (h.htp_engines || 0) + '/' + (h.engines || 0) +
       ' · VAD ' + (h.server_vad ? '开' : '关');
