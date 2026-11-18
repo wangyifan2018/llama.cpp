@@ -57,7 +57,7 @@ def pick_voice(name, lang):
     their prefix; plain names match exactly.
     """
     out = subprocess.run(["say", "-v", "?"], check=True, capture_output=True, text=True).stdout
-    want = {"zh": "zh_CN", "en": "en_US"}.get(lang)
+    want = {"zh": "zh_CN", "en": "en_US", "mixed": "zh_CN"}.get(lang)
     if not want:
         raise SystemExit(f"unsupported language column: {lang!r}")
     exact, prefixed = [], []
