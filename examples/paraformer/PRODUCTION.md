@@ -220,6 +220,16 @@ The second ABBA run pinned one busy thread each to CPUs 6 and 7. `/proc/stat` me
 
 The ABBA launchers, per-request results with `backend`, health, artifact hashes, and resource snapshots are in `$HOME/Library/Caches/qwen3-asr-htp/paraformer-production/routing.vjddv2`. Use `bash "$PF_OUT/route.sh" "$PF_OUT"` and `bash "$PF_OUT/pressure.sh" "$PF_OUT"` from the repo with that run directory as `PF_OUT`. The recorded pressure hash is from the phone. The initial routing executable was reconstructed from the archived source version after the manifest file was reused for the pressure run. It matches the logged transfer size. The model and backend libraries were identical in both runs.
 
+### Reordering the queue does not help
+
+Shortest-first dequeue was tried to protect short commands from a long upload and then reverted. The idea was that with two workers, arrival order puts a short command behind a long one and pays a full long decode, while shortest-first finishes the shorts inside one long decode.
+
+On SM6650 with two workers, `--prefer-idle-htp` and a 13.9 s clip against three 2.3-2.7 s clips released together, the median fell from 869 to 690 ms but the tail rose from 1536 to 1825 ms. Per-request rows show why. Short requests improved from 1049 to 364 ms, and the long request paid for it: its queue wait went from 0 to 350-400 ms because three shorts were taken ahead of it, so it finished later than in the FIFO arm. The total work is unchanged, so the median win is a transfer, not a saving, and the tail absorbs the loss.
+
+Ageing was what produced the tail. A long request deferred behind shorts was only taken once it passed the 2000 ms age bound, which is longer than the 1.4 s the decode itself needs.
+
+The conclusion is structural: with two workers and four requests, FIFO completion order matches the work already in flight, and any reorder moves latency between requests rather than removing it. Short commands are not slow in this workload - they take 205-366 ms end to end and the mixed P95 of 1452 ms is the long decode itself. Improving them needs a long request that yields its worker mid-decode, which the engine cannot do today because one context owns the whole window loop. Treat `--queue-order` as unavailable until that changes.
+
 ## Process recovery on CPU
 
 [`tools/supervise_api.sh`](tools/supervise_api.sh) runs the API as a child. An abnormal HTP exit triggers a new CPU-only API child on the same port. `--recover-on-cpu` preserves the configured HTP backend in the first engine's `requested` health field, reports `actual: CPU` and marks the process `degraded`. The CPU child loads and warms before listening. It stays on CPU until the service is restarted. Start the supervisor under the device's service manager so the CPU child's own exit is visible to that manager.
