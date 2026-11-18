@@ -283,21 +283,63 @@ The second voice set was one speaker. A wider sweep separates "one unlucky voice
 
 Tingting was re-rendered through the same script as a control. It reproduced the recorded set exactly - 0.60% zh and 13.74% en against 0.60% and 12.98% - so the pipeline is equivalent to the original fixtures and differences between rows are the voice.
 
-| Voice | Median F0 | zh CER | en WER |
-|---|---:|---:|---:|
-| Tingting (control) | 241 Hz | 0.60% | 13.74% |
-| Sandy | 250 Hz | 26.51% | 48.85% |
-| Shelley | 167 Hz | 35.54% | 41.98% |
-| Eddy | 122 Hz | 33.13% | 35.11% |
-| Rocko | 99 Hz | 35.54% | 33.59% |
+| Voice | Native language | Median F0 | zh CER | en WER |
+|---|---|---:|---:|---:|
+| Tingting (control) | zh_CN | 234 Hz | 0.60% | 13.74% |
+| Meijia | zh_TW | 220 Hz | 0.00% | 17.56% |
+| Sinji | zh_HK | 204 Hz | 65.66% | 25.95% |
+| Grandpa | multilingual | 91 Hz | 19.28% | 38.93% |
+| Sandy | multilingual | 237 Hz | 25.90% | 49.62% |
+| Rocko | multilingual | 94 Hz | 34.34% | 33.59% |
+| Flo | multilingual | 207 Hz | 34.34% | 40.46% |
+| Eddy | multilingual | 112 Hz | 33.13% | 35.88% |
+| Shelley | multilingual | 156 Hz | 33.73% | 41.22% |
+| Reed | multilingual | 100 Hz | 38.55% | 32.82% |
+| Grandma | multilingual | 113 Hz | 41.57% | 43.51% |
 
-Every non-tuning voice lands at 26-36% zh CER, 44-59 times the control, which matches the independent Flo and Daniel result of 34.34% and confirms the effect is systemic rather than one bad voice. Pitch does not explain it: Sandy is within 10 Hz of Tingting and still misses 26.51%, so the damage is a general shift in timbre, not a gender or register offset.
+Pitch and speed do not explain the spread. Tingting and Sandy differ by 3 Hz and 1 point of CER; Meijia and Sinji are both Mandarin voices and differ by 66 points. Slowing Sandy by 15% to the Mandarin voice rate moved 25.90% to 22.89% and speeding Meijia by 15% moved 0.00% to 0.60%, so time scale is worth about 3 points of 26.
 
-TTS bounds what this measures. There is no far field, no road noise, no microphone colouration and no accent, so these numbers are a floor on speaker sensitivity, not a ceiling on deployment error. They say the model does not generalise across speakers; they do not say how it fails in a cabin. Real recorded speech is still required for a release threshold.
+### The audio, not the model, is what breaks
 
-The fallback is unchanged: decoding-time bias cannot repair this. Hotwords and span rewrites act on tokens the model already produced, and 26-36% character error is the acoustic model choosing wrong characters, not a formatting problem. The paths are in-domain fine-tuning, or a speaker-adaptive front end.
+The first version of this section concluded the model overfits the tuning voice. That was wrong, and the error is worth recording because the reasoning that produced it looked sound.
 
-Measured rather than assumed: running the sweep with `PF_HOTWORDS=hotwords_vehicle_replace.txt`, the profile tuned on Tingting, moved every voice down by 1.0-2.3 points en WER and left zh CER bit-identical. Eddy 35.11 to 34.35, Sandy 48.85 to 46.56, Rocko 33.59 to 32.06, Shelley 41.98 to 39.69, Tingting unchanged at 13.74. The bias still helps off-domain, it simply cannot reach the error that matters, and it costs nothing when it does not apply. That means the existing profile does not have to be re-tuned per voice, but it also means it is not where the remaining failures live.
+FunASR CPU and the Q8_0 engine score these clips almost identically per voice - within 3 points zh on every one. That is not independent evidence: the Q8_0 checkpoint is a conversion of the same FunASR model, so agreement only shows quantisation cost nothing. The two arms fail the same clips because they are one model.
+
+Whisper small is a different acoustic model. Its zh CER on the same eleven voices:
+
+| Voice | Paraformer Q8_0 | Whisper small |
+|---|---:|---:|
+| Tingting | 0.60% | 13.86% |
+| Meijia | 0.00% | 9.04% |
+| Sandy | 25.90% | 58.43% |
+| Eddy | 33.13% | 51.81% |
+| Rocko | 34.34% | 48.19% |
+| Shelley | 33.73% | 62.65% |
+| Reed | 38.55% | 46.39% |
+| Grandma | 41.57% | 56.02% |
+| Grandpa | 19.28% | 69.28% |
+| Flo | 34.34% | 53.01% |
+| Sinji | 65.66% | 21.08% |
+
+Whisper is worse than this engine everywhere and roughly twice as bad on the multilingual voices. A model that cannot read the clips either is not being out-generalised by one that can. The Mandarin clips from the multilingual voices are damaged at synthesis, and every recogniser inherits that. Whisper is also the weaker model in absolute terms - 13.86% against 0.60% on the clip set it does read - so it is a detector for damaged audio, not a better baseline. Sinji is the one row that inverts: a Cantonese voice reading Mandarin, where Whisper's Mandarin trie happens to survive and the 8404-vocabulary model does not. One inverted row out of eleven does not rescue the pattern; the other ten move together.
+
+The comparison is reproducible without a second engine build. `tools/check_audio_quality.py` reads whisper's `--output_format tsv` tree alongside any transcript TSV and prints both rates per voice, converting Traditional to Simplified first - without that conversion every Traditional character counts as an error and the whole comparison silently inverts:
+
+```sh
+whisper --model small --language zh --task transcribe --output_format tsv \
+    --output_dir /tmp/wsp-zh /tmp/voice-sandy/*_zh*.wav
+python3 examples/paraformer/tools/check_audio_quality.py \
+    --refs examples/paraformer/tools/cabin_commands.tsv \
+    --arm whisper=/tmp/wsp-zh --arm paraformer=ours.tsv --lang zh
+```
+
+The English side splits differently, and this is the part that matters for release. These voices all have `en_US` variants, so the English clips are native speech. Whisper scores 7.63-9.92% WER on them (Eddy 7.63, Rocko 9.16, Sandy 9.92, Shelley 9.92) while the Q8_0 engine scores 33.59-49.62%. The audio is clean and this model is missing a third to a half of the words. Read together with the Mandarin rows, the sweep says two separate things: the multilingual voices cannot synthesise Mandarin well enough to measure with, and English command recognition is genuinely weak. Only the second is a product defect.
+
+TTS still bounds what any of this measures. There is no far field, no road noise, no microphone colouration and no accent, so the English numbers are a floor on speaker sensitivity, not a ceiling on deployment error. Real recorded speech is still required for a release threshold.
+
+The fallback is unchanged: decoding-time bias cannot repair either failure. Hotwords and span rewrites act on tokens the model already produced, and 26-62% character error is the acoustic model choosing wrong characters, not a formatting problem. The paths are in-domain fine-tuning, or a speaker-adaptive front end. For Mandarin, use a Mandarin voice for fixtures - Meijia at 0.00% shows the engine reads a native Mandarin synthetic voice perfectly, so a broken clip set measures the TTS, not the engine.
+
+Measured rather than assumed, and quoted on the same CLI arm as the English rows above so the numbers are comparable: running the sweep with `PF_HOTWORDS=hotwords_vehicle_replace.txt`, the profile tuned on Tingting, moved every voice down by 0.8-2.3 points en WER and left zh CER bit-identical. Sandy 49.62 to 47.33, Eddy 35.88 to 35.11, Rocko 33.59 to 32.06, Shelley 41.22 to 38.93, Tingting unchanged at 13.74. The bias still helps off-domain, it simply cannot reach the error that matters, and it costs nothing when it does not apply. That means the existing profile does not have to be re-tuned per voice, but it also means it is not where the remaining failures live.
 
 Fixtures and scores are reproducible with:
 
@@ -345,6 +387,7 @@ The archive includes `bundle/SHA256SUMS`, source hashes, base revision, toolchai
 
 ## Open acceptance work
 
+- English command recognition is the one measured defect with no mitigation in place. On clean native-speaker audio this engine scores 32.82-49.62% WER where an independent model scores 7.63-9.92%, so a third to a half of the words are wrong with no channel impairment at all. Establish whether the 8404-vocabulary Mandarin checkpoint is the cause and whether an English or bilingual acoustic model is required. This is a model decision, not a runtime one.
 - Inject a DSP transport failure and a stuck worker to validate process isolation with the target service manager. Exercise restart under load and confirm the socket and queue resource bounds on that deployment.
 - Establish release thresholds with target-vehicle command recordings from independent Mandarin and English speakers. Record overlap, speed, window state, HVAC, playback, seat and microphone for each utterance, and score the actual downstream command parser for wrong actions, extra actions and false activation. Keep voiceprint advisory until target-channel independent enrollment and impostor trials qualify it.
 - Agree the user-facing P95/P99 deadlines, failure and recovery targets, soak duration and RAM budget on the production SoC with representative services active. Use the same 20 ms workload and compare the two routing modes at that load.

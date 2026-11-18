@@ -255,9 +255,14 @@ python3 tools/score_voice.py --dir /tmp/voice-sandy --url http://127.0.0.1:8899
 ```
 
 `score_voice.py` reports the same zh CER and en WER used in
-[PRODUCTION.md](PRODUCTION.md). Five voices measured there put every
-non-tuning voice at 26-36% zh CER against 0.60% for Tingting, with pitch
-not explaining the spread. These are TTS clips: speaker variety without
+[PRODUCTION.md](PRODUCTION.md). Eleven voices measured there separate two
+effects that the first five-voice sweep had merged. The multilingual voices
+cannot synthesise Mandarin well enough to measure with - Whisper small, an
+independent acoustic model, scores 46-69% zh CER on the same clips, worse than
+this engine. Their English output is clean native speech, and there this
+engine scores 33.59-49.62% against Whisper's 7.63-9.92%, so English command
+accuracy is the real weakness. Use a Mandarin voice for Mandarin fixtures:
+Meijia scores 0.00% zh CER. These are TTS clips: speaker variety without
 channel variety.
 
 See `docs/backend/snapdragon/paraformer-htp-adaptation-design.md` for the
