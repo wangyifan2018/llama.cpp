@@ -93,6 +93,9 @@
   .stat .k{font-size:10.5px;color:var(--dim);letter-spacing:.06em;text-transform:uppercase}
   .stat .v{font-size:18px;font-variant-numeric:tabular-nums;font-weight:650;margin-top:2px}
   .stat .v small{font-size:11px;color:var(--dim);font-weight:400;margin-left:3px}
+  .stat.stop{margin-top:9px;border-color:#2b4a63;background:linear-gradient(180deg,#0d1a24,#0b1219)}
+  .stat.stop.fresh{border-color:var(--accent);box-shadow:0 0 14px rgba(56,189,248,.25)}
+  .stat.stop .v{color:var(--accent)}
   canvas#spark{width:100%;height:54px;display:block;margin-top:10px}
 
   /* history table */
@@ -178,6 +181,7 @@
         <div class="stat"><div class="k">分段</div><div class="v" id="mSegs">0</div></div>
         <div class="stat"><div class="k">平均段长</div><div class="v" id="mAvg">—</div></div>
       </div>
+      <div class="stat stop" id="stopBox"><div class="k">停止 → 出结果</div><div class="v" id="mStop">—</div></div>
       <canvas id="spark"></canvas>
       <div class="hint" id="mPct">p50 / p95 —</div>
     </aside>
@@ -212,6 +216,7 @@
   let pending = [], sentSamples = 0, committedAt = 0, lastPartial = '';
   const rows = new Map();          // item_id -> <tr>
   let durSum = 0, durCount = 0;
+  let stopAt = 0;   // when the user pressed stop; the next result is the tail segment
   const history = [];
   const trace = new Array(360).fill(0);
   let dpr = Math.min(devicePixelRatio || 1, 2);
@@ -397,6 +402,18 @@
           const text = m.transcript || '';
           $('final').textContent = text || '(空)';
           $('final').classList.toggle('empty', !text);
+          // The segment produced by the stop press is the one the driver waits
+          // for after they stop talking: measure it locally, because the server
+          // number is per segment and cannot know when the button was hit.
+          if (stopAt) {
+            const dt = Math.round(performance.now() - stopAt);
+            stopAt = 0;
+            const box = $('stopBox');
+            $('mStop').innerHTML = dt + '<small>ms</small>';
+            box.classList.add('fresh');
+            setTimeout(() => box.classList.remove('fresh'), 1200);
+            history.push(dt); updatePct();
+          }
           const tr = newRow(m.item_id);
           tr.querySelector('.text').textContent = text || '(空)';
           const dur = (m.usage && m.usage.seconds) ? m.usage.seconds.toFixed(1) + ' s' : '—';
@@ -490,6 +507,7 @@
     if (pending.length) { feed(new Int16Array(pending), 16000); pending = []; }
     if (ws && ws.readyState === 1) {
       committedAt = performance.now();
+      stopAt = committedAt;
       ws.send(JSON.stringify({type: 'input_audio_buffer.commit'}));
       setBadge('bConn', 'on', '等待结果');
       log('commit', (sentSamples / 16000).toFixed(2) + ' s');
@@ -505,7 +523,7 @@
     $('partial').textContent = '';
     $('mSegs').textContent = '0';
     $('mE2E').textContent = '—'; $('mQueue').textContent = '—'; $('mInfer').textContent = '—';
-    $('mVad').textContent = '—'; $('mAvg').textContent = '—';
+    $('mVad').textContent = '—'; $('mAvg').textContent = '—'; $('mStop').textContent = '—'; stopAt = 0;
     updatePct();
     if (ws && ws.readyState === 1) ws.send(JSON.stringify({type: 'input_audio_buffer.clear'}));
     log('clear', '');
@@ -531,6 +549,7 @@
         btnRec.classList.remove('rec');
         if (pending.length) { feed(new Int16Array(pending), 16000); pending = []; }
         committedAt = performance.now();
+        stopAt = committedAt;
         ws.send(JSON.stringify({type: 'input_audio_buffer.commit'}));
         setBadge('bConn', 'on', '等待结果');
         return;

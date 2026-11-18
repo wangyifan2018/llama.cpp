@@ -173,6 +173,32 @@ embedding（约 80 ms，只取前 1.5 s）在 CPU 上并行完成，被 280 ms �
 
 注意：服务端的 `--vad-model` 批量路径（>18 s 才切）**不能**修复紧切的段落——丢失的音频已经不在请求里了。
 
+## 4.3 从零复现当前效果
+
+前提：一台 SM6650 设备、`adb` 可见、`docker` 可用（交叉编译）、`PF_MODELS` 里放着
+`tools/fetch_models.py` 校验过的权重。
+
+```sh
+export PF_MODELS=$HOME/models/paraformer
+python3 examples/paraformer/tools/fetch_models.py --out "$PF_MODELS"   # 首次：取权重并校验 sha256
+examples/paraformer/tools/install_local.sh --with-capabilities          # 首次：铺设备目录（含 VAD/声纹模型）
+examples/paraformer/tools/reproduce_deployment.sh 8899                  # 构建 -> 安装 -> 重启 -> 验收
+```
+
+`reproduce_deployment.sh` 会重编 Android 二进制、安装 launcher 与配置、重启服务，最后跑
+`tools/accept.sh`；后者就是门禁：健康与 HTP 检查、23 项契约、OpenAI 接口精度、1/2 路延迟。
+在 SM6650 上应当看到（与 §4 一致）：
+
+| 项 | 期望 |
+|---|---|
+| 契约 | 23 checks, 0 failed |
+| 命令字段 | 87.5%（device 90.5%，value 100%，zh CER 0.60%，en WER 6.87%） |
+| 1 路 | wall p50/p95 ≈ 280/287 ms |
+| 2 路 | wall p50/p95 ≈ 292/306 ms |
+| `/health` | `status ok`、`htp_engines ≥ 1`、`server_vad true`、`speaker_gate false` |
+
+数字对不上时先看 §5 排障，再确认 `PF_MODELS` 里的权重 sha256 与 §2 的清单一致。
+
 ## 5. 排障
 
 | 现象 | 检查 |
