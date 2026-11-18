@@ -1,18 +1,54 @@
-# Paraformer NAR logit bias for cabin English confusables (measured 2026-11-17,
-# SM6650 + host CPU). Two forms:
+# Paraformer NAR logit bias for cabin English confusables.
+# Measured on 2026-11-17 (SM6650 + host CPU) and re-tuned on 2026-11-18 against
+# the mixed-language fixture set. Four forms:
 #   <gain> <token>            global gain at every CIF position
 #   <gain> <prefix>><token>   conditional: only when previous token == prefix
-# Only single tokens / BPE tails; see design doc §13-14.
+#   R <margin> <w+c...> => <r+c...>
+#                             span rewrite, applied after decode, gated on the
+#                             acoustic score: it fires only when the replacement
+#                             is within <margin> of what was actually observed.
+#   (blank line / # comment)
+# See design doc §13-14 and §15.
 
 # --- §13 whole-word: single-token words, gap measured by PF_DUMP_LOGITS ---
-# said->set 2.89-3.00 ; too->two 0.96.
+# said->set 2.89-3.00. 'and' (gap 4.16, also perturbs a neighbouring 'on') is
+# intentionally excluded.
 3.2 set
-1.5 two
-# 'and' (gap 4.16, also perturbs a neighbouring 'on') is intentionally excluded.
 
 # --- §14 BPE-tail: same token count, so a tail swap is biassable ---
 # seat = se@@ + at ; wrong "seed" = se@@ + ed ; at-vs-ed gap 3.26-3.46.
 # 'se@@' is a single vocab token and is almost always "seat", so the rule is
-# narrow. Footwell/lights have a different BPE token COUNT than the error and
-# cannot be fixed by a logit bias (they need token insertion/deletion).
+# narrow.
 3.8 se@@>at
+
+# --- §15 the same tail rule fixes footwell, which §14 called unfixable ---
+# §14 rejected footwell because `footwall` is 3 tokens and `footwell` is 2, so
+# no bias can make the model emit a token it is not already emitting. That is
+# true of the whole word but not of its tail: the model gets as far as
+# `f@@ oo@@ t@@` and then picks `al` over `well`. `well` is a single vocab
+# token and is only 2.89 behind, and `t@@` is a correct prefix, so a
+# conditional tail rule reaches it. Measured: `footal` -> `footwell`.
+3.0 t@@>well
+
+# --- §15 level two: the global rule was leaking into mixed utterances ---
+# The 1.5 gain this file used to carry on bare `two` fixed `level two` but also
+# fired at the `to` in `temperature to 二十一度`, inserting a stray `two` that
+# the downstream parser read as `to | two | 21` = 11 degrees. Both positions
+# follow a different token (`l` vs `to`), so the conditional form separates them
+# and the global rule is retired. Same en WER, no mixed regression.
+1.5 l>two
+
+# --- §15 crossing the script boundary narrows the first English word --------
+# `打开 rear right reading light` decodes as `打开 we are right ...`: at the
+# zh->Latin transition the acoustic model spreads `rear right` over three
+# tokens, and `re@@` loses to `we` by 2.18. `rear` is not missing from the
+# vocabulary -- a pure-English `turn on the rear right reading light` is perfect
+# (re@@ ar) -- so this is a boundary effect, not a missing word, and the fix has
+# to collapse the wrong span rather than boost a token.
+#
+# `R` is that collapse: replace three tokens with three at the same rows. The
+# margin is the guard. avg_wrong 12.16 vs avg_right 9.77 is a deficit of 2.39,
+# so 1.5 was rejected and 2.6 fires. Keep this rule scoped to the whole wrong
+# span; a rule on `we+are+right` alone matches any English sentence that
+# happens to contain those words.
+R 2.6 we+are+right => re@@+ar+right

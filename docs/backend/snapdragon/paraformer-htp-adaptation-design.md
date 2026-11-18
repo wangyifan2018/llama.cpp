@@ -1046,3 +1046,72 @@ zh CER 0.60%（不变）、en WER 6.87%（不变）；延迟无变化（每个�
 
 **回归**：32 条车控夹具 command 71.9%、zh CER 0.60%、en WER 6.87%，与未加编码器时一致；
 10 条命名片段里中文 6/6 正确（王子涵→王梓涵、李牧尘→李沐宸），英文 2/4（OOV 名仍需 R 规则）。
+
+## 30. 混说夹具重调热词：旧 profile 本来是负收益（2026-11-18，host CPU）
+
+**为什么重调**：§13-14 的热词是在 16 条纯英文夹具上量出来的，那批夹具用 Tingting 合成，
+句子结构全是 `Set the ...` 的英文单语模式。产品要的是**中英混说**，而混说的 token 序列
+和纯英文不同——上一轮导出 15 句混说的 token 后就能看出来，`Set`/`said` 在混说里根本不出现。
+继续用旧 profile 等于在一个不代表目标说话人的分布上调参。
+
+**先修测量工具，再调参**。规则是：混说的字符 CER 不是合格指标（`导航到 Beijing 机场` 输出
+`导航到北京机场` 语义正确却算 7 个字符错），所以新写了 `tools/eval_mixed.py`，直接复用
+`examples/x-asr/tools/eval_vehicle.py` 的字段解析器，按 (device, position, state, value) 打分。
+**解析器必须先能给自己满分**——用 15 句参考文本自检，发现并修掉三个仪器缺陷：
+
+| 缺陷 | 现象 | 根因 |
+|---|---|---|
+| 英文多词模式永不命中 | `打开 front left window` 判成缺 position | zh 路径在 `re.sub(r"\s+","",text)` 后的串上匹配，`front left` 这种带空格的 pattern 不可能命中 |
+| 英文动词全变 `?` | `turn on the 内循环` 判成 state 未知 | 同上，空格被删掉后 `\bturn on\b` 也失效 |
+| 数字读不出 | `twenty one 度` / `twenty two degrees` | en 路径没有"数词+单位"规则；`22 degrees` 两条路径都不认 |
+
+修法是**不改共享解析器**：两条路径都跑，取"子句数 → 已解析字段数"更优的一条（en 路径保留空格，
+自然赢下前两个）；第三个是把英文数词归一成阿拉伯数字、`degrees` 归一成 `度`，
+这也和 Whisper/SenseVoice 的 ITN 口径一致，不归一会冤枉自己。
+自检从 1 失败到 **0/10 失败**，此时基线混说 command = 80%。
+
+**A/B 结论（15 句混说 + 16 条纯英文 + 16 条纯中文，host CPU）**：
+
+| 臂 | 混说 command | 英文 WER | 中文 |
+|---|---:|---:|---|
+| 无热词 | 80.0% | 12.21% | 基准 |
+| 旧 `hotwords_vehicle.txt`（§13+§14） | **70.0%** | 8.40% | 逐字节不变 |
+| 本轮（§15） | **100.0%** | **8.40%** | 逐字节不变 |
+
+**旧 profile 在混说上是负收益**——不是没效果，是**有害**。根因是 §13 那条 `1.5 two`：
+它修的是纯英文 `level two`，但在混说句 `set the 主驾 temperature to 二十一度` 里，
+`to` 后面那个位置的 `two` 只差 0.96，g 在 1.0 以上就会插进去，输出变成
+`temperature two二十一度`，下游读成 `to | two | 21` = **11 度**。这不是精度下降，是把指令改错了。
+把 g 降到 0.6 不插入了，但纯英文的 `level two` 也就修不回来了（WER 回到 9.16%）。
+
+**冲突用前缀条件拆开**：两个位置的**前一个 token 不同**——`level two` 前是 `l`，
+冲突位置前是 `to`。改成 `1.5 l>two` 后两者同时正确，这条是 §15 相对 §13 的主要收获：
+**同一个目标 token 在不同上下文里需要的 gain 可以相反，全局增益是错的对象。**
+
+**`rear right` 不是缺词**：混说里 `打开 rear right reading light` 吐成 `打开 we are right ...`，
+但纯英文 `turn on the rear right reading light` 是**完美**的（`re@@|ar`）。词表里确实没有 `rear`
+整词，但有 `re@@`+`ar`，所以这是**中英切换边界上第一个英文词变弱**，不是词表缺词。
+上一轮把它记成"词表缺词、偏置修不了"是错的。全局加 `2.6 re@@` 能修，但输出成 `reare`
+（`re@@|are` 拼出 reare）——单点增益改不了"三个 token 对两个"的形状。
+正确工具是 §14 已实现的 **span rewrite**（`R <margin> <wrong> => <right>`）：
+`re@@+ar+right` 正好也是 3 个 token，可以原位替换。margin 是声学守卫，
+实测 deficit 2.39，`margin 1.5` 被拒、`2.6` 生效。**先量 deficit 再定 margin**，
+不能用"能改对"当判据。
+
+**`footwell` 是 §14 判错的**：§14 说 `footwall`(3 token) 与 `footwell`(2 token) token 数不同、
+偏置修不了，且文本 ITN 会造出 `footwwell`。这条对**整词**成立，对**词尾**不成立——
+模型已经走对到 `f@@ oo@@ t@@`，只在最后一跳选了 `al` 而不是 `well`，而 `well` 是单个词表 token、
+只差 2.89，且前一 token 正好是 `t@@`。`3.0 t@@>well` 直接把 `footal` 修成 `footwell`。
+教训：**"token 数不同所以修不了"要先问"不同发生在哪一段"**，前缀相同的部分完全可以用条件偏置接住。
+
+**验收口径（本轮确立）**：
+1. 混说门禁看 **command 字段**，不看字符 CER；
+2. 纯英文/纯中文两套夹具都要跑，且中文转写必须**逐字节不变**（本轮 16/16）；
+3. 热词规则按 `R` / `<prefix>><token>` / `<token>` 三级优先，能用条件就不用全局；
+4. 新规则进来先测 deficit 再定 gain/margin，**gain 上限 5.0、margin 是距离不是概率**；
+5. 夹具里凡是用 Tingting 合成的，manifest 可能是 CRLF——`\r` 会把行首覆盖掉导致全 100% 错，先 `tr -d '\r'`。
+
+**剩余的英文错误（8.40% 那 6 条）**：`Set`→`a`/`said`、`heater`→`see peater`/`peater`、
+`massage`→`massaician`、`vents`→`reevent`、`lights`→`likes`、`footwell`→`footwall`。
+全部是**词表缺形**或**多 token 粘连**，`R` 规则的 margin 也接不住（deficit 超一大截）。
+这些只能靠重训、或上真正的语义后处理层。
