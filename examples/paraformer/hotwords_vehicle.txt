@@ -106,6 +106,13 @@ R 5.0 li@@+kes => li@@+gh@@+ts
 R 1.2 dri@@+ry+a@@+ther => dri@@+ver
 # `driver or window`: the `or` is a stray token off the same sibilance.
 R 1.2 dri@@+ver+or => dri@@+ver
+# On HTP the same sibilance collapses the other way: `driver seat` arrives as
+# `driry eseseat` (`dri@@|ry|e@@|se@@|se@@|at`), which neither rule above can
+# match because the split falls between `e@@` and `se@@` instead of at `a@@`.
+# Host CPU and phone CPU both emit `dri@@|ry|a@@|ther|se@@|at` here, so this is
+# an HTP numerics difference on a span whose deficit is small, not a rule that
+# was always missing. Deficit measured on HTP: 3.57.
+R 4.1 dri@@+ry+e@@+se@@+se@@+at => dri@@+ver+se@@+at
 
 # Relative control verbs. 调低 is `lower`, and it decoded as `loyred` with the
 # first two pieces fused. The product requirement is that 调高/调低 (relative)
@@ -172,7 +179,15 @@ R 3.8 fron@@+t+found => fron@@+t+fo@@+g
 R 5.3 w@@+ind+shi@@+e@@+ld => win@@+d@@+shi@@+el@@+d
 R 1.7 day+fro@@+st => de@@+fro@@+st
 # `rear window defog` -> `rear window definitely`. Defog is de@@|fo@@|g.
+#
+# Two rules, because the wrong side is not stable across backends. The host
+# emits four pieces (`de@@|fin@@|i@@|tely`); the phone's CPU emits three
+# (`de@@|fin@@|ite`) on the same wav and the same checkpoint -- verified
+# byte-identical by sha256 on both sides. A span rewrite matches one shape
+# exactly, so with only the four-piece rule the phone silently does nothing and
+# prints `definite`. Measured deficits: 6.8 host, 7.03 phone CPU.
 R 8.1 de@@+fin@@+i@@+tely => de@@+fo@@+g
+R 7.6 de@@+fin@@+ite => de@@+fo@@+g
 # `footwell airflow mode` -> `foot will airflow moat`. Two separate rules: the
 # noun (`foot will` is the two-word version of the four-piece one above) and the
 # tail of `mode`.

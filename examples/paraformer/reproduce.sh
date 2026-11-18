@@ -490,11 +490,129 @@ PY
 
     local rc=$?
     info ""
-    if [ "$rc" = 0 ]; then
-        info "== device matches the host on all 32 transcripts (run dir: $PF_RUN)"
-    else
-        die "device transcripts differ from the host; see $PF_RUN/xcheck.tsv"
+    if [ "$rc" != 0 ]; then
+        die "device transcripts differ from the host on the 32-clip set; see $PF_RUN/xcheck.tsv"
     fi
+    info "== device matches the host on all 32 transcripts"
+
+    # --- 扩展集：这里不能用「逐字节相同」做判据 -----------------------------
+    # 84 条上实测不是逐字节一致：hvac2_en04 的 wrong side 在主机是
+    # `de@@|fin@@|i@@|tely`（4 片）、在设备是 `de@@|fin@@|ite`（3 片），
+    # seat2_en03 在 HTP 上是 `dri@@|ry|e@@|se@@|se@@|at`。同一段 wav、
+    # 同一份权重（sha256 两侧相同）、同一份热词，分歧发生在 span rewrite
+    # 之前，是量化卷积在不同 CPU/HTP 实现上的数值差，不是脚本或规则问题。
+    #
+    # 逐字节判据会把这种正常漂移判成失败，然后所有人学会忽略这个检查。
+    # 真正要守的是「漂移不许吃掉分数」：所以这里比的是命令准确率，只有
+    # 设备分数低于主机分数才算失败。形状不稳定的规则必须两条都写进
+    # profile（见 hotwords_vehicle.txt 的 defog / driver 两处注释）。
+    local exp_dir=$PF_RUN/cabin-expanded
+    if [ ! -f "$exp_dir/manifest.tsv" ]; then
+        info "== skip 84-clip device cross-check (no $exp_dir/manifest.tsv)"
+        info ""
+        info "== device matches the host on all 32 transcripts (run dir: $PF_RUN)"
+        return 0
+    fi
+
+    info "  push expanded fixtures (84 clips)"
+    "$ADB" -s "$serial" shell "mkdir -p $vdir/wav-exp" </dev/null
+    "$ADB" -s "$serial" push "$exp_dir"/*.wav "$vdir/wav-exp/" </dev/null >/dev/null 2>&1
+    "$ADB" -s "$serial" shell "ls $vdir/wav-exp/*.wav | wc -l" </dev/null | tr -d '\r' \
+        | grep -qx 84 || die "expected 84 expanded clips on the device, got a different count"
+
+    local xhost=$PF_RUN/xe-host.tsv
+    local xcpu=$PF_RUN/xe-device-cpu.tsv
+    local xhtp=$PF_RUN/xe-device-htp.tsv
+    info "  [host]      transcribe 84 expanded clips"
+    "$BIN" "$ZH_MODEL" "$exp_dir"/*.wav --quiet --threads "$THREADS" \
+        --hotwords "$HOTWORDS" >"$xhost" 2>/dev/null
+    for dev in CPU "$DEVICE"; do
+        info "  [$dev] transcribe 84 expanded clips on device"
+        "$ADB" -s "$serial" shell \
+            "cd $vbin && LD_LIBRARY_PATH=bin ./bin/llama-paraformer $vmodel $vdir/wav-exp/*.wav \
+             --device $dev --threads $THREADS --quiet --hotwords $vdir/hotwords.txt" \
+            </dev/null >"$( [ "$dev" = CPU ] && echo "$xcpu" || echo "$xhtp" )" 2>/dev/null
+    done
+    for tsv in "$xhost" "$xcpu" "$xhtp"; do
+        [ -s "$tsv" ] || die "empty expanded transcript file: $tsv"
+    done
+
+    # eval_vehicle 的键是 `<basename(dirname)>/<clip>`，设备上的目录叫
+    # `wav-exp`、主机上叫 `cabin-expanded`，键对不上就会「84 条全部没有
+    # 转写」然后静默给出只有 host 一行的报告。把设备侧的路径改写成主机
+    # 的目录名，只是改键，不动转写字段。
+    "$PYTHON" - "$xcpu" "$xhtp" "$exp_dir" <<'PY'
+import sys
+for path in sys.argv[1:3]:
+    rows = []
+    for line in open(path, encoding="utf-8", errors="replace"):
+        f = line.rstrip("\n").split("\t")
+        if len(f) < 2:
+            continue
+        f[0] = "%s/%s" % (sys.argv[3], f[0].rsplit("/", 1)[-1])
+        rows.append("\t".join(f))
+    open(path, "w", encoding="utf-8").write("\n".join(rows) + "\n")
+PY
+
+    "$PYTHON" "$HERE/../x-asr/tools/eval_vehicle.py" \
+        --semantics "$HERE/tools/vehicle_semantics_expanded.tsv" \
+        --pack cabin-expanded="$exp_dir/manifest.tsv" \
+        --run host="$xhost" --run device-cpu="$xcpu" --run device-htp="$xhtp" \
+        --json "$PF_RUN/xe-grade.json" >"$PF_RUN/xe-grade.txt" 2>/dev/null \
+        || die "expanded-domain grading failed; see $PF_RUN/xe-grade.txt"
+    grep -E '^(host|device)' "$PF_RUN/xe-grade.txt" | sed 's/^/  /' || true
+    # 只有 host 一行说明设备臂一条都没匹配上（键错了），这不是「设备没问题」，
+    # 是检查自己坏了。宁可红。
+    [ "$(grep -cE '^## ' "$PF_RUN/xe-grade.txt")" -ge 3 ] \
+        || die "grading saw fewer than 3 arms; check the pack/clip keys in $PF_RUN/xe-grade.txt"
+
+    # 分数判据：设备任一臂低于主机就失败。容差给 1 个 clip 的分母（84 条
+    # 上 1.2 个点），因为单条临界样本的漂移可能两边各错一条、方向不同，
+    # 这种互不相欠的漂移不该判红。超过 1 条才开始怀疑规则在设备上失效。
+    "$PYTHON" - "$PF_RUN/xe-grade.txt" <<'PY'
+import re, sys
+
+scores = {}
+cur = None
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    line = line.strip()
+    m = re.match(r"^## (\S+)$", line)
+    if m:
+        cur = m.group(1)
+        continue
+    if cur and "command=" in line:
+        m = re.search(r"command=([\d.]+)%", line)
+        if m:
+            scores[cur] = float(m.group(1))
+
+host = scores.get("host")
+if host is None:
+    print("  could not read the host score from", sys.argv[1])
+    sys.exit(1)
+
+# 不容差：设备分数必须与主机相等。曾经给过 1.3 个点（「两边各错一条、
+# 互不相欠」），实测用 §33 之前的 profile 跑，两臂同时各掉一条、delta
+# 恰好 -1.2，被容差吞掉、检查保持绿——容差把要抓的缺陷正好放过去了。
+# 漂移本身不需要容差：转写不一致但分数不掉时 delta 就是 0。
+bad = 0
+for arm in ("device-cpu", "device-htp"):
+    val = scores.get(arm)
+    if val is None:
+        print("  %-11s MISSING from the grading report" % arm)
+        bad = 1
+        continue
+    delta = val - host
+    ok = delta >= 0
+    if not ok:
+        bad = 1
+    print("  %-11s command %.1f%% (host %.1f%%, delta %+.1f)  %s"
+          % (arm, val, host, delta, "ok" if ok else "FAIL"))
+sys.exit(1 if bad else 0)
+PY
+    local erc=$?
+    info ""
+    [ "$erc" = 0 ] || die "an expanded-domain device arm scored below the host; see $PF_RUN/xe-grade.txt"
+    info "== device matches the host on all 32 transcripts and loses nothing on the 84 expanded clips (run dir: $PF_RUN)"
 }
 
 # ---------------------------------------------------------------- main

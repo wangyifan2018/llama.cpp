@@ -366,7 +366,7 @@ That table predates both the mixed-language fixture and the hotword retune, and 
 | Q8_0, §15 profile with the two noun rewrites (§32) | **71.9%** | **100.0%** | 0.60% / **6.87%** |
 | Q8_0 SM6650 HTP, same profile | **71.9%** | **100.0%** | 0.60% / **6.87%** |
 
-The device row is not borrowed from the host: it was re-measured on SM6650 with `--device HTP0`, and the 47 transcripts behind it are byte-identical to the host ones. `R` fires on the same spans because the logits come from the same quantized weights, so the 2.39 deficit that calibrates the `rear right` margin is unchanged on device.
+The device row is not borrowed from the host: it was re-measured on SM6650 with `--device HTP0`, and the 47 transcripts behind it are byte-identical to the host ones. `R` fires on the same spans because the logits come from the same quantized weights, so the 2.39 deficit that calibrates the `rear right` margin is unchanged on device. **That byte-identity holds on this 32-clip set only** — see "The device is not byte-identical" below, where two of the 84 expanded clips segment differently on device.
 
 The §13-14 profile scores *below* no hotwords on mixed speech: its global `1.5 two` gain fires after `to` in `temperature to 二十一度` and inserts a token that the parser reads as 11 degrees. The current profile replaces it with `1.5 l>two`, which is narrow enough to fix `level two` and not fire at the boundary.
 
@@ -382,6 +382,37 @@ The profile above was tuned on 32 clips of windows, temperature, seat heat and a
 | Q8_0, shipped profile | **91.7%** | **91.9%** | **91.9%** | **0.00%** | **16.74%** |
 
 `wrong=0` in both arms: no clip in the expanded set reversed an on/off direction with the profile on. The 32-clip and mixed arms are unchanged at 71.9% / 100.0% / 0.60% / 6.87%, so this block is additive.
+
+### The device is not byte-identical, and that mattered
+
+The 47-clip claim above ("byte-identical on device") was measured on the 32-clip set and it still holds there: 32/32 identical on device CPU and on HTP0. It does **not** generalise to the expanded set. On 84 clips, three arms (host, device CPU, device HTP0) each fail a *different* single clip:
+
+| clip | host | device CPU | device HTP0 |
+|---|---|---|---|
+| `hvac2_en04` | ✅ `defog` | ❌ `definite` | ✅ `defog` |
+| `seat2_en03` | ✅ `driver seat massage` | ✅ `driver seat massage` | ❌ `driry eseseat massage` |
+
+The divergence is upstream of the hotword layer. With the profile off, the same wav and the same checkpoint (sha256 verified identical on both sides) produce different token sequences:
+
+| arm | `hvac2_en04` raw | `seat2_en03` raw |
+|---|---|---|
+| host CPU | `de@@|fin@@|i@@|tely` | `dri@@|ry|a@@|ther|se@@|at` |
+| device CPU | `de@@|fin@@|ite` | — (same as host) |
+| device HTP0 | — | `dri@@|ry|e@@|se@@|se@@|at` |
+
+Both are quantised-convolution numerics, not a build or weight mismatch: the Android binary is newer than the source tree's build time and the GGUF hash matches on both sides. The clips affected are the ones whose deficit is in the 0.6-1.8 band, exactly where a small logit shift changes the segmentation.
+
+**The consequence for the profile is a rule, not a retune.** A span rewrite matches one token shape exactly, so a rule written against the host's segmentation silently does nothing on a device that segments differently — and `PF_REPLACE_LOG` still reports a healthy deficit, which reads like a model limitation. Every rule whose wrong side is not stable across arms needs one entry per shape:
+
+```
+R 8.1 de@@+fin@@+i@@+tely => de@@+fo@@+g     # host, 4 pieces, deficit 6.8
+R 7.6 de@@+fin@@+ite        => de@@+fo@@+g    # phone CPU, 3 pieces, deficit 7.03
+R 4.1 dri@@+ry+e@@+se@@+se@@+at => dri@@+ver+se@@+at   # HTP only, deficit 3.57
+```
+
+With both shapes present, all three arms land at **91.7% / 91.9% / 16.74% / 0.00%** and the per-clip diff is empty. This is why `reproduce.sh device` now covers the 84-clip set: the host-only gate cannot see this class of defect, because the host numbers are already correct with the incomplete profile. The device check compares command accuracy per arm and requires the device to lose **nothing**; byte-identity is enforced only on the 32-clip set, where it is true.
+
+That check was verified to fail: swapping in the pre-§33 profile drops both device arms to 90.5% against a host 91.7% and `reproduce.sh device` exits 1. The first version of the check gave a 1.3-point tolerance on the reasoning that two arms failing two different clips is "even", and that tolerance swallowed exactly this regression — the tolerance is now 0.
 
 Per domain, which is the view that shows where the remaining gap is:
 
@@ -675,6 +706,7 @@ Things that block a production deployment, in the order they can be closed. The 
 
 The rest are correctness and operations items that can proceed in parallel:
 
+- **Host numbers are not automatically device numbers.** 32/32 identical, but 83/84 on the expanded set: two clips segment differently on device and each fails on a different arm. Both are now covered by shape-specific rules and all three arms score 91.7%, but the general lesson is that the host-only gate cannot detect a rule written against the host's segmentation. `reproduce.sh device` now grades the 84-clip set per arm for this reason. Before trusting any deficit measured on the host, confirm the span shape on the device with `PF_DUMP_TOKENS=1`. Any new span rewrite whose wrong side sits in the 0.6-1.8 deficit band should be checked on all three arms, not two.
 - Inject a DSP transport failure and a stuck worker to validate process isolation with the target service manager. Exercise restart under load and confirm the socket and queue resource bounds on that deployment.
 - Agree the user-facing P95/P99 deadlines, failure and recovery targets, soak duration and RAM budget on the production SoC with representative services active. Use the same 20 ms workload and compare the two routing modes at that load.
 - Keep voiceprint advisory until target-channel independent enrollment and impostor trials qualify it.
