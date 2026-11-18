@@ -29,6 +29,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <optional>
 #include <unordered_map>
 #include <string>
 #include <vector>
@@ -178,6 +180,7 @@ struct paraformer_context {
     ggml_backend_t backend_cpu = nullptr;
     pf_stage_cache enc_cache;
     pf_stage_cache dec_cache;
+    paraformer_placement warmup_placement = {};
     int n_threads = 4;
     bool flash_attn = true;
     int verbosity = 0;
@@ -247,10 +250,17 @@ static inline ggml_tensor* mm_bias(ggml_context* ctx0, ggml_tensor* W, ggml_tens
 // [0, 5]. Bias is applied to every CIF position; NAR decoding has no
 // autoregressive prefix, so x-asr's head/prefix weighting does not apply.
 // Empty/invalid config leaves hotword_bonus empty => bit-identical baseline.
-// Rewrite exact wrong spans in place. Returns the number of rewrites.
-static int pf_apply_replacements(std::vector<int>& chosen, const float* logits, int V, const std::vector<pf_repl>& repls,
-                                 const std::vector<std::string>& vocab, bool verbose) {
-    int applied = 0;
+struct pf_choice {
+    int id;
+    double start_row;
+    double end_row;
+    bool rewritten = false;
+
+    size_t logits_row() const { return (size_t) std::lround(end_row); }
+};
+
+static void pf_apply_replacements(std::vector<pf_choice>& chosen, const float* logits, int V,
+                                  const std::vector<pf_repl>& repls, const std::vector<std::string>& vocab, bool verbose) {
     if (verbose) {
         fprintf(stderr, "pf-repl: %zu rules, %zu chosen\n", repls.size(), chosen.size());
     }
@@ -260,7 +270,7 @@ static int pf_apply_replacements(std::vector<int>& chosen, const float* logits, 
             std::string w, c;
             for (int id : r.wrong) w += vocab[(size_t) id] + "|";
             for (size_t i = 0; i < chosen.size() && i < 8; ++i) {
-                const int id = chosen[i];
+                const int id = chosen[i].id;
                 c += (id >= 0 && (size_t) id < vocab.size()) ? vocab[(size_t) id] + "|" : "?|";
             }
             fprintf(stderr, "pf-repl: rule [%s] chosen head [%s]\n", w.c_str(), c.c_str());
@@ -273,7 +283,7 @@ static int pf_apply_replacements(std::vector<int>& chosen, const float* logits, 
             // Compare token text, not ids: the vocab can hold duplicate strings.
             bool match = true;
             for (size_t i = 0; i < nw; ++i) {
-                const int a = chosen[p + i], b = r.wrong[i];
+                const int a = chosen[p + i].id, b = r.wrong[i];
                 if (a < 0 || (size_t) a >= vocab.size() || (size_t) b >= vocab.size() ||
                     vocab[(size_t) a] != vocab[(size_t) b]) {
                     match = false;
@@ -285,10 +295,12 @@ static int pf_apply_replacements(std::vector<int>& chosen, const float* logits, 
                 continue;
             }
             double sw = 0.0, sr = 0.0;
-            for (size_t i = 0; i < nw; ++i)
-                sw += logits[(p + i) * (size_t) V + r.wrong[i]];
-            for (size_t i = 0; i < nr; ++i)
-                sr += logits[(p + std::min(i, nw - 1)) * (size_t) V + r.right[i]];
+            for (size_t i = 0; i < nw; ++i) {
+                sw += logits[chosen[p + i].logits_row() * V + r.wrong[i]];
+            }
+            for (size_t i = 0; i < nr; ++i) {
+                sr += logits[chosen[p + std::min(i, nw - 1)].logits_row() * V + r.right[i]];
+            }
             const double avg_w = sw / (double) nw, avg_r = sr / (double) nr;
             if (verbose) {
                 fprintf(stderr, "pf-repl: match at %zu, avg_wrong %.2f avg_right %.2f deficit %.2f\n", p, avg_w, avg_r,
@@ -298,16 +310,27 @@ static int pf_apply_replacements(std::vector<int>& chosen, const float* logits, 
                 ++p;
                 continue;
             }
-            chosen.erase(chosen.begin() + (long) p, chosen.begin() + (long) (p + nw));
-            chosen.insert(chosen.begin() + (long) p, r.right.begin(), r.right.end());
-            ++applied;
+            std::vector<pf_choice> replacement;
+            replacement.reserve(nr);
+            const double first = chosen[p].start_row, last = chosen[p + nw - 1].end_row;
+            for (size_t i = 0; i < nr; ++i) {
+                if (nw == nr) {
+                    replacement.push_back({r.right[i], chosen[p + i].start_row, chosen[p + i].end_row, true});
+                } else if (nr == 1) {
+                    replacement.push_back({r.right[i], first, last, true});
+                } else {
+                    const double row = first + (last - first) * (double) i / (double) (nr - 1);
+                    replacement.push_back({r.right[i], row, row, true});
+                }
+            }
+            auto at = chosen.erase(chosen.begin() + p, chosen.begin() + p + nw);
+            chosen.insert(at, replacement.begin(), replacement.end());
             if (verbose) {
                 fprintf(stderr, "paraformer: span rewrite at %zu, avg %.2f -> %.2f\n", p, avg_w, avg_r);
             }
             p += nr;
         }
     }
-    return applied;
 }
 
 // Greedy longest-match tokenisation of one phrase: Chinese characters and Latin
@@ -1087,13 +1110,52 @@ static ggml_tensor* build_decoder_post(ggml_context* ctx0, ggml_tensor* cur, con
 // Full inference
 // ===========================================================================
 
-static bool paraformer_ensure_sched(paraformer_context* ctx, pf_stage_cache& cache) {
-    if (cache.sched)
-        return true;
+static ggml_backend_sched_t paraformer_new_sched(paraformer_context* ctx) {
     ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
     int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
-    cache.sched = ggml_backend_sched_new(backends, nullptr, n_be, 8192, false, false);
+    return ggml_backend_sched_new(backends, nullptr, n_be, 8192, false, false);
+}
+
+static bool paraformer_ensure_sched(paraformer_context* ctx, pf_stage_cache& cache) {
+    if (!cache.sched) cache.sched = paraformer_new_sched(ctx);
     return cache.sched != nullptr;
+}
+
+static void paraformer_reset_stage(pf_stage_cache& cache) {
+    if (cache.sched) ggml_backend_sched_reset(cache.sched);
+    ggml_free(cache.ctx);
+    cache.ctx = nullptr;
+    cache.gf = nullptr;
+}
+
+static void paraformer_count_placement(const char* stage, ggml_backend_sched_t sched, ggml_cgraph* graph,
+                                      ggml_backend_t backend, int& device_ops, int& total_ops) {
+    device_ops = total_ops = 0;
+    int other_ops[GGML_OP_COUNT] = {};
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        auto* node = ggml_graph_node(graph, i);
+        switch (node->op) {
+            case GGML_OP_NONE:
+            case GGML_OP_VIEW:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_TRANSPOSE:
+            case GGML_OP_PERMUTE:
+                continue;
+            default:
+                ++total_ops;
+        }
+        if (ggml_backend_sched_get_tensor_backend(sched, node) == backend) {
+            ++device_ops;
+        } else {
+            ++other_ops[node->op];
+        }
+    }
+    for (int op = 0; op < GGML_OP_COUNT; ++op) {
+        if (other_ops[op]) {
+            fprintf(stderr, "paraformer: warmup %s %s outside %s: %d\n", stage, ggml_op_name((ggml_op) op),
+                    ggml_backend_name(backend), other_ops[op]);
+        }
+    }
 }
 
 // §15: one decoded token with the time and confidence stitch needs.
@@ -1101,15 +1163,213 @@ static bool paraformer_ensure_sched(paraformer_context* ctx, pf_stage_cache& cac
 // string path skips it, so single-utterance output stays bit-identical.
 struct pf_token {
     std::string text;     // as emitted (may end in @@ for BPE continuation)
-    int64_t t_ms;         // fire frame * ms_per_alpha_frame
+    int64_t start_ms;
+    int64_t t_ms;
     float posterior;      // softmax probability of the chosen token
-    int local_index;      // position within its window
 };
 
-static std::string paraformer_transcribe_impl(paraformer_context* ctx, const float* pcm, int n_samples,
+static ggml_cgraph* paraformer_build_encoder(paraformer_context* ctx, ggml_context* ctx0, int T_lfr,
+                                             int D_lfr_actual, int batch, bool stage) {
+    const auto& hp = ctx->model.hp;
+    const int D = (int) hp.d_model;
+    auto* gf = ggml_new_graph_custom(ctx0, 32768, false);
+
+    // Input tensor
+    ggml_tensor* inp = batch == 1 ? ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D_lfr_actual, T_lfr)
+                                  : ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, D_lfr_actual, T_lfr, batch);
+    ggml_set_name(inp, "features");
+    ggml_set_input(inp);
+    // SANMEncoder with input_layer "pe": xs *= sqrt(output_size), then
+    // SinusoidalPositionEncoder adds sin|cos of positions 1..T over the input
+    // width. Missing before 2026-09: encoder_layer_0 sat at cos ~0.95 against
+    // upstream while the text still came out right.
+    ggml_tensor* pe_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D_lfr_actual, T_lfr);
+    ggml_set_name(pe_in, "enc_pe");
+    ggml_set_input(pe_in);
+
+    ggml_tensor* cur = ggml_add(ctx0, ggml_scale(ctx0, inp, std::sqrt((float)D)), pe_in);
+
+    // Encoder: entry block(s)
+    int enc_layer_idx = 0;
+    for (uint32_t i = 0; i < hp.n_enc_blocks0; i++) {
+        core_sanm::BlockParams p;
+        p.in_size = (i == 0) ? D_lfr_actual : D;
+        p.size = D;
+        p.n_heads = (int)hp.n_heads;
+        p.head_dim = D / (int)hp.n_heads;
+        p.kernel = (int)hp.sanm_kernel;
+        p.ln_eps = hp.ln_eps;
+        p.flash_attn = ctx->flash_attn;
+        cur = core_sanm::build_block(ctx0, cur, T_lfr, ctx->model.enc0[i], p, /*apply_attn_residual=*/false);
+        if (stage) {
+            char nm[64];
+            std::snprintf(nm, sizeof(nm), "encoder_layer_%d", enc_layer_idx);
+            ggml_set_name(cur, nm);
+            ggml_set_output(cur);
+        }
+        enc_layer_idx++;
+    }
+
+    // Encoder: main blocks
+    for (uint32_t i = 0; i < hp.n_enc_blocks; i++) {
+        core_sanm::BlockParams p;
+        p.in_size = D;
+        p.size = D;
+        p.n_heads = (int)hp.n_heads;
+        p.head_dim = D / (int)hp.n_heads;
+        p.kernel = (int)hp.sanm_kernel;
+        p.ln_eps = hp.ln_eps;
+        p.flash_attn = ctx->flash_attn;
+        cur = core_sanm::build_block(ctx0, cur, T_lfr, ctx->model.enc[i], p, /*apply_attn_residual=*/true);
+        if (stage) {
+            char nm[64];
+            std::snprintf(nm, sizeof(nm), "encoder_layer_%d", enc_layer_idx);
+            ggml_set_name(cur, nm);
+            ggml_set_output(cur);
+        }
+        enc_layer_idx++;
+    }
+
+    // Encoder: after_norm
+    cur = ggml_norm_affine(ctx0, cur, ctx->model.enc_after_norm_w, ctx->model.enc_after_norm_b, hp.ln_eps);
+    ggml_set_name(cur, "encoder_output");
+    ggml_set_output(cur);
+    ggml_build_forward_expand(gf, cur);
+    return gf;
+}
+
+static std::vector<float> paraformer_encoder_pe(const paraformer_context* ctx, int T_lfr, int Dp) {
+    // sinusoidal PE (FunASR SinusoidalPositionEncoder): positions 1..T,
+    // depth = input width; first half sin, second half cos
+    const int half = Dp / 2;
+    const float log_inc = std::log(10000.0f) / (float)(half - 1);
+    std::vector<float> inv_freq((size_t)half);
+    for (int i = 0; i < half; i++) {
+        inv_freq[i] = std::exp(-log_inc * (float)i);
+    }
+    std::vector<float> pe((size_t)Dp * (size_t)T_lfr);
+    float* pe_ptr = pe.data();
+    const float* inv_freq_ptr = inv_freq.data();
+    auto compute_pe = [&](int t0, int t1) {
+        for (int t = t0; t < t1; t++) {
+            float* row_sin = pe_ptr + (size_t)t * Dp;
+            float* row_cos = row_sin + half;
+            const float t_plus_1 = (float)(t + 1);
+            for (int i = 0; i < half; i++) {
+                const float a = t_plus_1 * inv_freq_ptr[i];
+                row_sin[i] = std::sin(a);
+                row_cos[i] = std::cos(a);
+            }
+        }
+    };
+    if (T_lfr >= 16) {
+        core_parallel::for_each_chunk_work(T_lfr, ctx->n_threads, (uint64_t)Dp * 4, 65536, compute_pe);
+    } else {
+        compute_pe(0, T_lfr);
+    }
+    return pe;
+}
+
+bool paraformer_bench_encoder_pair(paraformer_context* ctx, const float* pcm_a, const float* pcm_b, int n_samples, int reps) {
+    if (!ctx || !pcm_a || !pcm_b || n_samples <= 0 || reps <= 0) return false;
+    int T = 0, D = 0, T_b = 0, D_b = 0;
+    const auto a = paraformer_compute_features(ctx, pcm_a, n_samples, T, D);
+    const auto b = paraformer_compute_features(ctx, pcm_b, n_samples, T_b, D_b);
+    if (a.empty() || T != T_b || D != D_b || a.size() != b.size()) return false;
+    const auto pe = paraformer_encoder_pe(ctx, T, D);
+
+    struct EncoderGraph {
+        std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx{nullptr, &ggml_free};
+        std::unique_ptr<ggml_backend_sched, decltype(&ggml_backend_sched_free)> sched{nullptr, &ggml_backend_sched_free};
+        ggml_cgraph* gf = nullptr;
+        ggml_tensor* features = nullptr;
+        ggml_tensor* positions = nullptr;
+        ggml_tensor* output = nullptr;
+    } serial, paired;
+
+    auto prepare = [&](EncoderGraph& graph, int width) {
+        graph.ctx.reset(ggml_init({32 * 1024 * 1024, nullptr, true}));
+        graph.sched.reset(paraformer_new_sched(ctx));
+        if (!graph.ctx || !graph.sched) return false;
+        graph.gf = paraformer_build_encoder(ctx, graph.ctx.get(), T, D, width, false);
+        if (!ggml_backend_sched_alloc_graph(graph.sched.get(), graph.gf)) return false;
+        graph.features = ggml_graph_get_tensor(graph.gf, "features");
+        graph.positions = ggml_graph_get_tensor(graph.gf, "enc_pe");
+        graph.output = ggml_graph_get_tensor(graph.gf, "encoder_output");
+        int on_target, total;
+        paraformer_count_placement("encoder probe", graph.sched.get(), graph.gf, ctx->backend, on_target, total);
+        printf("encoder_pair width=%d frames=%d device=%s ops=%d/%d splits=%d\n", width, T,
+               ggml_backend_name(ctx->backend), on_target, total, ggml_backend_sched_get_n_splits(graph.sched.get()));
+        return true;
+    };
+    if (!prepare(serial, 1) || !prepare(paired, 2)) return false;
+
+    using Clock = std::chrono::steady_clock;
+    auto elapsed_ms = [](Clock::time_point begin, Clock::time_point end) {
+        return std::chrono::duration<double, std::milli>(end - begin).count();
+    };
+    struct Timing { double wall_ms = 0; double compute_ms = 0; };
+    auto run = [&](EncoderGraph& graph, const std::vector<float>& first, const std::vector<float>* second,
+                   float* output, Timing& timing) {
+        const auto begin = Clock::now();
+        ggml_backend_tensor_set(graph.features, first.data(), 0, first.size() * sizeof(float));
+        if (second) {
+            ggml_backend_tensor_set(graph.features, second->data(), first.size() * sizeof(float), second->size() * sizeof(float));
+        }
+        ggml_backend_tensor_set(graph.positions, pe.data(), 0, pe.size() * sizeof(float));
+        const auto ready = Clock::now();
+        if (ggml_backend_sched_graph_compute(graph.sched.get(), graph.gf) != GGML_STATUS_SUCCESS) return false;
+        const auto done = Clock::now();
+        ggml_backend_tensor_get(graph.output, output, 0, ggml_nbytes(graph.output));
+        timing.wall_ms += elapsed_ms(begin, Clock::now());
+        timing.compute_ms += elapsed_ms(ready, done);
+        return true;
+    };
+
+    const size_t stride = (size_t) ctx->model.hp.d_model * T;
+    std::vector<float> reference(2 * stride), output(2 * stride);
+    for (int i = -2; i < reps; ++i) {
+        Timing one, two;
+        const auto& first = i % 2 ? b : a;
+        const auto& second = i % 2 ? a : b;
+        auto run_serial = [&] {
+            return run(serial, first, nullptr, reference.data(), one) &&
+                   run(serial, second, nullptr, reference.data() + stride, one);
+        };
+        auto run_batch = [&] { return run(paired, first, &second, output.data(), two); };
+        if (!(i % 2 ? run_batch() && run_serial() : run_serial() && run_batch())) return false;
+
+        double rel_rms[2] = {};
+        double max_abs[2] = {};
+        for (size_t lane = 0; lane < 2; ++lane) {
+            double ref_sum = 0, err_sum = 0;
+            for (size_t j = lane * stride; j < (lane + 1) * stride; ++j) {
+                const double v = reference[j], error = output[j] - v;
+                if (!std::isfinite(v) || !std::isfinite(error)) return false;
+                ref_sum += v * v;
+                err_sum += error * error;
+                max_abs[lane] = std::max(max_abs[lane], std::abs(error));
+            }
+            rel_rms[lane] = std::sqrt(err_sum / std::max(ref_sum, 1e-30));
+        }
+        if (i >= 0) {
+            printf("encoder_pair rep=%d serial_ms=%.4f batch_ms=%.4f serial_compute_ms=%.4f batch_compute_ms=%.4f "
+                   "rel_rms_a=%.8g rel_rms_b=%.8g max_abs_a=%.8g max_abs_b=%.8g\n",
+                   i, one.wall_ms, two.wall_ms, one.compute_ms, two.compute_ms,
+                   rel_rms[i % 2], rel_rms[1 - i % 2], max_abs[i % 2], max_abs[1 - i % 2]);
+        }
+        if (std::max(rel_rms[0], rel_rms[1]) > 1e-3) {
+            fprintf(stderr, "paraformer: encoder pair parity failed: %.8g %.8g (limit 0.001)\n", rel_rms[0], rel_rms[1]);
+            return false;
+        }
+    }
+    return true;
+}
+
+static std::optional<std::string> paraformer_transcribe_impl(paraformer_context* ctx, const float* pcm, int n_samples,
                                               std::vector<float>* staged_out = nullptr, const char* stage = nullptr,
-                                              std::vector<int>* out_fire_frames = nullptr,
-                                              std::vector<pf_token>* out_tokens = nullptr) {
+                                              std::vector<pf_token>* out_tokens = nullptr,
+                                              paraformer_placement* warmup = nullptr) {
     const auto& hp = ctx->model.hp;
     const int D = (int)hp.d_model;
     paraformer_bench_lap _lap;
@@ -1126,7 +1386,7 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
         _lap.mark("feat done");
     }
     if (lfr.empty())
-        return "";
+        return warmup ? std::nullopt : std::optional<std::string>("");
 
     // 2. Build and run encoder graph
     // §176s: reuse cached encoder graph when T_lfr matches (skip graph build).
@@ -1150,11 +1410,7 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     } else {
         ++ec.misses;
         _lap.mark("enc graph miss");
-        if (ec.ctx) {
-            ggml_free(ec.ctx);
-            ec.ctx = nullptr;
-            ec.gf = nullptr;
-        }
+        paraformer_reset_stage(ec);
         if (can_cache) {
             if (ec.meta.empty())
                 ec.meta.resize(meta_sz);
@@ -1166,75 +1422,8 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
             ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
             ctx0 = ggml_init(ip);
         }
-        gf = ggml_new_graph_custom(ctx0, 32768, false);
+        gf = paraformer_build_encoder(ctx, ctx0, T_lfr, D_lfr_actual, 1, stage != nullptr);
 
-        // Input tensor
-        ggml_tensor* inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D_lfr_actual, T_lfr);
-        ggml_set_name(inp, "features");
-        ggml_set_input(inp);
-        // SANMEncoder with input_layer "pe": xs *= sqrt(output_size), then
-        // SinusoidalPositionEncoder adds sin|cos of positions 1..T over the input
-        // width. Missing before 2026-09: encoder_layer_0 sat at cos ~0.95 against
-        // upstream while the text still came out right.
-        ggml_tensor* pe_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D_lfr_actual, T_lfr);
-        ggml_set_name(pe_in, "enc_pe");
-        ggml_set_input(pe_in);
-
-        ggml_tensor* cur = ggml_add(ctx0, ggml_scale(ctx0, inp, std::sqrt((float)D)), pe_in);
-
-        // Encoder: entry block(s)
-        int enc_layer_idx = 0;
-        for (uint32_t i = 0; i < hp.n_enc_blocks0; i++) {
-            core_sanm::BlockParams p;
-            p.in_size = (i == 0) ? D_lfr_actual : D;
-            p.size = D;
-            p.n_heads = (int)hp.n_heads;
-            p.head_dim = D / (int)hp.n_heads;
-            p.kernel = (int)hp.sanm_kernel;
-            p.ln_eps = hp.ln_eps;
-            p.flash_attn = ctx->flash_attn;
-            cur = core_sanm::build_block(ctx0, cur, T_lfr, ctx->model.enc0[i], p, /*apply_attn_residual=*/false);
-            if (stage) {
-                char nm[64];
-                std::snprintf(nm, sizeof(nm), "encoder_layer_%d", enc_layer_idx);
-                ggml_set_name(cur, nm);
-                ggml_set_output(cur);
-            }
-            enc_layer_idx++;
-        }
-
-        // Encoder: main blocks
-        for (uint32_t i = 0; i < hp.n_enc_blocks; i++) {
-            core_sanm::BlockParams p;
-            p.in_size = D;
-            p.size = D;
-            p.n_heads = (int)hp.n_heads;
-            p.head_dim = D / (int)hp.n_heads;
-            p.kernel = (int)hp.sanm_kernel;
-            p.ln_eps = hp.ln_eps;
-            p.flash_attn = ctx->flash_attn;
-            cur = core_sanm::build_block(ctx0, cur, T_lfr, ctx->model.enc[i], p, /*apply_attn_residual=*/true);
-            if (stage) {
-                char nm[64];
-                std::snprintf(nm, sizeof(nm), "encoder_layer_%d", enc_layer_idx);
-                ggml_set_name(cur, nm);
-                ggml_set_output(cur);
-            }
-            enc_layer_idx++;
-        }
-
-        // Encoder: after_norm
-        cur = ggml_norm_affine(ctx0, cur, ctx->model.enc_after_norm_w, ctx->model.enc_after_norm_b, hp.ln_eps);
-        ggml_set_name(cur, "encoder_output");
-        ggml_set_output(cur);
-        ggml_build_forward_expand(gf, cur);
-
-        if (can_cache) {
-            ec.ctx = ctx0;
-            ec.gf = gf;
-            ec.k0 = T_lfr;
-            ctx0 = nullptr; // owned by the cache now
-        }
     }
     _lap.mark("enc graph built");
 
@@ -1242,19 +1431,20 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     if (!paraformer_ensure_sched(ctx, ec)) {
         if (ctx0)
             ggml_free(ctx0);
-        return "";
+        return std::nullopt;
     }
     if (!enc_hit) {
-        ggml_backend_sched_reset(ec.sched);
         if (!ggml_backend_sched_alloc_graph(ec.sched, gf)) {
             fprintf(stderr, "paraformer: sched alloc encoder graph failed\n");
-            if (can_cache) {
-                ec.ctx = nullptr;
-                ec.gf = nullptr;
-            }
-            if (ctx0)
-                ggml_free(ctx0);
-            return "";
+            paraformer_reset_stage(ec);
+            ggml_free(ctx0);
+            return std::nullopt;
+        }
+        if (can_cache) {
+            ec.ctx = ctx0;
+            ec.gf = gf;
+            ec.k0 = T_lfr;
+            ctx0 = nullptr;
         }
     }
     _lap.mark("enc sched alloc");
@@ -1265,42 +1455,15 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
         if (lfr_bytes > inp_bytes) {
             fprintf(stderr, "paraformer: input tensor too small: %zu bytes vs %zu lfr bytes (T=%d, D=%d)\n", inp_bytes,
                     lfr_bytes, T_lfr, D_lfr_actual);
-            if (ctx0)
-                ggml_free(ctx0);
-            return "";
+            paraformer_reset_stage(ec);
+            ggml_free(ctx0);
+            return std::nullopt;
         }
         if (ctx->verbosity >= 2)
             fprintf(stderr, "paraformer: encoder input OK: T_lfr=%d, D_lfr=%d, bytes=%zu\n", T_lfr, D_lfr_actual,
                     lfr_bytes);
         ggml_backend_tensor_set(inp, lfr.data(), 0, lfr_bytes);
-        // sinusoidal PE (FunASR SinusoidalPositionEncoder): positions 1..T,
-        // depth = input width; first half sin, second half cos
-        const int Dp = D_lfr_actual, half = Dp / 2;
-        const float log_inc = std::log(10000.0f) / (float)(half - 1);
-        std::vector<float> inv_freq((size_t)half);
-        for (int i = 0; i < half; i++) {
-            inv_freq[i] = std::exp(-log_inc * (float)i);
-        }
-        std::vector<float> pe((size_t)Dp * (size_t)T_lfr);
-        float* pe_ptr = pe.data();
-        const float* inv_freq_ptr = inv_freq.data();
-        auto compute_pe = [&](int t0, int t1) {
-            for (int t = t0; t < t1; t++) {
-                float* row_sin = pe_ptr + (size_t)t * Dp;
-                float* row_cos = row_sin + half;
-                const float t_plus_1 = (float)(t + 1);
-                for (int i = 0; i < half; i++) {
-                    const float a = t_plus_1 * inv_freq_ptr[i];
-                    row_sin[i] = std::sin(a);
-                    row_cos[i] = std::cos(a);
-                }
-            }
-        };
-        if (T_lfr >= 16) {
-            core_parallel::for_each_chunk_work(T_lfr, ctx->n_threads, (uint64_t)Dp * 4, 65536, compute_pe);
-        } else {
-            compute_pe(0, T_lfr);
-        }
+        const auto pe = paraformer_encoder_pe(ctx, T_lfr, D_lfr_actual);
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "enc_pe"), pe.data(), 0, pe.size() * sizeof(float));
     }
     if (ctx->verbosity >= 2)
@@ -1309,9 +1472,14 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
         paraformer_bench_stage _b("encoder");
         if (core_sched_prof::compute(ec.sched, gf, "paraformer") != GGML_STATUS_SUCCESS) {
             fprintf(stderr, "paraformer: encoder graph compute failed\n");
+            paraformer_reset_stage(ec);
             ggml_free(ctx0);
-            return "";
+            return std::nullopt;
         }
+    }
+    if (warmup) {
+        paraformer_count_placement("encoder", ec.sched, gf, ctx->backend, warmup->encoder_device_ops,
+                                   warmup->encoder_total_ops);
     }
     if (ctx->verbosity >= 2)
         fprintf(stderr, "paraformer: encoder done\n");
@@ -1321,8 +1489,9 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     ggml_tensor* enc_result = ggml_graph_get_tensor(gf, "encoder_output");
     if (!enc_result) {
         fprintf(stderr, "paraformer: encoder_output tensor not found in graph\n");
+        paraformer_reset_stage(ec);
         ggml_free(ctx0);
-        return "";
+        return std::nullopt;
     }
     const size_t enc_bytes = ggml_nbytes(enc_result);
     const size_t enc_expect = (size_t)D * T_lfr * sizeof(float);
@@ -1333,8 +1502,9 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     if (enc_bytes < enc_expect) {
         fprintf(stderr, "paraformer: encoder_output size mismatch: got %zu, expected %zu (D=%d, T=%d)\n", enc_bytes,
                 enc_expect, D, T_lfr);
+        paraformer_reset_stage(ec);
         ggml_free(ctx0);
-        return "";
+        return std::nullopt;
     }
     std::vector<float> enc_out((size_t)D * T_lfr);
     ggml_backend_tensor_get(enc_result, enc_out.data(), 0, enc_expect);
@@ -1377,17 +1547,16 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
         paraformer_bench_stage _b("cif_predict");
         // §15: tokens need their fire frames too, so request them when either
         // the caller asked for frames or for token records.
-        cif_predict(ctx, enc_out.data(), T_lfr, D, acoustic_embeds, N_tokens,
-                    (out_fire_frames || out_tokens) ? &fire_frames_vec : nullptr);
+        cif_predict(ctx, enc_out.data(), T_lfr, D, acoustic_embeds, N_tokens, out_tokens ? &fire_frames_vec : nullptr);
         _lap.mark("cif done");
     }
-    if (out_fire_frames)
-        *out_fire_frames = fire_frames_vec;
-
     if (ctx->verbosity >= 1)
         fprintf(stderr, "paraformer: CIF predicted %d tokens from T_lfr=%d\n", N_tokens, T_lfr);
-    if (N_tokens <= 0)
-        return "";
+    if (N_tokens <= 0) {
+        if (!warmup) return "";
+        N_tokens = 1;
+        acoustic_embeds.assign(D, 0.0f);
+    }
 
     // Stage capture: acoustic_embeds (row-major (N, D))
     if (stage && staged_out && std::strcmp(stage, "acoustic_embeds") == 0) {
@@ -1408,11 +1577,7 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
         enc_tensor = ggml_graph_get_tensor(gf, "enc_for_decoder");
     } else {
         ++dc.misses;
-        if (dc.ctx) {
-            ggml_free(dc.ctx);
-            dc.ctx = nullptr;
-            dc.gf = nullptr;
-        }
+        paraformer_reset_stage(dc);
         if (dec_cacheable) {
             if (dc.meta.empty())
                 dc.meta.resize(meta_sz);
@@ -1472,19 +1637,14 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     if (!paraformer_ensure_sched(ctx, dc)) {
         if (ctx0)
             ggml_free(ctx0);
-        return "";
+        return std::nullopt;
     }
     if (!dec_hit) {
-        ggml_backend_sched_reset(dc.sched);
         if (!ggml_backend_sched_alloc_graph(dc.sched, gf)) {
             fprintf(stderr, "paraformer: sched alloc decoder graph failed\n");
-            if (dec_cacheable) {
-                dc.ctx = nullptr;
-                dc.gf = nullptr;
-            }
-            if (ctx0)
-                ggml_free(ctx0);
-            return "";
+            paraformer_reset_stage(dc);
+            ggml_free(ctx0);
+            return std::nullopt;
         }
         if (dec_cacheable) {
             dc.ctx = ctx0;
@@ -1505,9 +1665,14 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
         paraformer_bench_stage _b("decoder");
         if (core_sched_prof::compute(dc.sched, gf, "paraformer") != GGML_STATUS_SUCCESS) {
             fprintf(stderr, "paraformer: decoder graph compute failed\n");
+            paraformer_reset_stage(dc);
             ggml_free(ctx0);
-            return "";
+            return std::nullopt;
         }
+    }
+    if (warmup) {
+        paraformer_count_placement("decoder", dc.sched, gf, ctx->backend, warmup->decoder_device_ops,
+                                   warmup->decoder_total_ops);
     }
 
     // Stage capture from decoder graph
@@ -1560,16 +1725,9 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     int prev_token = -1;            // §13: token chosen at n-1, for seq rules
     // Choose first, rewrite spans, then render. Without replacement rules the
     // output is byte-identical to the single-pass version.
-    std::vector<int> chosen((size_t) N_tokens, -1);
-    // Token records are built after the span rewrite, so a rewritten token keeps
-    // the time of its position and the rewrite is not silently skipped whenever
-    // the caller asks for timestamps.
-    std::vector<int64_t> pos_t_ms;
-    std::vector<float> pos_posterior;
-    if (out_tokens) {
-        pos_t_ms.assign((size_t) N_tokens, 0);
-        pos_posterior.assign((size_t) N_tokens, 1.0f);
-    }
+    std::vector<pf_choice> chosen;
+    chosen.reserve(N_tokens);
+    std::vector<float> pos_posterior(out_tokens ? (size_t) N_tokens : 0, 0.0f);
     for (int n = 0; n < N_tokens; n++) {
         const float* row = logits_data.data() + (size_t)n * V;
         // §13: prefix-conditional gains for this position (depends on prev token).
@@ -1657,7 +1815,7 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
             ctx_active.swap(next_active);
         }
         prev_token = best;
-        chosen[(size_t) n] = best;
+        chosen.push_back({best, (double) n, (double) n});
         // Skip special tokens: 0=<blank>, 1=<s>, 2=</s>, last=<unk>
         if (best <= 2 || best == V - 1)
             continue;
@@ -1667,20 +1825,10 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
             // only paid when out_tokens is requested, so the plain path is
             // unchanged.
             if (out_tokens) {
-                float mx = -1e30f;
-                for (int v = 0; v < V; ++v) {
-                    const float val = row[v] + (apply_bias ? bias_of(v) : 0.0f);
-                    if (val > mx)
-                        mx = val;
-                }
                 double sum = 0.0;
                 for (int v = 0; v < V; ++v)
-                    sum += std::exp((double) (row[v] + (apply_bias ? bias_of(v) : 0.0f) - mx));
-                const float best_biased = row[best] + (apply_bias ? bias_of(best) : 0.0f);
-                const float posterior = (float) (std::exp((double) (best_biased - mx)) / sum);
-                const int frame = (n < (int) fire_frames_vec.size()) ? fire_frames_vec[(size_t) n] : 0;
-                pos_t_ms[(size_t) n] = (int64_t) frame * (int64_t) hp.lfr_n * 10;
-                pos_posterior[(size_t) n] = posterior;
+                    sum += std::exp((double) (row[v] + (apply_bias ? bias_of(v) : 0.0f) - best_val));
+                pos_posterior[(size_t) n] = (float) (1.0 / sum);
             }
         }
     }
@@ -1691,19 +1839,30 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     }
 
     if (out_tokens) {
-        // Build the records from the rewritten sequence: text from the chosen id,
-        // time/posterior from the position it occupies.
-        for (size_t n = 0; n < chosen.size(); ++n) {
-            const int id = chosen[n];
+        const double frame_step_ms = (double) hp.lfr_n * hp.frame_shift_ms;
+        auto time_at = [&](double row) {
+            const size_t lo = (size_t) row;
+            const size_t hi = std::min(lo + 1, fire_frames_vec.size() - 1);
+            const double frame = fire_frames_vec[lo] + (row - lo) * (fire_frames_vec[hi] - fire_frames_vec[lo]);
+            return (int64_t) std::lround(frame * frame_step_ms);
+        };
+        for (const auto& choice : chosen) {
+            const int id = choice.id;
             if (id <= 2 || id == V - 1 || (size_t) id >= ctx->vocab.size()) {
                 continue;
             }
-            pf_token rec;
-            rec.text = ctx->vocab[(size_t) id];
-            rec.t_ms = n < pos_t_ms.size() ? pos_t_ms[n] : 0;
-            rec.posterior = n < pos_posterior.size() ? pos_posterior[n] : 1.0f;
-            rec.local_index = (int) n;
-            out_tokens->push_back(std::move(rec));
+            const size_t src = choice.logits_row();
+            float posterior = pos_posterior[src];
+            if (choice.rewritten) {
+                const float* row = logits_data.data() + src * V;
+                const float mx = *std::max_element(row, row + V);
+                double sum = 0.0;
+                for (int v = 0; v < V; ++v) {
+                    sum += std::exp((double) (row[v] - mx));
+                }
+                posterior = (float) (std::exp((double) (row[id] - mx)) / sum);
+            }
+            out_tokens->push_back({ctx->vocab[(size_t) id], time_at(choice.start_row), time_at(choice.end_row), posterior});
         }
     }
 
@@ -1717,7 +1876,7 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     if (std::getenv("PF_DUMP_TOKENS")) {
         std::string ids;
         for (size_t n = 0; n < chosen.size(); ++n) {
-            const int id = chosen[n];
+            const int id = chosen[n].id;
             if (id >= 0 && (size_t) id < ctx->vocab.size())
                 ids += ctx->vocab[(size_t) id] + "|";
         }
@@ -1725,7 +1884,7 @@ static std::string paraformer_transcribe_impl(paraformer_context* ctx, const flo
     }
 
     for (size_t n = 0; n < chosen.size(); n++) {
-        const int best = chosen[n];
+        const int best = chosen[n].id;
         if (best < 0 || best <= 2 || best == V - 1 || (size_t) best >= ctx->vocab.size())
             continue;
         const std::string& tok = ctx->vocab[best];
@@ -1836,8 +1995,8 @@ static void pf_append_token(std::string& out, const std::string& tok, bool prev_
 // window i+1 keeps `at`, the plain @@ join below reassembles `seat`. The two
 // halves may come from different windows and disagree (`seed` vs `seat`), which
 // is the documented cost of context windows, not a stitch bug.
-static std::string paraformer_transcribe_long(paraformer_context* ctx, const float* pcm, int n_samples,
-                                             const pf_long_cfg& cfg, std::vector<pf_token>* out_tokens) {
+static std::optional<std::string> paraformer_transcribe_long(paraformer_context* ctx, const float* pcm, int n_samples,
+                                                            const pf_long_cfg& cfg, std::vector<pf_token>* out_tokens) {
     const int sr = 16000;
     const int64_t total_ms = (int64_t) n_samples * 1000 / sr;
     const int64_t win = cfg.win_ms, ov = cfg.overlap_ms;
@@ -1873,7 +2032,9 @@ static std::string paraformer_transcribe_long(paraformer_context* ctx, const flo
         if (off < 0 || len <= 0 || off + len > n_samples)
             continue;
         std::vector<pf_token> toks;
-        paraformer_transcribe_impl(ctx, pcm + off, len, nullptr, nullptr, nullptr, &toks);
+        if (!paraformer_transcribe_impl(ctx, pcm + off, len, nullptr, nullptr, &toks)) {
+            return std::nullopt;
+        }
         seams.push_back(merged.size());
         // PF_DUMP_WINDOWS=1 prints each window's own hypothesis, so a bad
         // stitch can be told apart from a bad window decode. Must run before
@@ -1892,6 +2053,7 @@ static std::string paraformer_transcribe_long(paraformer_context* ctx, const flo
         }
         size_t kept = 0;
         for (auto& t : toks) {
+            t.start_ms += w.s;
             t.t_ms += w.s;
             if (t.t_ms < w.core_s || t.t_ms >= w.core_e)
                 continue;
@@ -1901,7 +2063,7 @@ static std::string paraformer_transcribe_long(paraformer_context* ctx, const flo
         if (ctx->verbosity >= 1)
             fprintf(stderr, "paraformer: long window %zu/%zu [%lld,%lld) core [%lld,%lld) -> %zu tokens, %zu kept\n",
                     wi + 1, wins.size(), (long long) w.s, (long long) w.e, (long long) w.core_s,
-                    (long long) w.core_e, (long long) toks.size(), kept);
+                    (long long) w.core_e, toks.size(), kept);
     }
 
     // Cores tile the timeline exactly, so a token is normally owned by exactly
@@ -1992,14 +2154,12 @@ static bool paraformer_use_long(const pf_long_cfg& cfg, int n_samples) {
     return total_ms >= cfg.min_ms;
 }
 
-static std::string paraformer_run(paraformer_context* ctx, const float* pcm, int n_samples,
-                                  std::vector<pf_token>* out_tokens) {
+static std::optional<std::string> paraformer_run(paraformer_context* ctx, const float* pcm, int n_samples,
+                                                std::vector<pf_token>* tokens = nullptr) {
     const pf_long_cfg lc = paraformer_long_cfg();
     if (paraformer_use_long(lc, n_samples))
-        return paraformer_transcribe_long(ctx, pcm, n_samples, lc, out_tokens);
-    if (out_tokens)
-        out_tokens->clear();
-    return paraformer_transcribe_impl(ctx, pcm, n_samples);
+        return paraformer_transcribe_long(ctx, pcm, n_samples, lc, tokens);
+    return paraformer_transcribe_impl(ctx, pcm, n_samples, nullptr, nullptr, tokens);
 }
 
 paraformer_context_params paraformer_context_default_params() {
@@ -2043,39 +2203,6 @@ void paraformer_weights_free(paraformer_weights* w) {
     delete w;
 }
 
-static void paraformer_select_backend(paraformer_context* ctx, paraformer_context_params params, bool respect_env) {
-    // Shared contexts must pick their backend purely from params.use_gpu, so
-    // that an HTP context and a CPU context can coexist in one process (the
-    // CRISPASR_PARAFORMER_GPU env is process-global and would force both).
-    if (!respect_env) {
-        ctx->backend = ctx->backend_cpu;
-        if (params.use_gpu) {
-            ggml_backend_t gpu = crispasr_init_gpu_backend();
-            if (gpu)
-                ctx->backend = gpu;
-        }
-        return;
-    }
-    const char* gpu_env = std::getenv("CRISPASR_PARAFORMER_GPU");
-    const bool force_gpu = gpu_env && std::atoi(gpu_env) != 0;
-    const bool force_cpu = gpu_env && std::atoi(gpu_env) == 0;
-    ctx->backend = ctx->backend_cpu;
-    if (!force_cpu && (force_gpu || params.use_gpu)) {
-        ggml_backend_t gpu = crispasr_init_gpu_backend();
-        if (gpu) {
-            bool is_metal = false;
-#if defined(GGML_USE_METAL)
-            is_metal = core_cpu_backend::is_metal(gpu);
-#endif
-            if (!is_metal || force_gpu) {
-                ctx->backend = gpu;
-            } else {
-                ggml_backend_free(gpu);
-            }
-        }
-    }
-}
-
 paraformer_context* paraformer_init_shared(paraformer_weights* w, paraformer_context_params params) {
     if (!w)
         return nullptr;
@@ -2091,7 +2218,11 @@ paraformer_context* paraformer_init_shared(paraformer_weights* w, paraformer_con
         return nullptr;
     }
     core_cpu_backend::set_n_threads(ctx->backend_cpu, ctx->n_threads);
-    paraformer_select_backend(ctx, params, /*respect_env=*/false);
+    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
+    if (!ctx->backend) {
+        paraformer_free(ctx);
+        return nullptr;
+    }
 
     ctx->model_path = w->model_path;
     // Materialize this context's weights from the single in-memory GGUF byte
@@ -2221,18 +2352,31 @@ void paraformer_free(paraformer_context* ctx) {
     delete ctx;
 }
 
-void paraformer_warmup(paraformer_context* ctx, const float* samples, int n_samples) {
-    if (!ctx || !samples || n_samples <= 0)
-        return;
-    // Discard the text; the point is the one-time HTP session creation and the
-    // encoder/decoder graph registration on the device.
-    (void) paraformer_transcribe_impl(ctx, samples, n_samples);
+bool paraformer_warmup(paraformer_context* ctx, const float* samples, int n_samples) {
+    if (!ctx || !samples || n_samples <= 0) return false;
+    paraformer_placement placement = {};
+    if (!paraformer_transcribe_impl(ctx, samples, n_samples, nullptr, nullptr, nullptr, &placement) ||
+        placement.encoder_device_ops == 0 || placement.decoder_device_ops == 0) {
+        return false;
+    }
+    ctx->warmup_placement = placement;
+    return true;
+}
+
+const char* paraformer_backend_name(const paraformer_context* ctx) {
+    return ggml_backend_dev_name(ggml_backend_get_device(ctx->backend));
+}
+
+paraformer_placement paraformer_warmup_placement(const paraformer_context* ctx) {
+    return ctx->warmup_placement;
 }
 
 char* paraformer_transcribe(paraformer_context* ctx, const float* samples, int n_samples) {
     if (!ctx || !samples || n_samples <= 0)
         return nullptr;
-    std::string s = paraformer_run(ctx, samples, n_samples, nullptr);
+    auto result = paraformer_run(ctx, samples, n_samples);
+    if (!result) return nullptr;
+    const auto& s = *result;
     char* buf = (char*)std::malloc(s.size() + 1);
     if (buf) {
         std::memcpy(buf, s.data(), s.size());
@@ -2244,50 +2388,24 @@ char* paraformer_transcribe(paraformer_context* ctx, const float* samples, int n
 paraformer_result* paraformer_transcribe_with_timestamps(paraformer_context* ctx, const float* samples, int n_samples) {
     if (!ctx || !samples || n_samples <= 0)
         return nullptr;
-    // Long audio returns stitched token times directly (window offsets already
-    // applied); short audio keeps the CIF fire-frame path untouched.
     std::vector<pf_token> tokens;
-    std::vector<int> fire_frames;
-    const pf_long_cfg lc = paraformer_long_cfg();
-    std::string s;
-    if (paraformer_use_long(lc, n_samples)) {
-        s = paraformer_transcribe_long(ctx, samples, n_samples, lc, &tokens);
-    } else {
-        s = paraformer_transcribe_impl(ctx, samples, n_samples, nullptr, nullptr, &fire_frames);
-    }
+    auto result = paraformer_run(ctx, samples, n_samples, &tokens);
+    if (!result) return nullptr;
+    const auto& s = *result;
 
     auto* r = (paraformer_result*)std::malloc(sizeof(paraformer_result));
     if (!r)
         return nullptr;
     r->text = (char*)std::malloc(s.size() + 1);
-    if (r->text) {
-        std::memcpy(r->text, s.data(), s.size());
-        r->text[s.size()] = '\0';
+    r->n_chars = (int) tokens.size();
+    r->char_times_cs = r->n_chars ? (int32_t*) std::malloc(tokens.size() * sizeof(int32_t)) : nullptr;
+    if (!r->text || (r->n_chars && !r->char_times_cs)) {
+        paraformer_result_free(r);
+        return nullptr;
     }
-
-    // Convert fire frame indices to centiseconds.
-    // CIF fires on LFR (low frame rate) frames. core_lfr::stack steps by
-    // `lfr_n` raw mel frames (T_lfr = ceil(T/lfr_n)), and raw mel frames are
-    // 10 ms apart — so one LFR frame is lfr_n*10 = 60 ms, NOT lfr_m*10 = 70 ms.
-    // Using lfr_m over-counted every frame by 10 ms (win_zh02: 26 LFR frames
-    // predicted 1750 ms for 1543 ms of audio, ratio 1.13); the 60 ms base gives
-    // 26*60 = 1560 ms, matching the clip. This matters most for stitching,
-    // where a per-frame error accumulates across windows.
-    const int lfr_n = (int)ctx->model.hp.lfr_n;
-    const int ms_per_frame = lfr_n * 10;
-    // Long path: token times are already absolute ms (window offset applied),
-    // and one entry per emitted token — the same granularity as fire frames for
-    // the single-shot path, so callers see one timestamp per character either way.
-    r->n_chars = (int)(tokens.empty() ? fire_frames.size() : tokens.size());
-    r->char_times_cs = (int32_t*)std::malloc((size_t)r->n_chars * sizeof(int32_t));
-    if (r->char_times_cs) {
-        if (!tokens.empty()) {
-            for (int i = 0; i < r->n_chars; i++)
-                r->char_times_cs[i] = (int32_t)(tokens[(size_t) i].t_ms / 10); // ms → cs
-        } else {
-            for (int i = 0; i < r->n_chars; i++)
-                r->char_times_cs[i] = fire_frames[i] * ms_per_frame / 10; // ms → cs
-        }
+    std::memcpy(r->text, s.c_str(), s.size() + 1);
+    for (int i = 0; i < r->n_chars; ++i) {
+        r->char_times_cs[i] = (int32_t) (tokens[i].t_ms / 10);
     }
     return r;
 }
@@ -2296,13 +2414,9 @@ paraformer_tokens* paraformer_transcribe_tokens(paraformer_context* ctx, const f
     if (!ctx || !samples || n_samples <= 0)
         return nullptr;
     std::vector<pf_token> toks;
-    std::string s;
-    const pf_long_cfg lc = paraformer_long_cfg();
-    if (paraformer_use_long(lc, n_samples)) {
-        s = paraformer_transcribe_long(ctx, samples, n_samples, lc, &toks);
-    } else {
-        s = paraformer_transcribe_impl(ctx, samples, n_samples, nullptr, nullptr, nullptr, &toks);
-    }
+    auto result = paraformer_run(ctx, samples, n_samples, &toks);
+    if (!result) return nullptr;
+    const auto& s = *result;
     auto* r = (paraformer_tokens*) std::malloc(sizeof(paraformer_tokens));
     if (!r)
         return nullptr;
@@ -2313,13 +2427,22 @@ paraformer_tokens* paraformer_transcribe_tokens(paraformer_context* ctx, const f
     }
     r->n_tokens = (int) toks.size();
     r->tokens = r->n_tokens ? (paraformer_token*) std::calloc((size_t) r->n_tokens, sizeof(paraformer_token)) : nullptr;
+    if (!r->text || (r->n_tokens && !r->tokens)) {
+        std::free(r->tokens);
+        std::free(r->text);
+        std::free(r);
+        return nullptr;
+    }
     for (int i = 0; i < r->n_tokens; ++i) {
         r->tokens[i].text = (char*) std::malloc(toks[(size_t) i].text.size() + 1);
-        if (r->tokens[i].text) {
-            std::memcpy(r->tokens[i].text, toks[(size_t) i].text.data(), toks[(size_t) i].text.size());
-            r->tokens[i].text[toks[(size_t) i].text.size()] = '\0';
+        if (!r->tokens[i].text) {
+            paraformer_tokens_free(r);
+            return nullptr;
         }
+        std::memcpy(r->tokens[i].text, toks[(size_t) i].text.data(), toks[(size_t) i].text.size());
+        r->tokens[i].text[toks[(size_t) i].text.size()] = '\0';
         r->tokens[i].t_ms = (int32_t) toks[(size_t) i].t_ms;
+        r->tokens[i].start_ms = (int32_t) toks[(size_t) i].start_ms;
         r->tokens[i].posterior = toks[(size_t) i].posterior;
     }
     return r;
@@ -2351,7 +2474,9 @@ float* paraformer_extract_stage(paraformer_context* ctx, const float* samples, i
         return nullptr;
 
     if (std::strcmp(stage_name, "generated_text") == 0) {
-        std::string txt = paraformer_run(ctx, samples, n_samples, nullptr);
+        auto result = paraformer_run(ctx, samples, n_samples);
+        if (!result) return nullptr;
+        const auto& txt = *result;
         char* buf = (char*)std::malloc(txt.size() + 1);
         if (!buf)
             return nullptr;

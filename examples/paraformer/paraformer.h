@@ -47,27 +47,40 @@ void paraformer_weights_free(paraformer_weights* w);
 // Create an inference context backed by a shared weight set. Weights are
 // cloned into the context's own backend buffer (host for CPU, tiled device
 // buffer for HTP), so contexts are independent and safe to run in parallel.
-// params.use_gpu selects HTP vs CPU (subject to the same env gates as
-// paraformer_init_from_file).
+// When params.use_gpu is true, initialization requires the selected device.
 paraformer_context* paraformer_init_shared(paraformer_weights* w, paraformer_context_params params);
 
 paraformer_context* paraformer_init_from_file(const char* path, paraformer_context_params params);
 void paraformer_free(paraformer_context* ctx);
 
-// Transcribe audio (16 kHz mono PCM). Returns a malloc'd string; caller frees.
+// Transcribe audio (16 kHz mono PCM). NULL means failure. Empty text is valid.
+// The caller frees the returned string.
 char* paraformer_transcribe(paraformer_context* ctx, const float* samples, int n_samples);
 
 // Warm up the runtime outside the measured path: creates the HTP session and
 // registers the encoder/decoder graphs once, so the first real request does not
 // pay the one-time DSP graph-dispatch cost (~1 s on SM6650). Samples should be
 // representative of the expected audio length. Safe to call more than once.
-void paraformer_warmup(paraformer_context* ctx, const float* samples, int n_samples);
+bool paraformer_warmup(paraformer_context* ctx, const float* samples, int n_samples);
 
-// Variant that returns per-character CIF timestamps (centiseconds from audio start).
-// Each emitted character maps to the encoder frame where CIF fired.
+struct paraformer_placement {
+    int encoder_device_ops;
+    int encoder_total_ops;
+    int decoder_device_ops;
+    int decoder_total_ops;
+};
+
+// Backend name and compute placement from the last successful warmup.
+const char* paraformer_backend_name(const paraformer_context* ctx);
+struct paraformer_placement paraformer_warmup_placement(const paraformer_context* ctx);
+
+// Measure two equal-length 16 kHz utterances with serial and width-two encoder graphs.
+bool paraformer_bench_encoder_pair(paraformer_context* ctx, const float* pcm_a, const float* pcm_b, int n_samples, int reps);
+
+// End timestamps for the emitted tokens, in centiseconds from audio start.
 struct paraformer_result {
     char* text;
-    int32_t* char_times_cs; // per-character end time in centiseconds
+    int32_t* char_times_cs; // token end times in centiseconds
     int n_chars;            // number of entries in char_times_cs
 };
 struct paraformer_result* paraformer_transcribe_with_timestamps(paraformer_context* ctx, const float* samples,
@@ -80,8 +93,9 @@ void paraformer_result_free(struct paraformer_result* r);
 // and clause boundaries from the gaps between entries.
 struct paraformer_token {
     char* text;
-    int32_t t_ms;    // token end time from the CIF fire frame
-    float posterior; // softmax probability of the chosen token
+    int32_t t_ms;       // End of the source CIF span, in milliseconds.
+    float posterior;   // For a rewrite, acoustic probability at its nearest original CIF position.
+    int32_t start_ms;   // Start of the source CIF span, in milliseconds.
 };
 
 struct paraformer_tokens {
