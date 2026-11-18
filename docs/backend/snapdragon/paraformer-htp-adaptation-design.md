@@ -1197,6 +1197,14 @@ host CPU 上判定相同（`deficit 2.39` 不变，因为 logits 走的是同一
 | 点单（瑞幸拿铁、美式） | 8 | 88% | 88% | 0 |
 | 导航（地标、地名） | 12 | 50% | **58%** | 0 |
 
+**点单 88% / 多媒体 100% 是「意图级」，不是「内容级」**，读表时必须知道这一点：
+这两域的标注是 `state=?`、`value=-`，只判意图字段，不判品牌/曲名。实测有两条
+判对但内容是错的 —— `Order an Americano` 在转写 `order in emy cananel` 上判对
+（`order` 活着、items 没了）、`Play some Jay Chou` 在 `play some j true` 上判对
+（动词活着、歌手没了）。按内容级打，点单是 3/8、多媒体 11/12。
+导航之所以是唯一能暴露缺口的行，是因为它的标注里含 `navigate` 动词，
+专有名词把动词一起带歪，字段集本身就对不上。
+
 **英文增益全部来自 span rewrite**，原因与 §15 相同：错误序列与正确序列 token 数不同，
 任何 gain 都够不到。两条硬约束（都是首轮踩出来的）：
 
@@ -1254,12 +1262,21 @@ R 4.1 dri@@+ry+e@@+se@@+se@@+at => dri@@+ver+se@@+at   # 仅 HTP，deficit 3.57
 
 ### 33.2 热词接不住的那一类
 
-84 条里 13 条仍然错，而且同质——声学模型没见过的专有名词。`Luckin`、`Wangfujing`、
+84 条里 7 条仍然错——6 条英文导航 + 1 条空气净化。语音模型没见过的专有名词是主因：`Luckin`、`Wangfujing`、
 `Tiananmen`、`Hongqiao`、`Americano`、`Jay Chou` 都拼得出来（各 3–7 片，已验证），
 但解成 `locking`、`one fuging`、`shinnamon`、`hunkill`、`emy cananel`、`j true`，
 deficit 9–11，margin 那么高会改写无关句子。**修法是重训或下游名称匹配，不是热词。**
 
-还有一条是词表边界而非声学问题：`air purifier` 解成 `airpurifier`，而 `air` 在本词表里
+导航的失败还被动词拖累：中文 6 条**全对**（六个地名也都对，`北京首都机场`/`天安门广场`/
+`瑞幸咖啡`/`虹桥火车站`/`王府井` —— zh 权重有这些字）；英文 6 条只对 1 条
+（`Navigate to the nearest charging station`），凡带地名的连动词一起崩：
+`never get too locking coffee`、`never good to北京capital airport`。
+`navigate` 自己有能生效的规则，但 span rewrite 只替换它匹配到的那几片，
+未知专有名词把动词一起带歪 —— **是一个缺陷，不是两个**。
+顺带一个必须留意的行为：模型把句中的 `Beijing` 读成 `北京`，这对 shipping checkpoint 是**正确**的，
+也正是导航要靠名称匹配而不是更严的命令文法的原因。
+
+空气净化那条是词表边界而非声学问题：`air purifier` 解成 `airpurifier`，而 `air` 在本词表里
 只有 `air@@`（续接形态），没有终结形态 —— 模型产出了一个词，就无法渲染成两个词，
 任何重写候选都会粘在一起。说 `air filter` 能绕开，热词绕不开。
 
