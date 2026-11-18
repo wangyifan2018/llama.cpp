@@ -189,6 +189,12 @@ static size_t g_queue_bytes = 0;
 static double g_timeout_ms = 30000;
 static std::chrono::milliseconds g_deadline{30000};
 static std::string g_model_id = "paraformer-zh";
+
+// Optional bearer token. Empty means the service is open, which is the
+// behaviour every earlier measurement was taken under - the gate stays exact
+// by not imposing a header that existing clients do not send.
+static std::string g_api_key;
+static std::atomic<uint64_t> g_auth_rejected{0};
 static std::atomic<uint64_t> g_requests{0};
 static std::atomic<int> g_inflight{0}; // tasks a worker is currently running
 static std::atomic<uint64_t> g_rejected{0};
@@ -236,6 +242,64 @@ static void reply_error(httplib::Response& res, int status, const std::string& m
                         const std::string& param = "", const std::string& code = "") {
     res.status = status;
     res.set_content(error_body(message, type, param, code).dump(), "application/json");
+}
+
+// ---- Auth ----
+
+// Constant-time compare. A plain == leaks the length of the matching prefix
+// through timing, which over a network is enough to recover a token byte by
+// byte. The length itself is not secret, so comparing it up front is fine.
+static bool token_matches(const std::string& got, const std::string& want) {
+    if (got.size() != want.size()) return false;
+    unsigned char diff = 0;
+    for (size_t i = 0; i < got.size(); ++i) {
+        diff |= (unsigned char) (got[i] ^ want[i]);
+    }
+    return diff == 0;
+}
+
+// Pull the credential out of `Authorization: Bearer <token>`. The scheme is
+// case-insensitive per RFC 7235, so `bearer` and `BEARER` have to work; the
+// comparison is spelled out here because strncasecmp does not exist on Windows
+// under that name and this file builds there too.
+static std::string bearer_token(const httplib::Request& req) {
+    static const char scheme[] = "bearer ";
+    const std::string& h = req.get_header_value("Authorization");
+    if (h.size() > sizeof(scheme) - 1) {
+        bool match = true;
+        for (size_t i = 0; i < sizeof(scheme) - 1; ++i) {
+            char c = h[i];
+            if (c >= 'A' && c <= 'Z') c = (char) (c - 'A' + 'a');
+            if (c != scheme[i]) { match = false; break; }
+        }
+        if (match) {
+            std::string t = h.substr(sizeof(scheme) - 1);
+            // Trailing whitespace from a sloppy client is not a credential.
+            while (!t.empty() && (t.back() == ' ' || t.back() == '\r' || t.back() == '\n')) t.pop_back();
+            while (!t.empty() && t.front() == ' ') t.erase(t.begin());
+            return t;
+        }
+    }
+    return std::string();
+}
+
+// Endpoints a probe needs before it has a credential: liveness, readiness and
+// the model list. Everything that accepts audio, or that exposes queue state,
+// is behind the token.
+static bool path_is_public(const std::string& path) {
+    return path == "/health" || path == "/v1/models" || path == "/metrics" ||
+           path == "/metrics.json" || path == "/" || path.rfind("/ui", 0) == 0;
+}
+
+static bool authorized(const httplib::Request& req, httplib::Response& res) {
+    if (g_api_key.empty()) return true;
+    if (token_matches(bearer_token(req), g_api_key)) return true;
+
+    // Same envelope shape as every other error, so a client has one parser.
+    res.set_header("WWW-Authenticate", "Bearer realm=\"pf-api\"");
+    reply_error(res, 401, "missing or invalid bearer token", "authentication_error", "", "invalid_api_key");
+    g_auth_rejected.fetch_add(1);
+    return false;
 }
 
 // ---- WAV ----
@@ -1471,13 +1535,17 @@ int main(int argc, char** argv) {
                      "[--seg-gap-ms N] [--punct-gap-ms N] "
                      "[--web-dir DIR] [--speaker-model FILE] [--enroll-dir DIR] [--speaker-threshold F] [--speaker-max-s S] "
                      "[--vad-model FILE] [--vad-split-s S] [--vad-threshold F] [--vad-min-silence S] "
-                     "[--vad-min-speech S]\n",
+                     "[--vad-min-speech S] [--api-key TOKEN | PF_API_KEY]\n",
                      argv[0]);
         return 1;
     }
     const char* model = argv[1];
     const char* device = "CPU";
-    const char* bind_addr = "0.0.0.0";
+    // Loopback by default. A speech service that accepts unauthenticated audio
+    // should not appear on every interface because of a default nobody chose;
+    // putting it on the LAN has to be an explicit --bind. Every recorded
+    // measurement used an explicit address, so no number here moves.
+    const char* bind_addr = "127.0.0.1";
     const char* warmup = nullptr;
     const char* web_dir = "web";
     int port = 8080;
@@ -1502,6 +1570,8 @@ int main(int argc, char** argv) {
             threads = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
             bind_addr = argv[++i];
+        } else if (std::strcmp(argv[i], "--api-key") == 0 && i + 1 < argc) {
+            g_api_key = argv[++i];
         } else if (std::strcmp(argv[i], "--queue") == 0 && i + 1 < argc) {
             g_queue_limit = (size_t) std::max(1, std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--queue-mib") == 0 && i + 1 < argc) {
@@ -1599,6 +1669,14 @@ int main(int argc, char** argv) {
     if (recover_on_cpu && (!device_set || std::strncmp(device, "HTP", 3) != 0)) {
         std::fprintf(stderr, "pf-api: --recover-on-cpu requires an HTP --device\n");
         return 1;
+    }
+
+    // A token in argv is visible in /proc/<pid>/cmdline to every local process,
+    // so the environment is the better default for anything that is not a test.
+    // The flag wins if both are set, because an explicit argument is a
+    // deliberate act and silently preferring the environment would be worse.
+    if (g_api_key.empty()) {
+        if (const char* env = std::getenv("PF_API_KEY")) g_api_key = env;
     }
     g_degraded = recover_on_cpu;
     if (device_set && std::strcmp(device, "CPU") != 0) {
@@ -1765,6 +1843,7 @@ int main(int argc, char** argv) {
                   {"failed", g_failed.load()},
                   {"deadline_expired", g_deadline_expired.load()},
                   {"cancelled_queued", g_cancelled_queued.load()},
+                  {"auth_rejected", g_auth_rejected.load()},
                   {"cpu_fallback", g_degraded},
                   {"partials", g_partials_run.load()},
                   {"partials_skipped", g_partials_skipped.load()},
@@ -1793,6 +1872,16 @@ int main(int argc, char** argv) {
     }
     srv.WebSocket("/v1/realtime", [](const httplib::Request&, httplib::ws::WebSocket& ws) { ws_serve(ws); });
 
+    // One gate in front of every route, rather than a check inside each
+    // handler. A per-handler check is how an endpoint added later ships
+    // unauthenticated: the WebSocket upgrade is the obvious one to forget, and
+    // it carries the most audio.
+    srv.set_pre_routing_handler([](const httplib::Request& req, httplib::Response& res) {
+        if (path_is_public(req.path)) return httplib::Server::HandlerResponse::Unhandled;
+        if (authorized(req, res)) return httplib::Server::HandlerResponse::Unhandled;
+        return httplib::Server::HandlerResponse::Handled;
+    });
+
     srv.set_exception_handler([](const httplib::Request&, httplib::Response& res, std::exception_ptr ep) {
         std::string what = "internal error";
         try {
@@ -1806,6 +1895,25 @@ int main(int argc, char** argv) {
 
     std::fprintf(stderr, "pf-api: model '%s', %zu engines, queue %zu, partials %s, listening on %s:%d\n",
                  g_model_id.c_str(), g_engines.size(), g_queue_limit, g_partials ? "on" : "off", bind_addr, port);
+    if (g_api_key.empty()) {
+        std::fprintf(stderr, "pf-api: no --api-key / PF_API_KEY set; every endpoint accepts unauthenticated audio\n");
+        // Binding to a wildcard or a concrete non-loopback address without a
+        // token publishes the microphone to the network. Say so loudly: the
+        // operator may have meant it, but they should have to mean it.
+        const bool exposed = std::strcmp(bind_addr, "0.0.0.0") == 0 || std::strcmp(bind_addr, "::") == 0 ||
+                             std::strcmp(bind_addr, "[::]") == 0 ||
+                             (std::strcmp(bind_addr, "127.0.0.1") != 0 && std::strcmp(bind_addr, "::1") != 0 &&
+                              std::strcmp(bind_addr, "localhost") != 0);
+        if (exposed) {
+            std::fprintf(stderr,
+                         "pf-api: WARNING %s is not a loopback address and no token is set, so any host that can\n"
+                         "pf-api: WARNING reach this port can submit audio and read the queue counters. Set PF_API_KEY\n"
+                         "pf-api: WARNING or bind 127.0.0.1 unless this is deliberate.\n",
+                         bind_addr);
+        }
+    } else {
+        std::fprintf(stderr, "pf-api: bearer token required on audio endpoints; /health, /v1/models and /metrics stay open\n");
+    }
     if (!srv.bind_to_port(bind_addr, port)) {
         std::fprintf(stderr, "pf-api: cannot listen on %s:%d\n", bind_addr, port);
         return 4;

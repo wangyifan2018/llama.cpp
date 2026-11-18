@@ -26,6 +26,33 @@
 | WS | `/v1/realtime` | 实时：append / commit / clear，返回 partial 与最终结果 |
 | GET | `/` | 浏览器测试台（`--web-dir` 存在时） |
 
+### 认证与监听地址
+
+默认不启用认证（与所有已记录测量一致）。设了 `--api-key` 或 `PF_API_KEY` 后，
+**接收音频的端点**（`POST /v1/audio/transcriptions`、`POST /asr/segment`、
+`WS /v1/realtime` 的升级握手）要求 `Authorization: Bearer <token>`；比较是常量时间，
+避免通过时序逐字节还原 token。拒绝时返回 401，错误体与其他错误同一形状：
+
+```json
+{"error":{"code":"invalid_api_key","message":"missing or invalid bearer token","type":"authentication_error"}}
+```
+
+`/health`、`/v1/models`、`/metrics` 保持开放：容器健康检查无法持凭证，拒绝它会把
+运行中的服务变成永久 unhealthy。它们只暴露引擎数与队列深度，不含音频。
+`/metrics` 多一个 `auth_rejected` 计数。
+
+`PF_API_KEY` 优先于 `--api-key`，因为命令行参数在 `/proc/<pid>/cmdline` 里对同机
+所有进程可读；两者都设时以显式参数为准。
+
+`--bind` 默认 `127.0.0.1`。默认不认证的语音服务不应因为一个没人选择的默认值出现在
+所有网卡上；要放到局域网上必须显式 `--bind 0.0.0.0`，此时若未设 token，启动日志会
+打印一段 WARNING。
+
+验证用 [`tools/check_auth.py`](../../../examples/paraformer/tools/check_auth.py)，
+覆盖拒绝（无 token / 错 token / 缺 Bearer scheme / 空 token / 同长度错 token）、
+放行（正确 token、小写 `bearer`）、探针开放和 WS 升级两条路径；`--no-auth` 是
+针对未设 token 服务的镜像检查。
+
 显式指定的加速后端不可用时，服务默认启动失败。`--allow-cpu-fallback` 允许启动时改用 CPU，此时 `/health` 返回 HTTP 200 和 `status: degraded`，`/metrics` 返回 `cpu_fallback: true`。正常启动的状态为 `ok`。
 
 ## 3. POST /v1/audio/transcriptions

@@ -260,6 +260,50 @@ speaker gate and server VAD, and integration notes.
 The front end already commits one segment at the VAD endpoint, so a whole
 utterance per request maps directly onto the engine.
 
+### Authentication
+
+Off by default, so nothing that already works stops working. Set a token and
+every endpoint that accepts audio — including the `/v1/realtime` upgrade —
+requires `Authorization: Bearer <token>`:
+
+```sh
+export PF_API_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+build-x-asr/bin/llama-paraformer-api MODEL.gguf --port 8080 --api-key "$PF_API_KEY"
+```
+
+`PF_API_KEY` is preferred over `--api-key` because an argument is readable in
+`/proc/<pid>/cmdline` by every local process. The flag wins if both are set.
+
+`/health`, `/v1/models` and `/metrics` stay open: a container healthcheck has no
+way to hold a credential, and refusing it turns a running service into a
+permanently unhealthy one. They expose engine counts and queue depth, not
+audio — if that is still too much, put the service behind a proxy that
+authenticates everything.
+
+A rejected request gets 401 with the same envelope as every other error, so a
+client needs one parser:
+
+```json
+{"error":{"code":"invalid_api_key","message":"missing or invalid bearer token","type":"authentication_error"}}
+```
+
+Token comparison is constant-time; a plain `==` leaks how much of the prefix
+matched through timing, which is enough to recover a token byte by byte over a
+network. `tools/check_auth.py` asserts the refusals, the acceptance, the open
+probes and the WebSocket path against a running server:
+
+```sh
+python3 tools/check_auth.py --port 8080 --wav clip.wav --key "$PF_API_KEY"
+python3 tools/check_auth.py --port 8080 --wav clip.wav --no-auth   # open server
+```
+
+### Binding
+
+The default `--bind` is `127.0.0.1`. A service that accepts unauthenticated
+audio should not appear on every interface because of a default nobody chose;
+putting it on the LAN is an explicit `--bind 0.0.0.0`, and the server prints a
+warning at startup when the address is not loopback and no token is set.
+
 ```sh
 build-x-asr/bin/llama-paraformer-api MODEL.gguf --device HTP0:0 --port 8080 \
     --engines 2 --threads 2 --queue 64 --queue-mib 8 --deadline-ms 30000 --model-id paraformer-zh-q8_0 \
@@ -320,8 +364,10 @@ docker run --rm -v "$PWD:/workspace" -v /tmp/sherpa:/sherpa:ro \
 
 # on the phone: LD_LIBRARY_PATH needs lib/ and onnx/bin (sherpa + onnxruntime)
 export LD_LIBRARY_PATH=$PWD/lib:$PWD/onnx/bin
-bin/llama-paraformer-api MODEL.gguf --device HTP0:0 --port 8899 --engines 2 \
+bin/llama-paraformer-api MODEL.gguf --device HTP0:0 --port 8899 --engines 2 --bind 0.0.0.0 \
     --speaker-model onnx/model/spk_od.onnx --enroll-dir pf-enroll --speaker-threshold 0.55
+# `adb forward tcp:8899 tcp:8899` reaches a loopback bind; use --bind 0.0.0.0
+# only if the phone's network should also reach it, and set PF_API_KEY if so.
 ```
 
 `--enroll-dir` holds 16 kHz WAVs for the enrolled speaker. Startup prints the
