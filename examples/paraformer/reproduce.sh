@@ -100,7 +100,7 @@ do_check() {
              "$HERE/tools/cabin_mixed.tsv" "$HERE/tools/eval_mixed.py" \
              "$HERE/tools/gen_voice_fixtures.py" \
              "$HERE/tools/cabin_expanded.tsv" "$HERE/tools/vehicle_semantics_expanded.tsv" \
-             "$HERE/tools/check_vocab_coverage.py"; do
+             "$HERE/tools/check_vocab_coverage.py" "$HERE/tools/check_hotword_rules.py"; do
         [ -f "$f" ] && note "ok      $(basename "$f")" || { note "MISSING $f"; bad=1; }
     done
 
@@ -124,6 +124,43 @@ do_check() {
     fi
 
     rm -f /tmp/pf-verify.$$
+
+    # 每条 span rewrite 的 token 必须真的在词表里，且末片必须收词。
+    # 这两条错法的共同点是**静默**：解析器在加载时打一行
+    # "replacement token not in vocab" 就丢掉规则，之后 deficit、命中数、
+    # 分数全部正常，只有转写不变——读起来像模型到了极限，实际是规则写错。
+    # 所以必须机械地查，不能靠读日志。
+    if [ -f "$ZH_MODEL" ] && [ -x "$BIN" ]; then
+        local vocab_dump=$PF_RUN/vocab-zh.txt
+        mkdir -p "$PF_RUN"
+        if [ ! -s "$vocab_dump" ]; then
+            # A vocabulary dump needs one clip to trigger it (the CLI takes
+            # MODEL WAV...), so borrow whichever fixture exists. The audio is
+            # irrelevant: the dump is the token table.
+            local probe_wav=
+            for cand in "$PF_MODELS/tingting"/*.wav "$PF_RUN/cabin-expanded"/*.wav; do
+                [ -f "$cand" ] && { probe_wav=$cand; break; }
+            done
+            if [ -n "$probe_wav" ]; then
+                PF_DUMP_VOCAB= "$BIN" "$ZH_MODEL" "$probe_wav" --quiet \
+                    >/dev/null 2>"$vocab_dump.tmp" || true
+                grep '^pf-vocab: ' "$vocab_dump.tmp" | sed 's/^pf-vocab: //' >"$vocab_dump" || true
+                rm -f "$vocab_dump.tmp"
+            fi
+        fi
+        if [ -s "$vocab_dump" ]; then
+            if "$PYTHON" "$HERE/tools/check_hotword_rules.py" \
+                    --vocab "$vocab_dump" --hotwords "$HOTWORDS" >"$PF_RUN/hotword-rules.txt" 2>&1; then
+                note "ok      hotword rules match the vocabulary ($(tail -1 "$PF_RUN/hotword-rules.txt"))"
+            else
+                note "FAIL    hotword rules do not match the vocabulary:"
+                sed 's/^/          /' "$PF_RUN/hotword-rules.txt" | head -20
+                bad=1
+            fi
+        else
+            note "WARN    no vocabulary dump; hotword rule check skipped"
+        fi
+    fi
 
     # 夹具不是提交物。没有就是没生成，不是错误，但要告诉人下一步是什么。
     if [ -f "$PF_MODELS/tingting/manifest.tsv" ]; then

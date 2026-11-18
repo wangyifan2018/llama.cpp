@@ -131,3 +131,28 @@ no visible reason.
 match. `reproduce.sh check` calls it and reports a mismatch as a warning rather
 than a failure - a run with unverified weights still produces a valid *relative*
 measurement, it just cannot be compared to the committed numbers.
+
+## Hotword rules are checked against the vocabulary, not eyeballed
+
+`reproduce.sh check` also runs `tools/check_hotword_rules.py`, which loads a
+`PF_DUMP_VOCAB` dump of the checkpoint and verifies every `R` rule in
+`hotwords_vehicle.txt`: both sides must be entirely made of tokens that exist in
+the table, the last piece on each side must not carry `@@` (it has to close the
+word), and the margin must parse as a number.
+
+This is a check rather than a convention because every failure mode here is
+silent. A rule whose span uses a token that is not in the vocabulary is dropped
+at load with one line on stderr, and afterwards the deficit, the hit count and
+the score all look normal - the transcript just does not change, which reads
+exactly like a model at its limit. Two rules in this file were broken that way
+before the check existed: `footwell` written as `t+al` when the model emits
+`t@@|al`, and a final piece with `@@` that glued the next word on.
+
+The check is verified to fail: appending `R 9.9 de@@+zzz@@+qqq => de@@+fo@@+g`
+(unknown tokens), `R 9.9 re@@+r => re@@+ar@@` (final piece is a continuation)
+and `R notanumber fo@@+t => fo@@+g` makes it report all three and exit 1.
+
+One caveat on the dump: `PF_DUMP_VOCAB=` (empty string) means *all* tokens,
+while `PF_DUMP_VOCAB=<substring>` filters. The CLI also requires at least one
+WAV argument, so the check borrows any fixture just to trigger the dump; the
+audio is irrelevant, the output is the token table.
