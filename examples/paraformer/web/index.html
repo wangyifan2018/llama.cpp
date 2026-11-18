@@ -131,7 +131,7 @@
           <button class="ghost" id="btnStop" disabled>停止并提交</button>
           <button class="ghost danger" id="btnClear" disabled>清空</button>
           <label class="hint" style="display:flex;gap:6px;align-items:center;cursor:pointer">
-            <input type="checkbox" id="chkVad"> 连续断句（服务端 VAD）
+            <input type="checkbox" id="chkVad" checked> 连续断句（服务端 VAD，默认）
           </label>
           <button class="ghost" id="btnFile">WAV 回放</button>
           <input id="file" type="file" accept="audio/wav" hidden>
@@ -367,10 +367,14 @@
             // Every result is a segment, in either mode: list them so a long
             // stream is readable instead of only the last line surviving.
             const li = document.createElement('li');
+            li.dataset.item = m.item_id || '';
             const spk = (typeof m.speaker_score === 'number')
               ? '  [' + (m.speaker_ok ? '司机' : '非司机') + ' ' + m.speaker_score.toFixed(2) + ']' : '';
-            const dur = (m.usage && m.usage.seconds) ? '  ' + m.usage.seconds.toFixed(1) + ' s' : '';
-            li.textContent = (text || '(空)') + spk + dur + (ms ? '  ' + ms + ' ms' : '');
+            // Label the numbers: the trailing value used to be the audio length,
+            // which reads like a latency and is not one.
+            const dur = (m.usage && m.usage.seconds) ? '  · 时长 ' + m.usage.seconds.toFixed(1) + ' s' : '';
+            const lat = ms ? '  · 端到端 ' + ms + ' ms' : '';
+            li.textContent = (text || '(空)') + spk + dur + lat;
             li.style.marginBottom = '4px';
             $('segments').appendChild(li);
             $('mSegs').textContent = $('segments').children.length;
@@ -410,6 +414,14 @@
           const td = (m.session && m.session.turn_detection) || {};
           log('session', 'turn_detection=' + (td.type || 'none'));
         } else if (t === 'x.pf.metrics') {
+          const li = Array.from($('segments').children).find(x => x.dataset.item === m.item_id);
+          if (li && typeof m.infer_ms === 'number') {
+            const extra = '  · 推理 ' + Math.round(m.infer_ms) + ' ms' +
+                          (m.queue_ms > 1 ? ' · 排队 ' + Math.round(m.queue_ms) + ' ms' : '') +
+                          (m.backend ? ' · ' + m.backend : '');
+            li.textContent += extra;
+            li.style.color = String(m.backend || '').startsWith('HTP') ? '#cfe3f7' : '#ffd7a8';
+          }
           if (m.backend) {
             const b = $('bBackend');
             b.className = 'badge ' + (String(m.backend).startsWith('HTP') ? 'on' : '');

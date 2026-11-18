@@ -1281,6 +1281,24 @@ static void stream_vad_drain(const std::shared_ptr<WsSession>& s) {
         if (piece.empty()) {
             continue;
         }
+        // The detector hands back the trailing silence it waited for. Keep 150 ms
+        // of it as context and drop the rest: silence is pure decoder work
+        // (about 7 ms per 60 ms of audio) and the CIF has nothing to fire on it.
+        {
+            const size_t keep = (size_t) (0.15 * 16000.0);
+            size_t end = piece.size();
+            while (end > keep && std::fabs(piece[end - 1]) < 0.01f) {
+                --end;
+            }
+            end = std::min(piece.size(), end + keep);
+            size_t start = 0;
+            while (start + keep < end && std::fabs(piece[start]) < 0.01f) {
+                ++start;
+            }
+            if (start > 0 || end < piece.size()) {
+                piece.assign(piece.begin() + (long) start, piece.begin() + (long) end);
+            }
+        }
         const std::string item = "item_" + std::to_string(++s->stream_items);
         const double duration = (double) piece.size() / 16000.0;
         const auto deadline = pf_clock::now() + g_deadline;
@@ -2046,6 +2064,7 @@ int main(int argc, char** argv) {
             htp_flash_attn = true;
         } else if (std::strcmp(argv[i], "--prefer-idle-htp") == 0) {
             prefer_idle_htp = true;
+
         } else if (std::strcmp(argv[i], "--route-by-length") == 0) {
             g_length_route = true;
         } else if (std::strcmp(argv[i], "--route-by-length-ms") == 0) {
@@ -2300,6 +2319,31 @@ int main(int argc, char** argv) {
     srv.set_write_timeout(5, 0);
     srv.set_payload_max_length(2u * 1024u * 1024u);
 
+    {
+        size_t htp_engines = 0;
+        for (const auto* eng : g_engines) {
+            if (eng->name.rfind("HTP", 0) == 0) {
+                ++htp_engines;
+            }
+        }
+        // HTP is the shipped backend. An engine list without one means the device
+        // node, the library or the launch flags are wrong, and serving on CPU
+        // anyway is both silent and slow: fail, so init's backoff handles it.
+        if (htp_engines == 0 && !allow_cpu_fallback) {
+            std::fprintf(stderr,
+                         "pf-api: no engine came up on HTP and --allow-cpu-fallback was not given; refusing to "
+                         "serve on CPU only\n");
+            return 3;
+        }
+        if (htp_engines == 0) {
+            // Serving without HTP is a degraded mode, not a normal one: say so in
+            // /health and /metrics, not only in the log.
+            g_degraded = true;
+        }
+        std::fprintf(stderr, "pf-api: %zu of %zu engines on HTP%s\n", htp_engines, g_engines.size(),
+                     htp_engines == 0 ? " (CPU only, explicitly allowed: degraded)" : "");
+    }
+
     if (!(g_speaker_threshold >= -1.0f && g_speaker_threshold <= 1.0f) ||
         !(g_speaker_max_s >= 0.025f && g_speaker_max_s <= 30.0f) || !spk_init()) {
         std::fprintf(stderr, "pf-api: invalid or unsupported speaker scoring configuration\n");
@@ -2322,6 +2366,11 @@ int main(int argc, char** argv) {
         json j = {{"status", g_degraded ? "degraded" : "ok"},
                   {"engines", g_engines.size()},
                   {"backends", std::move(backends)},
+                  {"htp_engines", [&] {
+                       size_t n = 0;
+                       for (const auto* eng : g_engines) if (eng->name.rfind("HTP", 0) == 0) ++n;
+                       return n;
+                   }()},
                   {"routing", g_preferred_engine ? "prefer_idle_htp" : (g_length_route ? "by_length" : "shared_queue")},
                   {"route_by_length_ms", g_length_route ? g_length_route_ms : 0},
                   {"queue", queue_depth()},

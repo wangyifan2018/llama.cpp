@@ -6,7 +6,12 @@ CPU 引擎与声纹/VAD 是可选件。
 - 二进制：`llama-paraformer-api`
 - 接口：`POST /v1/audio/transcriptions`、`GET /v1/models`，另有 `/health`、`/metrics`、
   `/v1/realtime`(WS) 与测试台 `/`
-- 后端：**默认 HTP**（检测到 HTP 设备时自动选 `HTP0:0`，无则回落 CPU；`--device CPU` 可强制）
+- 后端：**HTP 是默认且强制的后端**。启动脚本显式传 `--device HTP0:0`（`PF_DEVICE`），
+  `--prefer-idle-htp` 让单路请求始终落在 HTP（CPU worker 只作第二路溢出）；
+  **没有 HTP 引擎时服务以退出码 3 拒绝启动**，除非显式 `--allow-cpu-fallback`（或
+  `PF_ALLOW_CPU_FALLBACK=1`），此时 `/health` 报 `status: degraded`、`/metrics` 报
+  `cpu_fallback: true`。这样"悄悄跑在 CPU 上"不会再发生。`/health` 的 `htp_engines` 与启动日志 `N of M engines on HTP`
+  可直接核对。`PF_DEVICE=auto` 保留二进制探测，供宿主使用。
 - 精度档：热词规则 + 文本规则 + 标点，**属于服务的一部分**，不是可选优化
 
 ## 1. 两种落地形态
@@ -148,8 +153,13 @@ device/state/value 90.5/90.5/100%，zh CER 0.60%，en WER 6.87%，wrong=0。
 段落音频含尾部静音，因此不会出现客户端切太早导致的末尾丢字。
 
 阈值与真实停顿的对应关系（实测，数字静音间隔）：250 ms 不断句，**400 ms 断句**，600 ms 断句。
-检测器自身有窗口平滑，所以"配 300 ms" 的实际分界落在 250–400 ms 之间；想让 250 ms 也断，
-把阈值降到 150–200 ms 再测。无停顿的长音频由检测器在 18 s 处强制断开。
+检测器自身有窗口平滑，所以"配 300 ms" 的实际分界落在 250–400 ms 之间。
+
+**不要低于 300 ms**：23 s 连续命令片段实测，阈值 250 ms 会切出 **11 段**（把"别关氛围灯/把顶灯关掉"
+从句中切开），300 ms 得到 **8 段**、正好一句一段。想更快只能牺牲"一句一段"。
+
+无停顿的长音频由检测器在 18 s 处强制断开；段尾多余的静音在送模型前会被裁到 150 ms
+（静音只是纯解码开销，约 7 ms 每 60 ms）。
 
 会话结束时（`commit` 或断开）剩余音频**直接推理、不补齐**：图是按精确形状构建的，
 补齐只会多花算力并扰动 CIF 统计。
