@@ -2051,7 +2051,19 @@ struct pf_long_cfg {
     bool enabled = true;     // PARAFORMER_LONG=0 disables, restoring single-shot
     int win_ms = 8000;       // window length
     int overlap_ms = 1000;   // overlap between adjacent windows
-    int min_ms = 15000;      // only engage beyond this length
+    // Single-shot stays correct far longer than the windows were first assumed
+    // to need, so the switch sits just past where it actually breaks:
+    //
+    //   continuous cabin speech, 8 distinct commands repeated with 300 ms gaps
+    //   16.8 s  21.4 s  24.0 s  26.9 s  29.0 s  32.3 s  -> single-shot exact
+    //   34.9 s                                            -> first error ("调"->"降")
+    //
+    // The windowed path is *worse* over that whole range, not just slower: it
+    // returns 66 chars where 65 are expected at 16.8 s, 78/76 at 19.5 s and
+    // 84/82 at 21.4 s - one or two extra syllables, at the window seams. It was
+    // gated at 15000 ms, which put the seams inside audio single-shot handles
+    // exactly. 33000 keeps them for the range where nothing else works.
+    int min_ms = 33000;
 };
 
 static pf_long_cfg paraformer_long_cfg() {

@@ -334,6 +334,35 @@ python3 tools/check_metrics.py --port 8080
 In-tree consumers (`smoke_production.py`, `check_admission.py`,
 `bench_ws_realtime.py`) read `/metrics.json`; keep both endpoints.
 
+### Long audio
+
+Single-shot decoding stays exact to **32 s** of continuous speech and starts
+degrading at 34.9 s (first error: `调` becomes `降` in the ninth command). Past
+that the model switches to 8 s windows with 1 s overlap, and the stitch assigns
+each token to the window whose core contains it.
+
+The window threshold used to be 15 s, which was wrong: over the whole 15-32 s
+range the windows are not just slower, they are less accurate, because the
+seams add or drop a syllable (`66` characters where 65 are expected at 16.8 s,
+`78/76` at 19.5 s, `84/82` at 21.4 s). Single-shot is both correct and faster
+there. `PARAFORMER_LONG_MIN_MS` still overrides it, but a smaller value puts the
+seams back inside audio the single pass handles exactly.
+
+Trailing digital silence is trimmed before decoding: the CIF keeps emitting into
+silence and hallucinates `没有` that grows with the silence (3 tokens at 5 s,
+six at 7 s, plus `证据` at 8 s). Two seconds of tail are kept as context.
+
+`tools/gen_long_fixtures.py` builds the fixtures and scores them - an 8-step
+staircase, the same speech with 0-6 s of silence, and a seam case:
+
+```sh
+python3 tools/gen_long_fixtures.py --model MODEL.gguf --out /tmp/pf-long --gate
+```
+
+14 gated fixtures, all exact. The seam case is reported but not gated: 0.5 s of
+context either side of a silence midpoint still duplicates the word that
+straddles it, which a future splitter has to fix or explain.
+
 ### Shutdown
 
 `SIGTERM` and `SIGINT` mean "finish what you already accepted, then exit", which
