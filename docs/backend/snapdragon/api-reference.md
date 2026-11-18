@@ -211,7 +211,16 @@ pf-api: shut down cleanly
 ```
 
 partial 的节流：新增音频 ≥ `--partial-ms`（默认 800 ms）且距上次 ≥ `--partial-interval-ms`（600 ms），
-且队列为空、音频长度 < `--partial-max-s`（2.0 s）。partial 永远给 commit 让路。
+且队列为空、音频长度 ≥ `--partial-min-s` 且 < `--partial-max-s`（两者默认都是 2.0 s）。partial 永远给 commit 让路。
+
+`--partial-min-s` 默认等于 `--partial-max-s`，也就是默认**不发** partial，只发整句结果。
+原因不是省算力：Paraformer 会随音频增长修正前面的字，而 delta 只能追加不能改，
+服务端只能把修正后的结果丢掉。实测 1.8 s 的「把主驾空调调到二十」中途只弹出一次
+「把主架扩」，然后停在屏幕上 1.1 s 直到整句完成——错字比空白更糟。短命令等 final，
+说完到出字 187–369 ms（1.2/1.8/2.3 s 三个长度）。
+
+要开预览必须**同时**放宽两个阈值，例如 `--partial-min-s 0.8 --partial-max-s 8`，
+并接受短句上的错字停留。
 
 ## 6. 错误
 

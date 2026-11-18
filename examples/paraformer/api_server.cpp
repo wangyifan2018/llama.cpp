@@ -234,6 +234,12 @@ static double g_punct_gap_ms = 600;     // silence that earns a clause separator
 static double g_partial_min_ms = 800;   // new audio needed before a partial
 static double g_partial_interval = 600; // minimum time between partials
 static double g_partial_max_s = 2.0;    // stop partials past this much audio
+// Below this much audio a session previews nothing; see the note in the partial
+// scheduler. This sits at the ceiling above, so the preview window is
+// deliberately closed for the lengths a cabin command actually has: a wrong
+// revision stuck on screen was worse than no revision at all. Raise the ceiling
+// together with this if previews are wanted for longer dictation.
+static double g_partial_min_s = 2.0;
 static bool g_partials = true;
 static std::atomic<uint64_t> g_partials_run{0};
 static std::atomic<uint64_t> g_partials_skipped{0};
@@ -1223,6 +1229,16 @@ static void maybe_schedule_partial(const std::shared_ptr<WsSession>& s) {
         return;
     }
     std::lock_guard<std::mutex> lock(s->m);
+    // A short command should not preview at all. Paraformer revises itself as
+    // more audio arrives, and a delta can only append, so a revision has to be
+    // dropped; the driver is then left reading a wrong partial until the final
+    // lands. On a 1.8 s clip that meant one wrong partial ("把主架扩" for
+    // "把主驾空调调到二十") sitting on screen for 1.1 s. Wrong text is a worse
+    // experience than no text, so below this much audio the session waits for
+    // the final, which arrives 187-369 ms after the speaker stops.
+    if (g_partial_min_s > 0 && s->pcm.size() < (size_t) (g_partial_min_s * 16000.0)) {
+        return;
+    }
     if (g_partial_max_s > 0 && s->pcm.size() > (size_t) (g_partial_max_s * 16000.0)) {
         g_partials_skipped.fetch_add(1);
         return;
@@ -1736,7 +1752,7 @@ int main(int argc, char** argv) {
                      "[--htp-flash-attn | --no-htp-flash-attn] [--prefer-idle-htp] [--route-by-length | --route-by-length-ms N] [--htp-watchdog-ms N] [--htp-warmup-ms N] "
                      "[--bind ADDR] [--queue N] [--queue-mib N] [--timeout-ms N] [--deadline-ms N] "
                      "[--model-id ID] [--warmup WAV] [--allow-cpu-fallback] [--recover-on-cpu] "
-                     "[--partial-ms N] [--partial-interval-ms N] [--partial-max-s N] [--no-partials] "
+                     "[--partial-ms N] [--partial-interval-ms N] [--partial-min-s S] [--partial-max-s S] [--no-partials] "
                      "[--seg-gap-ms N] [--punct-gap-ms N] "
                      "[--web-dir DIR] [--speaker-model FILE] [--enroll-dir DIR] [--speaker-threshold F] [--speaker-max-s S] "
                      "[--vad-model FILE] [--vad-split-s S] [--vad-threshold F] [--vad-min-silence S] "
@@ -1862,6 +1878,8 @@ int main(int argc, char** argv) {
             g_partials = false;
         } else if (std::strcmp(argv[i], "--partial-max-s") == 0 && i + 1 < argc) {
             g_partial_max_s = std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--partial-min-s") == 0 && i + 1 < argc) {
+            g_partial_min_s = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--speaker-model") == 0 && i + 1 < argc) {
             g_speaker_model = argv[++i];
         } else if (std::strcmp(argv[i], "--enroll-dir") == 0 && i + 1 < argc) {

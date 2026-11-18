@@ -144,6 +144,24 @@ Decomposition wins at one lane and at four, and is level at two. The four-lane p
 
 The client-visible gain is larger than the inference-time gain because the fused graph's 66 off-device ops are serial round trips that sit in front of the first token.
 
+## Short commands do not preview
+
+Realtime sessions no longer send partial text for utterances under `--partial-min-s`, which defaults to 2.0 s (equal to `--partial-max-s`, so the preview window is closed by default). `/v1/realtime` answers such a command with a single `completed` event.
+
+The reason is not cost. Paraformer revises earlier characters as more audio arrives, and the delta event can only append, so a revision has no way to reach the client and the server drops it. Measured on one 1.8 s clip against the default 800 ms / 600 ms throttle, the session received exactly one delta, reading "把主架扩" for the audio that finishes as "把主驾空调调到二十", and then nothing for 1.1 s until the final replaced it. Earlier throttling makes the content worse, not better: at 400 ms the first preview was "巴主的". A driver reading a wrong partial for a second is worse off than a driver reading nothing, so the window is closed for the lengths a cabin command actually has.
+
+Waiting costs little, because the final is fast once the speaker stops:
+
+| Audio | text visible at commit | final after speaker stops |
+|---:|---|---:|
+| 1.2 s | none (by design) | 187 ms, p95 209 ms |
+| 1.8 s | none (by design) | 286 ms, p95 287 ms |
+| 2.3 s | none (by design) | 369 ms, p95 372 ms |
+
+Text after a longer utterance still previews, and correctly: a 4.6 s clip showed "把主驾空调调到二十一" at 2.3 s. Both thresholds have to move together to re-enable previews, for example `--partial-min-s 0.8 --partial-max-s 8`, and that should be judged on whether the revisions it exposes are acceptable rather than on how early the first delta appears.
+
+`bench_first_token.py` reports this split -- text already on screen at commit versus the post-commit wait -- because endpoint-to-final alone cannot tell a previewing server from a silent one.
+
 ## Backend choice depends on utterance length
 
 HTP does not win on short commands. It pays a fixed cost per call -- session scheduling plus the FastRPC round trips for the graph edges -- that only amortises once the utterance is long enough. Measured one engine at a time on SM6650, one warmup then five requests per length, rising `X-Infer-Ms` medians:
