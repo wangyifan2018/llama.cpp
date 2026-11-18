@@ -106,8 +106,8 @@ struct BlockParams {
     bool flash_attn = false;
 };
 
-// Build one SANM encoder block. `cur` is (in_size, T). Returns the new
-// (size, T) hidden state. The caller decides whether the attention branch
+// Build one SANM encoder block. `cur` is (in_size, T, batch). Returns the new
+// (size, T, batch) hidden state. The caller decides whether the attention branch
 // gets a residual via `apply_attn_residual` — for block 0 (in_size != size)
 // the upstream graph skips the attn residual entirely.
 static inline ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* cur, int T, const BlockWeights& w,
@@ -116,12 +116,15 @@ static inline ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* cur, int
     const int n_heads = p.n_heads;
     const int hd = p.head_dim;
     const int K = p.kernel;
+    const int64_t batch = cur->ne[2];
     const float eps = p.ln_eps;
     const float scale = 1.0f / std::sqrt((float)hd);
 
     auto mm_bias = [&](ggml_tensor* W, ggml_tensor* x, ggml_tensor* b) {
+        if (batch > 1) x = ggml_reshape_2d(ctx0, x, x->ne[0], T * batch);
         ggml_tensor* y = ggml_mul_mat(ctx0, W, x);
-        return b ? ggml_add(ctx0, y, b) : y;
+        if (b) y = ggml_add(ctx0, y, b);
+        return batch > 1 ? ggml_reshape_3d(ctx0, y, y->ne[0], T, batch) : y;
     };
 
     // ---- norm1 + fused QKV ----
@@ -133,9 +136,14 @@ static inline ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* cur, int
     // T-row leaves a 2*n_feat gap. The downstream reshape_3d asserts
     // contiguity, so make each split its own buffer with ggml_cont.
     const size_t row_bytes = qkv->nb[1];
-    ggml_tensor* Q = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv, n_feat, T, row_bytes, 0));
-    ggml_tensor* K_ = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv, n_feat, T, row_bytes, (size_t)n_feat * sizeof(float)));
-    ggml_tensor* V = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv, n_feat, T, row_bytes, (size_t)2 * n_feat * sizeof(float)));
+    auto qkv_part = [&](size_t offset) {
+        ggml_tensor* view = batch > 1 ? ggml_view_3d(ctx0, qkv, n_feat, T, batch, row_bytes, qkv->nb[2], offset)
+                                     : ggml_view_2d(ctx0, qkv, n_feat, T, row_bytes, offset);
+        return ggml_cont(ctx0, view);
+    };
+    ggml_tensor* Q = qkv_part(0);
+    ggml_tensor* K_ = qkv_part((size_t) n_feat * sizeof(float));
+    ggml_tensor* V = qkv_part((size_t) 2 * n_feat * sizeof(float));
 
     // ---- FSMN memory branch (depthwise conv1d on V) ----
     //
@@ -148,18 +156,18 @@ static inline ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* cur, int
         ggml_tensor* w4 = ggml_cast(ctx0, w.attn_fsmn_w, GGML_TYPE_F32);
         w4 = ggml_reshape_4d(ctx0, w4, K, 1, 1, n_feat);
 
-        ggml_tensor* v4 = ggml_cont(ctx0, ggml_transpose(ctx0, V)); // (T, n_feat)
-        v4 = ggml_reshape_4d(ctx0, v4, T, 1, n_feat, 1);
+        ggml_tensor* v4 = ggml_cont(ctx0, ggml_transpose(ctx0, V)); // (T, n_feat, batch)
+        v4 = ggml_reshape_4d(ctx0, v4, T, 1, n_feat, batch);
         ggml_tensor* y = ggml_conv_2d_dw_direct(ctx0, w4, v4, 1, 1, (K - 1) / 2, 0, 1, 1);
-        y = ggml_cont(ctx0, ggml_permute(ctx0, y, 1, 2, 0, 3)); // back to (n_feat, T, 1, 1)
-        y = ggml_reshape_2d(ctx0, y, n_feat, T);
+        y = ggml_cont(ctx0, ggml_permute(ctx0, y, 1, 2, 0, 3));
+        y = ggml_reshape_3d(ctx0, y, n_feat, T, batch);
         fsmn = ggml_add(ctx0, y, V);
     }
 
     // ---- Multi-head self-attention ----
-    Q = ggml_reshape_3d(ctx0, Q, hd, n_heads, T);
-    K_ = ggml_reshape_3d(ctx0, K_, hd, n_heads, T);
-    ggml_tensor* V_h = ggml_reshape_3d(ctx0, V, hd, n_heads, T);
+    Q = ggml_reshape_4d(ctx0, Q, hd, n_heads, T, batch);
+    K_ = ggml_reshape_4d(ctx0, K_, hd, n_heads, T, batch);
+    ggml_tensor* V_h = ggml_reshape_4d(ctx0, V, hd, n_heads, T, batch);
 
     // Permute so head_dim stays fast, T becomes the "rows" axis per head.
     Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));   // (hd, T, n_heads)
@@ -171,7 +179,6 @@ static inline ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* cur, int
         // flash_attn_ext fuses (scores + softmax + ×V) into one kernel.
         // Output is (hd, T, n_heads) which we reshape to (n_feat, T).
         attn = ggml_flash_attn_ext(ctx0, Q, K_, V_h, /*mask*/ nullptr, scale, 0.0f, 0.0f);
-        attn = ggml_reshape_2d(ctx0, attn, n_feat, T);
     } else {
         // scores = K^T · Q → (T, T, n_heads). Softmax along the key axis
         // (ne[0]), with the d_k^-0.5 scale fused in by soft_max_ext.
@@ -181,8 +188,8 @@ static inline ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* cur, int
         ggml_tensor* V_p = ggml_cont(ctx0, ggml_permute(ctx0, V_h, 1, 0, 2, 3)); // (T, hd, n_heads)
         attn = ggml_mul_mat(ctx0, V_p, scores);                                  // (hd, T, n_heads)
         attn = ggml_cont(ctx0, ggml_permute(ctx0, attn, 0, 2, 1, 3));            // (hd, n_heads, T)
-        attn = ggml_reshape_2d(ctx0, attn, n_feat, T);
     }
+    attn = ggml_reshape_3d(ctx0, attn, n_feat, T, batch);
 
     // Output projection + bias, then sum with the FSMN memory branch.
     attn = mm_bias(w.attn_out_w, attn, w.attn_out_b);
