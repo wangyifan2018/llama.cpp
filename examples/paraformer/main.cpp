@@ -1,4 +1,5 @@
 #include "paraformer.h"
+#include "core/segment_limits.h"
 
 #include "ggml-backend.h"
 
@@ -50,7 +51,7 @@ int main(int argc, char ** argv) {
     if (argc < 3) {
         fprintf(stderr,
                 "usage: %s MODEL.gguf WAV... [--device NAME] [--threads N] [--warmup FILE] [--timestamps] [--quiet]\n"
-                "       [--hotwords FILE] [--dump-logits N]\n",
+                "       [--hotwords FILE] [--dump-logits N] [--bench-encoder-pair REPS]\n",
                 argv[0]);
         return 1;
     }
@@ -60,11 +61,14 @@ int main(int argc, char ** argv) {
     params.flash_attn = false;
     params.verbosity = 0;   // per-clip results go to stdout; stderr stays quiet
     bool timestamps = false;
+    int encoder_pair_reps = 0;
     const char * warmup_file = nullptr;
+    const char * requested_device = nullptr;
     std::vector<const char *> waves;
     for (int i = 2; i < argc; ++i) {
         if (std::strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
-            setenv("PARAFORMER_DEVICE", argv[++i], 1);
+            requested_device = argv[++i];
+            setenv("PARAFORMER_DEVICE", requested_device, 1);
             setenv("CRISPASR_PARAFORMER_GPU", "1", 1);
         } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
             params.n_threads = std::atoi(argv[++i]);
@@ -80,6 +84,12 @@ int main(int argc, char ** argv) {
             setenv("PF_HOTWORDS", argv[++i], 1);
         } else if (std::strcmp(argv[i], "--dump-logits") == 0 && i + 1 < argc) {
             setenv("PF_DUMP_LOGITS", argv[++i], 1);
+        } else if (std::strcmp(argv[i], "--bench-encoder-pair") == 0 && i + 1 < argc) {
+            char* end = nullptr;
+            const char* value = argv[++i];
+            const long reps = std::strtol(value, &end, 10);
+            if (end == value || *end || reps < 1 || reps > 1000) return 1;
+            encoder_pair_reps = (int) reps;
         } else {
             waves.push_back(argv[i]);
         }
@@ -95,9 +105,23 @@ int main(int argc, char ** argv) {
     if (!model) {
         return 2;
     }
+    if (requested_device && std::strcmp(requested_device, paraformer_backend_name(model.get())) != 0) {
+        fprintf(stderr, "paraformer: requested %s, initialized %s\n", requested_device, paraformer_backend_name(model.get()));
+        return 2;
+    }
     const double init_ms =
         std::chrono::duration<double, std::milli>(pf_clock::now() - init_begin).count();
     fprintf(stderr, "paraformer: init %.1f ms\n", init_ms);
+
+    if (encoder_pair_reps) {
+        std::vector<float> a, b;
+        if (waves.size() != 2 || !read_wav(waves[0], a) || !read_wav(waves[1], b) ||
+            a.size() != b.size() || a.size() > pf_segment::max_samples) {
+            fprintf(stderr, "paraformer: encoder pair probe needs two equal-length WAVs of at most 30 seconds\n");
+            return 3;
+        }
+        return paraformer_bench_encoder_pair(model.get(), a.data(), b.data(), (int) a.size(), encoder_pair_reps) ? 0 : 6;
+    }
 
     if (warmup_file) {
         std::vector<float> warm;
@@ -105,7 +129,10 @@ int main(int argc, char ** argv) {
             return 3;
         }
         const auto wbegin = pf_clock::now();
-        paraformer_warmup(model.get(), warm.data(), (int) warm.size());
+        if (!paraformer_warmup(model.get(), warm.data(), (int) warm.size())) {
+            fprintf(stderr, "paraformer: warmup failed on %s\n", paraformer_backend_name(model.get()));
+            return 6;
+        }
         const double wms =
             std::chrono::duration<double, std::milli>(pf_clock::now() - wbegin).count();
         fprintf(stderr, "paraformer: warmup %.1f ms\n", wms);

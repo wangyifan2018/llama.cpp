@@ -21,6 +21,8 @@
 // run concurrently; the second engine is always CPU.
 
 #include "paraformer.h"
+#include "core/engine_start.h"
+#include "core/segment_limits.h"
 #include "ggml-backend.h"
 
 #include <arpa/inet.h>
@@ -53,9 +55,9 @@ enum { OP_RECOGNIZE = 0 };
 enum { ST_FINAL = 1, ST_ERROR = 2 };
 
 struct Engine {
-    paraformer_context* ctx = nullptr;
+    paraformer_context_ptr ctx{nullptr, &paraformer_free};
     int id = 0;
-    const char* name = "";
+    std::string name;
     std::thread worker;
     std::atomic<uint64_t> requests{0};
     std::atomic<double> total_ms{0};
@@ -74,8 +76,6 @@ static std::condition_variable g_queue_cv;
 static bool g_stop = false;
 static size_t queue_limit = 32;      // pending requests before OPEN-side reject
 static double queue_timeout_ms = 15000; // a request that waited longer is dropped
-static double g_queue_ms = 0;        // last request's queue wait, for the log
-static double g_infer_ms = 0;
 
 // A client that hung up before its turn must not consume an engine slot.
 static bool peer_alive(int fd) {
@@ -92,6 +92,8 @@ static bool peer_alive(int fd) {
 static std::vector<Engine*> g_engines;
 static std::atomic<uint64_t> g_requests{0};
 static std::atomic<double> g_total_ms{0};
+static std::atomic<int> g_connections{0};
+static constexpr int connection_limit = 16;
 
 static double now_ms() {
     return std::chrono::duration<double, std::milli>(pf_clock::now().time_since_epoch()).count();
@@ -178,7 +180,7 @@ static void worker_loop(Engine* eng) {
         } else {
             const double t0 = now_ms();
             std::unique_ptr<char, decltype(&std::free)> out(
-                paraformer_transcribe(eng->ctx, task->samples.data(), (int) task->samples.size()), &std::free);
+                paraformer_transcribe(eng->ctx.get(), task->samples.data(), (int) task->samples.size()), &std::free);
             const double dt = now_ms() - t0;
             eng->requests.fetch_add(1);
             double cur = eng->total_ms.load();
@@ -189,10 +191,8 @@ static void worker_loop(Engine* eng) {
             if (getenv("PF_TIMING")) {
                 static std::mutex log_mutex;
                 std::lock_guard<std::mutex> lock(log_mutex);
-                std::fprintf(stderr, "pf-server: queue_ms=%.3f infer_ms=%.3f engine=%s\n", queue_ms, dt, eng->name);
+                std::fprintf(stderr, "pf-server: queue_ms=%.3f infer_ms=%.3f engine=%s\n", queue_ms, dt, eng->name.c_str());
             }
-            g_queue_ms = queue_ms;
-            g_infer_ms = dt;
             reply = out ? std::make_pair((int) ST_FINAL, std::string(out.get())) : std::make_pair((int) ST_ERROR, std::string("inference failed"));
         }
         task->result.set_value(std::move(reply));
@@ -205,7 +205,7 @@ static void handle_connection(int fd) {
         if (!read_exact(fd, head, sizeof(head)))
             break;
         uint32_t op = head[0], bytes = head[2];
-        if (bytes > 64u * 1024u * 1024u) {
+        if (bytes > pf_segment::max_samples * sizeof(float)) {
             respond(fd, ST_ERROR, "payload too large");
             break;
         }
@@ -218,11 +218,19 @@ static void handle_connection(int fd) {
             respond(fd, ST_ERROR, "unknown op");
             continue;
         }
-        std::vector<float> samples(bytes / sizeof(float));
-        if (bytes && !read_exact(fd, samples.data(), bytes))
+        if (bytes % sizeof(float) != 0) {
+            respond(fd, ST_ERROR, "expected whole float32 samples");
             break;
-        if (samples.empty()) {
+        }
+        if (bytes == 0) {
             respond(fd, ST_ERROR, "empty audio");
+            continue;
+        }
+        std::vector<float> samples(bytes / sizeof(float));
+        if (!read_exact(fd, samples.data(), bytes))
+            break;
+        if (!pf_segment::finite(samples)) {
+            respond(fd, ST_ERROR, "audio contains non-finite samples");
             continue;
         }
 
@@ -231,13 +239,17 @@ static void handle_connection(int fd) {
         task->fd = fd;
         task->enqueued_ms = now_ms();
         auto result = task->result.get_future();
+        bool admitted = false;
         {
             std::lock_guard<std::mutex> lock(g_queue_mutex);
-            if (g_queue.size() >= queue_limit) {
-                respond(fd, ST_ERROR, "busy: queue full");
-                continue;
+            if (g_queue.size() < queue_limit) {
+                g_queue.push(std::move(task));
+                admitted = true;
             }
-            g_queue.push(std::move(task));
+        }
+        if (!admitted) {
+            respond(fd, ST_ERROR, "busy: queue full");
+            continue;
         }
         g_queue_cv.notify_one();
 
@@ -246,13 +258,14 @@ static void handle_connection(int fd) {
             break;
     }
     close(fd);
+    --g_connections;
 }
 
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr,
                      "usage: %s MODEL.gguf [DEVICE] [--port N] [--warmup F32] [--threads N] "
-                     "[--engines 1|2] [--bind ADDR] [--queue N] [--timeout-ms N] [--no-warmup]\n",
+                     "[--engines N] [--bind ADDR] [--queue N] [--timeout-ms N] [--no-warmup] [--allow-cpu-fallback]\n",
                      argv[0]);
         return 1;
     }
@@ -264,6 +277,7 @@ int main(int argc, char** argv) {
     int threads = 2;
     int n_engines = 2;
     bool no_warmup = false;
+    bool allow_cpu_fallback = false;
     bool device_set = false;
     for (int i = 2; i < argc; ++i) {
         if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -282,6 +296,8 @@ int main(int argc, char** argv) {
             queue_timeout_ms = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--no-warmup") == 0) {
             no_warmup = true;
+        } else if (std::strcmp(argv[i], "--allow-cpu-fallback") == 0) {
+            allow_cpu_fallback = true;
         } else if (argv[i][0] != '-' && !device_set) {
             device = argv[i];
             device_set = true;
@@ -314,7 +330,8 @@ int main(int argc, char** argv) {
 
     // Load the GGUF once into a canonical host-buffer weight set.
     const double load0 = now_ms();
-    paraformer_weights* weights = paraformer_weights_load(model, 0);
+    std::unique_ptr<paraformer_weights, decltype(&paraformer_weights_free)> weights(paraformer_weights_load(model, 0),
+                                                                                 &paraformer_weights_free);
     if (!weights) {
         std::fprintf(stderr, "pf-server: cannot load weights from %s\n", model);
         return 2;
@@ -338,23 +355,32 @@ int main(int argc, char** argv) {
     for (int i = 1; i < n_engines; ++i)
         specs.push_back({false, "CPU"});
 
+    std::vector<std::unique_ptr<Engine>> engines;
     for (size_t i = 0; i < specs.size(); ++i) {
-        auto* eng = new Engine();
+        auto eng = std::make_unique<Engine>();
         eng->id = (int) i;
-        eng->name = specs[i].name;
         auto p = params;
         p.use_gpu = specs[i].use_gpu;
         const double t0 = now_ms();
-        eng->ctx = paraformer_init_shared(weights, p);
+        eng->ctx = paraformer_start_engine(weights.get(), p, warm);
+        if (!eng->ctx && p.use_gpu && allow_cpu_fallback) {
+            std::fprintf(stderr, "pf-server: %s init or warmup failed, retrying on CPU\n", specs[i].name);
+            p.use_gpu = false;
+            eng->ctx = paraformer_start_engine(weights.get(), p, warm);
+        }
         if (!eng->ctx) {
-            std::fprintf(stderr, "pf-server: engine %zu (%s) init failed\n", i, specs[i].name);
+            std::fprintf(stderr, "pf-server: engine %zu (%s) init or warmup failed\n", i, specs[i].name);
             return 2;
         }
-        if (!warm.empty())
-            paraformer_warmup(eng->ctx, warm.data(), (int) warm.size());
-        std::fprintf(stderr, "pf-server: engine %d (%s) ready in %.1f ms\n", eng->id, eng->name, now_ms() - t0);
-        g_engines.push_back(eng);
+        eng->name = paraformer_backend_name(eng->ctx.get());
+        const auto placement = paraformer_warmup_placement(eng->ctx.get());
+        std::fprintf(stderr, "pf-server: engine %d requested=%s actual=%s encoder=%d/%d decoder=%d/%d in %.1f ms\n",
+                     eng->id, specs[i].name, eng->name.c_str(), placement.encoder_device_ops, placement.encoder_total_ops,
+                     placement.decoder_device_ops, placement.decoder_total_ops, now_ms() - t0);
+        g_engines.push_back(eng.get());
+        engines.push_back(std::move(eng));
     }
+    weights.reset();
 
     const int listener = socket(AF_INET, SOCK_STREAM, 0);
     if (listener < 0) {
@@ -381,8 +407,22 @@ int main(int argc, char** argv) {
         int fd = accept(listener, nullptr, nullptr);
         if (fd < 0)
             continue;
+        if (g_connections.load() >= connection_limit) {
+            close(fd);
+            continue;
+        }
         int nodelay = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-        std::thread(handle_connection, fd).detach();
+        timeval recv_timeout{10, 0};
+        timeval send_timeout{5, 0};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
+        ++g_connections;
+        try {
+            std::thread(handle_connection, fd).detach();
+        } catch (const std::system_error&) {
+            --g_connections;
+            close(fd);
+        }
     }
 }
