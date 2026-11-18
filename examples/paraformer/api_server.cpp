@@ -1711,7 +1711,7 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
                      "usage: %s MODEL.gguf [--device HTP0:0] [--port N] [--engines N] [--threads N] "
-                     "[--no-htp-flash-attn] [--prefer-idle-htp] [--htp-watchdog-ms N] [--htp-warmup-ms N] "
+                     "[--htp-flash-attn | --no-htp-flash-attn] [--prefer-idle-htp] [--htp-watchdog-ms N] [--htp-warmup-ms N] "
                      "[--bind ADDR] [--queue N] [--queue-mib N] [--timeout-ms N] [--deadline-ms N] "
                      "[--model-id ID] [--warmup WAV] [--allow-cpu-fallback] [--recover-on-cpu] "
                      "[--partial-ms N] [--partial-interval-ms N] [--partial-max-s N] [--no-partials] "
@@ -1737,7 +1737,7 @@ int main(int argc, char** argv) {
     bool device_set = false;
     bool allow_cpu_fallback = false;
     bool recover_on_cpu = false;
-    bool htp_flash_attn = true;
+    bool htp_flash_attn = false;
     bool prefer_idle_htp = false;
     std::chrono::milliseconds htp_watchdog_limit{0};
     std::chrono::milliseconds htp_warmup_limit{0};
@@ -1787,6 +1787,8 @@ int main(int argc, char** argv) {
             recover_on_cpu = true;
         } else if (std::strcmp(argv[i], "--no-htp-flash-attn") == 0) {
             htp_flash_attn = false;
+        } else if (std::strcmp(argv[i], "--htp-flash-attn") == 0) {
+            htp_flash_attn = true;
         } else if (std::strcmp(argv[i], "--prefer-idle-htp") == 0) {
             prefer_idle_htp = true;
         } else if (std::strcmp(argv[i], "--htp-watchdog-ms") == 0) {
@@ -1969,6 +1971,24 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "pf-api: engine %d requested=%s actual=%s flash_attn=%d encoder=%d/%d decoder=%d/%d ready in %.0f ms\n",
                      i, eng->requested.c_str(), eng->name.c_str(), eng->flash_attn, p.encoder_device_ops, p.encoder_total_ops,
                      p.decoder_device_ops, p.decoder_total_ops, now_ms() - t0);
+        // Ops that do not land on the accelerator turn into FastRPC round trips
+        // for every request, so measure the placement instead of trusting the
+        // flash-attn default. On a v73 part (2 HVX, no HMX) FLASH_ATTN_EXT is
+        // unsupported and turning it on pushes 50 encoder and 16 decoder ops
+        // off the DSP: 447 -> 355 ms p50 and 1004 -> 710 ms p95 at 4 lanes.
+        // Flash is also the less accurate graph there -- it reads light_en02 as
+        // "reading leg", where the decomposed graph gets "reading light" and
+        // matches the 6.87% en WER release figure. Reporting the gap makes the
+        // next part that behaves differently visible without a new experiment.
+        if (i == 0 && eng->name.rfind("HTP", 0) == 0) {
+            const int off = (p.encoder_total_ops - p.encoder_device_ops) + (p.decoder_total_ops - p.decoder_device_ops);
+            if (off > 0) {
+                std::fprintf(stderr,
+                             "pf-api: %d op(s) in this graph do not run on %s; each one costs a FastRPC round trip per "
+                             "request. The default graph avoids this; flash is only worth it if the count is 0 on your part.\n",
+                             off, eng->name.c_str());
+            }
+        }
         g_engines.push_back(eng.get());
         engines.push_back(std::move(eng));
     }
@@ -1993,7 +2013,11 @@ int main(int argc, char** argv) {
             backends.push_back({{"requested", eng->requested}, {"actual", eng->name},
                                 {"flash_attn", eng->flash_attn}, {"watchdog_ms", eng->watchdog ? htp_watchdog_limit.count() : 0},
                                 {"encoder_device_ops", p.encoder_device_ops}, {"encoder_total_ops", p.encoder_total_ops},
-                                {"decoder_device_ops", p.decoder_device_ops}, {"decoder_total_ops", p.decoder_total_ops}});
+                                {"decoder_device_ops", p.decoder_device_ops}, {"decoder_total_ops", p.decoder_total_ops},
+                                // Per-engine request count. Without it there is no way to tell
+                                // whether a latency change came from routing or from the engine
+                                // itself, and the two look identical from the client side.
+                                {"requests", eng->requests.load()}});
         }
         json j = {{"status", g_degraded ? "degraded" : "ok"},
                   {"engines", g_engines.size()},

@@ -124,9 +124,27 @@ The Android launcher, synthetic enrollment fixture identifiers and hashes, raw r
 
 ## HTP attention placement and latency
 
-`--no-htp-flash-attn` selects the existing QK matmul, softmax and value matmul graph for HTP. The flag keeps CPU workers on their existing attention graph. `/health` reports the attention choice per engine. Both REST endpoints and WS timings expose the worker backend for each request.
+`--htp-flash-attn` selects `FLASH_ATTN_EXT` for HTP. It is off by default. The flag keeps CPU workers on their existing attention graph either way. `/health` reports the attention choice per engine. Both REST endpoints and WS timings expose the worker backend for each request.
 
-The same API binary and Q8_0 model ran on SM6650 with the vehicle rewrite profile, two inference threads per worker, and previews, server VAD, and speaker scoring off. The recognition check ran one HTP engine per arm on the 32 Tingting clips. The scheduling check used two engines (HTP + CPU) and restarted in flash, decomposed, decomposed, flash order. For each start it used one warmup request and two rounds per layout. All workloads used paced 20 ms WebSocket packets.
+The default is the decomposed graph because on parts without HMX the fused op does not run on the DSP. On SM6650 (Hexagon v73, 2 HVX, no HMX) turning flash on moves 50 encoder and 16 decoder ops off HTP, and each of those becomes a FastRPC round trip per request. The server now prints that count at startup whenever a graph has ops outside the accelerator, so a part that behaves differently says so instead of hiding inside a latency number:
+
+```
+pf-api: 66 op(s) in this graph do not run on HTP0; each one costs a FastRPC round trip per request.
+```
+
+Decomposition is also the more accurate graph, not merely the faster one, so this is not a speed-for-quality trade. Measured on one SM6650 with the same API binary, Q8_0 model, two engines and 6 runs per lane, restarting between arms:
+
+| lanes | Flash p50 / p95 | Decomposed p50 / p95 | Flash infer p50 | Decomposed infer p50 |
+|---:|---:|---:|---:|---:|
+| 1 | 447 / 555 ms | **355 / 359 ms** | 433 ms | 335 ms |
+| 2 | 425 / 518 ms | 424 / 530 ms | 412 ms | 420 ms |
+| 4 | 596 / **1004** ms | **486 / 710** ms | 364 ms | 321 ms |
+
+Decomposition wins at one lane and at four, and is level at two. The four-lane p95 matters most for a cabin: it is the case where a command queues behind other commands, and there the fused graph costs an extra 294 ms. Inference time per request stays near 320 ms in both arms at four lanes, so the four-lane gap is queueing behind a slower worker, not a slower model.
+
+The client-visible gain is larger than the inference-time gain because the fused graph's 66 off-device ops are serial round trips that sit in front of the first token.
+
+The earlier WebSocket experiment covered in the table below reached the same placement counts but reported 293.5 ms (flash) against 288.5 ms (decomposed) and concluded the two were equivalent, so it kept flash as the default. That measurement used paced 20 ms WebSocket packets and four-request arms; the difference is inside its noise, which is why the placement counts -- not the latency delta -- are what carried over. Both measurements agree on the reason to prefer decomposition once it is measured at the queue, where the 66 round trips stop being amortised by pacing.
 
 | HTP attention | Encoder ops on HTP | Decoder ops on HTP | zh CER | en WER | Median inference, 32 HTP requests |
 |---|---:|---:|---:|---:|---:|
@@ -143,11 +161,11 @@ Placement counts describe the warmup graphs. The previous CPU placements were al
 | One 10 s clip and three short commands | 16 | 667/1462 ms | 647/1452 ms |
 | Short requests within the mixed workload | 12 | 565/785 ms | 545/825 ms |
 
-Latency is measured from client commit to final, and the maximum lateness of the client commit versus its scheduled endpoint was 2.31 ms. All 52 benchmark transcripts matched per arm. In the aligned workload the median HTP worker inference fell from 314 to 282 ms. Client P95 stayed close there and increased in the staggered and short-with-long workloads. Keep the default graph and expose decomposition as an opt-in HTP candidate. The short samples motivate backend-aware scheduling before a default switch.
+Latency is measured from client commit to final, and the maximum lateness of the client commit versus its scheduled endpoint was 2.31 ms. All 52 benchmark transcripts matched per arm. In the aligned workload the median HTP worker inference fell from 314 to 282 ms. Client P95 stayed close there and increased in the staggered and short-with-long workloads. That run was too short to separate the arms on latency, so it kept the default graph; the later REST measurement above reaches the opposite conclusion on the same placement counts, and decomposition is the default now.
 
 The pre/post snapshots showed about 415-425 MiB RSS, zero process swap, and Android thermal status 0 for both arms. These are short-run process snapshots. Sustained thermal and system contention remain open.
 
-Run the two Android API arms with `--device HTP0:0 --engines 2 --threads 2 --no-partials` and the same warmup WAV. Add `--no-htp-flash-attn` for the decomposed arm. Forward the loopback port and run the paced client.
+Both graphs are still selectable per start. Run `--device HTP0:0 --engines 2 --threads 2 --no-partials` for the default decomposed arm and add `--htp-flash-attn` for the fused arm. Forward the loopback port and run the paced client.
 
 ```sh
 PF_CACHE="${PF_CACHE:-$HOME/pf-cache}"

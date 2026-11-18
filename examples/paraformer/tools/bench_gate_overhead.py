@@ -11,6 +11,7 @@ can be compared on and off without changing anything else.
 import argparse
 import statistics
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -79,6 +80,14 @@ def main():
             if r:
                 walls.append(r["wall"])
                 infers.append(r["infer"])
+    if not walls:
+        # Every request failed. Say so, instead of letting pct() raise an
+        # IndexError on the empty list -- the traceback points at percentile
+        # maths and hides the real cause (wrong port, dropped adb forward, or
+        # the server not up yet), which is the only thing worth reporting.
+        print("%-16s lanes=%d n=0  all requests failed (is the server up on %s? adb forward may have dropped)"
+              % (args.label or "run", args.lanes, url), file=sys.stderr)
+        return 1
     print("%-16s lanes=%d n=%d  wall p50=%5.0f p95=%5.0f max=%5.0f | infer p50=%5.0f p95=%5.0f"
           % (args.label or "run", args.lanes, len(walls), pct(walls, 50), pct(walls, 95), max(walls),
              pct(infers, 50), pct(infers, 95)))
