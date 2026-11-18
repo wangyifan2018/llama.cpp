@@ -1247,14 +1247,10 @@ static void ws_emit_segment(const std::shared_ptr<WsSession>& s, const std::stri
 #ifdef XASR_SPEAKER
 // Feed one append into the session detector and transcribe every segment it
 // closed. Runs on the WebSocket thread; the detector is owned by the session.
-static void stream_vad_feed(const std::shared_ptr<WsSession>& s, const std::vector<float>& samples) {
+static void stream_vad_drain(const std::shared_ptr<WsSession>& s) {
     auto* vad = (const SherpaOnnxVoiceActivityDetector*) s->vad;
-    if (!s->stream_vad || !vad || samples.empty()) {
+    if (!s->stream_vad || !vad) {
         return;
-    }
-    for (size_t off = 0; off < samples.size(); off += 512) {
-        const size_t n = std::min<size_t>(512, samples.size() - off);
-        SherpaOnnxVoiceActivityDetectorAcceptWaveform(vad, samples.data() + off, (int32_t) n);
     }
     while (!SherpaOnnxVoiceActivityDetectorEmpty(vad)) {
         const SherpaOnnxSpeechSegment* seg = SherpaOnnxVoiceActivityDetectorFront(vad);
@@ -1289,6 +1285,30 @@ static void stream_vad_feed(const std::shared_ptr<WsSession>& s, const std::vect
             ws_queue_event(*s, "error", error_body("server is busy, retry later", "rate_limit_error"));
         }
     }
+}
+
+static void stream_vad_feed(const std::shared_ptr<WsSession>& s, const std::vector<float>& samples) {
+    auto* vad = (const SherpaOnnxVoiceActivityDetector*) s->vad;
+    if (!s->stream_vad || !vad || samples.empty()) {
+        return;
+    }
+    for (size_t off = 0; off < samples.size(); off += 512) {
+        const size_t n = std::min<size_t>(512, samples.size() - off);
+        SherpaOnnxVoiceActivityDetectorAcceptWaveform(vad, samples.data() + off, (int32_t) n);
+    }
+    stream_vad_drain(s);
+}
+
+// Session ended mid-utterance: close the detector and transcribe what is left.
+// No padding: the graph is built per exact shape, so padding would only add
+// compute and change the CIF statistics.
+static void stream_vad_finish(const std::shared_ptr<WsSession>& s) {
+    auto* vad = (const SherpaOnnxVoiceActivityDetector*) s->vad;
+    if (!s->stream_vad || !vad) {
+        return;
+    }
+    SherpaOnnxVoiceActivityDetectorFlush(vad);
+    stream_vad_drain(s);
 }
 #endif
 
@@ -1480,6 +1500,15 @@ static void ws_handle_text(const std::shared_ptr<WsSession>& s, const std::strin
         return;
     }
     if (type == "input_audio_buffer.commit") {
+#ifdef XASR_SPEAKER
+        if (s->stream_vad) {
+            // The detector owns the audio in streaming mode; commit means "flush
+            // now", so the remainder is transcribed as its own segment.
+            stream_vad_finish(s);
+            ws_queue_event(*s, "input_audio_buffer.committed", {{"item_id", "flush"}, {"previous_item_id", nullptr}});
+            return;
+        }
+#endif
         std::lock_guard<std::mutex> lock(s->m);
         if (s->pcm.empty()) {
             ws_queue_event(*s, "error", error_body("buffer is empty", "invalid_request_error"));
