@@ -90,3 +90,87 @@ llama-qwen3-asr-batch MODEL MMPROJ CPU|HTP0:0 SLOTS TRACE.tsv \
 实测（SM6650，2 slot，2–3 条请求）：`idle` 把首条终稿从 5.07 s 降到 2.94 s（−41%），代价是总耗时
 +14%、P95 变差、配对次数归零；`interleaved` 只省 70–80 ms，因为 790 ms 的音频 encoder 在 mtmd 里
 仍是一块。完整对照与分阶段分解见 [BENCHMARK.md](BENCHMARK.md#第二批调度策略与首个终稿延迟2026-11-19)。
+
+## 第二批：改动、提交与结论（汇总）
+
+这一节把本批的代码改动、提交、结论和复现方式集中在一处；细节与逐条数据在
+[BENCHMARK.md 第二批各节](BENCHMARK.md)里。分支 `codex/qwen3-asr-batch`，**仅本地提交**，未推送。
+
+### 代码改动
+
+| 文件 | 改动 |
+|---|---|
+| `main.cpp` | 新增调度策略（`blocking` / `decode-first` / `interleaved` / `idle`，第 9–10 个参数）、`QWEN_FLASH_ATTN`、`QWEN_THREADS`、`QWEN_TIMING`；把 prefill 拆成可计时的 log-Mel / 音频 encoder / decoder prefill 三段 |
+| `run_device.sh` | 新增 `QWEN_SCHEDULE`、`QWEN_BUDGET_MS`、`QWEN_EXTRA_ENV` 透传，文件名带上策略维度 |
+| `compare_schedules.py` | 新增：读 `OUT/<schedule>/<trace>.<cap>.<round>.jsonl`，输出性能表、分阶段表和 token 一致性 |
+| `ggml-hexagon.cpp` | 新增 `GGML_HEXAGON_TIMING`，分别打印每次图的 enqueue 与 sync 时间 |
+| `BENCHMARK.md` | 新增第二批各节：分阶段、四档调度、量化与剖析、静态图否定、单请求收尾、优化后调度重跑、切块实验 |
+| `README.md` | 新增调度策略说明与使用方式 |
+
+### 提交
+
+| 提交 | 内容 |
+|---|---|
+| `3e325aada` | 调度策略 + 分阶段计时 + `compare_schedules.py` + 运行器参数 |
+| `065d1d291` | 单请求量化对照（Q8_0 / Q5_K / Q4_K / packed）与 HTP 算子剖析 |
+| `89f285e98` | 更正 `SET_ROWS` 的判读（KV cache 写入，不是音频 embedding），按图拆派发成本 |
+| `befa57e15` | 排除 `GGML_HEXAGON_OPBATCH` 512/2048/8192（无差别），新增 `QWEN_EXTRA_ENV` |
+| `5de985dc5` | flash attention 改为默认（−16%）、编码器剖析（三层 conv 654 ms）、`GGML_HEXAGON_TIMING` |
+| `7414563e0` | 否定静态图与编码器补齐（线性成本），记录 K/V 写随 flash 消失、Q4_K 精度一致 |
+| `09874d5d7` | 单请求收尾：最终配置与“无效方向”清单 |
+| `29080770f` | 优化后模型上的调度重跑 + 线程复核（2/4/8 无差别） |
+| `1eeaa2a5e` | 1 s 编码块实测（慢 2 倍）与精度打断 |
+
+### 结论
+
+**单请求最优**：Q4_K + flash attention + 4 线程，一条 2.65 s 中文命令 **2348 ms**（基线 2980 ms，−21%），
+分阶段 encoder 779 / decoder prefill 896 / decode 581 ms。
+
+**有效的优化**：
+
+| 手段 | 收益 |
+|---|---|
+| flash attention（本芯片上是正收益，与第一批假设相反） | prefill 1043→761 ms，单请求 −479 ms |
+| Q4_K（q8 源再量化，zh/en/de 三条夹具文本一致） | decode 1024→744 ms |
+| packed 打包（flash 关时有意义） | prefill −74 ms |
+
+**无效或负收益（已记录，避免重复）**：`GGML_HEXAGON_OPBATCH` 三档、宿主线程 2/4/8、conv 图变体
+（weight-first / gather）、静态图与编码器补齐（成本线性，补齐负收益）、1 s 编码切块（每块约 228 ms
+固定开销，合计慢 2 倍且打断注意力）。
+
+**调度**（同一 trace，capacity 2，capacity 1 做 token 对照）：`idle` 把首条终稿从 4124/4122/8633 ms
+降到 2352/2340/7185 ms（约 −43%），代价是总耗时 +11%、配对次数归零；`blocking` 保留作为吞吐档。
+
+**剩余瓶颈（应用层无法解决）**：encoder 的三层 conv2d（654 ms，`hvx-flat`、f16×f16→f32、2 MB VTCM，
+约 44 GFLOP/s），以及 decode 每 token 的 DSP 执行（Q4_K 后约 58 ms）。前者要 DSP 侧融合 conv 核或
+conv 权重 q8，后者只能靠 speculative decoding 或多请求合并提交。
+
+### 复现
+
+```sh
+# 构建（宿主 + 设备）
+cmake --build build-qwen-host --target llama-qwen3-asr-batch -j 8
+docker run --rm --volume "$PWD:/workspace" --workdir /workspace --platform linux/amd64 -u $(id -u):$(id -g) \
+  ghcr.io/snapdragon-toolchain/arm64-android:v0.8 \
+  bash -c 'cmake --build /workspace/build-android-xasr --target llama-qwen3-asr-batch -j 6'
+
+# 单次运行（换 QWEN_SCHEDULE 即换策略）
+ADB=$ANDROID_SDK/platform-tools/adb QWEN_EXTRA_ENV='QWEN_FLASH_ATTN=1' QWEN_SCHEDULE=idle \
+  examples/qwen3-asr-0.6b/run_device.sh build-android-xasr \
+    "$CACHE/Qwen3-ASR-0.6B-q4k.gguf" "$CACHE/mmproj-Qwen3-ASR-0.6B-Q8_0-convout-q8.gguf" \
+    "$NDK/toolchains/llvm/prebuilt/darwin-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" \
+    /tmp/qwen-solo /tmp/qwen-q/final 1
+
+# 汇总
+python3 examples/qwen3-asr-0.6b/compare_schedules.py --dir /tmp/qwen-b2
+```
+
+夹具：`simultaneous` / `staggered` / `refill` 三份 trace，`zh` / `en` / `de` / `long` 四段音频（本地 TTS 生成，
+`fixtures.sha256` 记录哈希）；归档 `~/Library/Caches/qwen3-asr-htp/qwen3-asr-0.6b-batch2-schedule-sm6650-2026-11-19.tar.gz`
+（SHA-256 `25ef540d…`）。
+
+### 未决与边界
+
+- **F16 源重量化未做**：本机只有 Q8_0 GGUF，Q4_K 是从 Q8_0 二次量化；要真正的 F16→Q4_K 需要原始 checkpoint。
+- **样本量**：调度 2 轮、其余 1 轮，P95/P99 的样本数只有 6–12；结论方向可靠，绝对数字会有几 % 浮动。
+- **工作区仍有他人未提交改动**：`conversion/qwen3tts.py`、`examples/qwen3-asr-0.6b/compare.py`，本批未触碰。
