@@ -12,7 +12,7 @@ import websockets
 from bench_ws_realtime import pct, read_wav
 
 
-async def transcribe(url, pcm, server_vad, paced, start_at):
+async def transcribe(url, pcm, server_vad, paced, start_at, silence_ms):
     loop = asyncio.get_running_loop()
     async with websockets.connect(url) as ws:
         assert json.loads(await asyncio.wait_for(ws.recv(), timeout=5))["type"] == "session.created"
@@ -21,7 +21,7 @@ async def transcribe(url, pcm, server_vad, paced, start_at):
             await ws.send(json.dumps({"type": kind, **fields}))
 
         if server_vad:
-            await send("session.update", session={"turn_detection": {"type": "server_vad", "silence_duration_ms": 300}})
+            await send("session.update", session={"turn_detection": {"type": "server_vad", "silence_duration_ms": silence_ms}})
             updated = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
             if updated["type"] != "session.updated":
                 raise RuntimeError(updated)
@@ -39,7 +39,7 @@ async def transcribe(url, pcm, server_vad, paced, start_at):
                     item = event["item_id"]
                     if item in seen:
                         raise RuntimeError(f"duplicate acknowledgement for {item}")
-                    seen[item] = {}
+                    seen[item] = {"ack_ms": loop.time() * 1000}
                 elif kind == "conversation.item.input_audio_transcription.completed":
                     row = seen[event["item_id"]]
                     if "transcript" in row:
@@ -91,8 +91,10 @@ async def replay(args):
     samples, failures = [], 0
     root = args.manifest.parent
     entries = [line.split("\t", 2) for line in args.manifest.read_text(encoding="utf-8").splitlines()]
+    if args.language:
+        entries = [entry for entry in entries if entry[1] == args.language]
     if not entries:
-        raise SystemExit("manifest is empty")
+        raise SystemExit("manifest has no matching audio")
 
     async def replay_clip(entry, start_at):
         name, language, reference = entry
@@ -100,7 +102,7 @@ async def replay(args):
         row = {"wav": str(wav), "reference": reference}
         try:
             pcm = read_wav(str(wav))
-            items, elapsed = await transcribe(args.url, pcm, args.server_vad, not args.unpaced, start_at)
+            items, elapsed = await transcribe(args.url, pcm, args.server_vad, not args.unpaced, start_at, args.silence_ms)
             separator = "，" if language == "zh" else ", "
             text = separator.join(item["transcript"] for item in items.values() if item["transcript"])
             row.update(text=text, items=items, endpoint_to_final_ms=elapsed, audio_ms=len(pcm) / 32)
@@ -137,11 +139,15 @@ if __name__ == "__main__":
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--details", type=Path, required=True)
+    parser.add_argument("--language", help="select one language from the manifest")
     parser.add_argument("--server-vad", action="store_true")
+    parser.add_argument("--silence-ms", type=int, default=300, help="minimum silence for server VAD")
     parser.add_argument("--unpaced", action="store_true", help="reduce runtime for accuracy-only checks")
     parser.add_argument("--lanes", type=int, choices=range(1, 5), default=1)
     parser.add_argument("--stagger-ms", type=int, default=0, help="start offset between adjacent lanes")
     args = parser.parse_args()
     if args.stagger_ms < 0:
         parser.error("--stagger-ms must be nonnegative")
+    if not 32 <= args.silence_ms <= 2000:
+        parser.error("--silence-ms must be between 32 and 2000")
     asyncio.run(replay(args))

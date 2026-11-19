@@ -6,6 +6,10 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 PORT=${1:-18804}
 case "$PORT" in ''|*[!0-9]*) echo "expected a device TCP port" >&2; exit 2 ;; esac
+PUNCTUATE=${PF_REALTIME_PUNCTUATE:-0}
+case "$PUNCTUATE" in 0|1) ;; *) echo "expected PF_REALTIME_PUNCTUATE=0 or 1" >&2; exit 2 ;; esac
+REPLAY_SINGLE=${PF_REPLAY_SINGLE:-0}
+case "$REPLAY_SINGLE" in 0|1) ;; *) echo "expected PF_REPLAY_SINGLE=0 or 1" >&2; exit 2 ;; esac
 PF_MODELS=${PF_MODELS:-$HOME/models/paraformer}
 PF_SHERPA_SDK=${PF_SHERPA_SDK:-/tmp/sherpa}
 PF_ONNX_DIR=${PF_ONNX_DIR:-$PF_SHERPA_SDK/lib}
@@ -41,6 +45,7 @@ docker image inspect --format '{{index .RepoDigests 0}}' ghcr.io/snapdragon-tool
     tar -czf "$RUN/paraformer-source.tar.gz" -T -)
 "$HERE/tools/package_device.sh" "$RUN/package" >"$RUN/package.log" 2>&1 || { cat "$RUN/package.log" >&2; exit 1; }
 [ "${PF_PACKAGE_ONLY:-0}" != 1 ] || exit 0
+FIXTURES=$(cd "$FIXTURES" && pwd)
 
 processes=$("$ADB" shell -T 'ps -A -o ARGS')
 htp_owner=$(printf '%s\n' "$processes" | awk 'index($0, "llama-paraformer-api") && index($0, "--device HTP") { print "yes"; exit }')
@@ -78,6 +83,7 @@ cat >>"$config" <<EOF
 PF_WORKDIR=$remote/state
 PF_LOG=$remote/state/api.log
 PF_PORT=$PORT
+PF_REALTIME_PUNCTUATE=$PUNCTUATE
 PF_WEB_DIR=$remote/system/vendor/etc/paraformer/web
 PF_EXTRA_ARGS="--htp-warmup-ms 15000 --htp-watchdog-ms 5000"
 EOF
@@ -96,3 +102,28 @@ for _ in $(seq 1 40); do
 done
 [ -s "$RUN/initial-health.json" ] || { echo "replay did not become ready, see $RUN/device.log" >&2; exit 1; }
 PF_RUN="$RUN/results" PF_REPLAY_PROTOCOL_CHECK=1 "$HERE/tools/accept.sh" "$forward" "$FIXTURES"
+if [ "$REPLAY_SINGLE" = 1 ]; then
+    PF_RUN="$RUN/single-realtime" "$HERE/tools/replay_single_realtime.sh" "$forward" "$FIXTURES" manual 300 180 120
+    if [ "$PUNCTUATE" = 1 ]; then
+        "${PYTHON:-python3}" - "$RUN/single-realtime" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+for arm in ("manual", "300"):
+    rows = json.loads((root / arm / "quality.json").read_text())["per_clip"]["ws"]
+    failed = [row["id"] for row in rows if not row["grade"]["command"] or row["grade"]["wrong_direction"]]
+    if len(rows) != 16 or failed:
+        raise SystemExit(f"Mandarin command regression in {arm}: {len(rows)} clips, failed {failed}")
+PY
+    fi
+fi
+if [ "$PUNCTUATE" = 1 ]; then
+    PYTHON=${PYTHON:-python3}
+    "$PYTHON" "$HERE/tools/eval_realtime.py" --url "ws://127.0.0.1:$forward/v1/realtime" \
+        --manifest "$FIXTURES/manifest.tsv" --server-vad --lanes 4 --stagger-ms 220 \
+        --out "$RUN/results/realtime-auto.tsv" --details "$RUN/results/realtime-auto.jsonl"
+    "$PYTHON" "$HERE/../x-asr/tools/eval_vehicle.py" --pack "$(basename "$FIXTURES")=$FIXTURES/manifest.tsv" \
+        --run "ws=$RUN/results/realtime-auto.tsv" --json "$RUN/results/realtime-auto-score.json"
+fi

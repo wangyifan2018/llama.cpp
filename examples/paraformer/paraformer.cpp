@@ -919,10 +919,19 @@ static void cif_predict(paraformer_context* ctx, const float* enc_out, int T, in
     };
 
     if (!ctx->model.cif_weights_cached) {
-        ctx->model.cif_conv_w_f32.resize((size_t)D * D * 3);
+        std::vector<float> original((size_t) D * D * 3);
+        read_f32(ctx->model.cif_conv_w, original.data(), original.size());
+        auto& packed = ctx->model.cif_conv_w_f32;
+        packed.resize(original.size());
+        for (int k = 0; k < 3; ++k) {
+            for (int d = 0; d < D; ++d) {
+                for (int o = 0; o < D; ++o) {
+                    packed[((size_t) k * D + d) * D + o] = original[((size_t) o * D + d) * 3 + k];
+                }
+            }
+        }
         ctx->model.cif_conv_b_f32.resize((size_t)D);
         ctx->model.cif_out_w_f32.resize((size_t)D);
-        read_f32(ctx->model.cif_conv_w, ctx->model.cif_conv_w_f32.data(), ctx->model.cif_conv_w_f32.size());
         read_f32(ctx->model.cif_conv_b, ctx->model.cif_conv_b_f32.data(), ctx->model.cif_conv_b_f32.size());
         read_f32(ctx->model.cif_out_w, ctx->model.cif_out_w_f32.data(), ctx->model.cif_out_w_f32.size());
         read_f32(ctx->model.cif_out_b, &ctx->model.cif_out_b_f32, 1);
@@ -940,21 +949,22 @@ static void cif_predict(paraformer_context* ctx, const float* enc_out, int T, in
     auto run_conv_chunk = [&](int t0, int t1) {
         for (int t = t0; t < t1; t++) {
             float* out_row = conv_out_ptr + (size_t)t * D;
-            for (int o = 0; o < D; o++) {
-                float val = conv_b[o];
-                const float* w_o = conv_w + (size_t)o * D * 3;
-                for (int k = 0; k < 3; k++) {
-                    int ti = t - 1 + k; // padding=1: shift by 1
-                    if (ti < 0 || ti >= T)
-                        continue;
-                    const float* x_ti = enc_out + (size_t)ti * D;
-                    const float* w_k = w_o + k;
-                    for (int d = 0; d < D; d++) {
-                        // conv_w layout: (out_ch, in_ch, K) → w[o * D * 3 + d * 3 + k]
-                        val += w_k[(size_t)d * 3] * x_ti[d];
+            std::copy_n(conv_b, D, out_row);
+            for (int k = 0; k < 3; ++k) {
+                const int ti = t - 1 + k;
+                if (ti < 0 || ti >= T) continue;
+                const float* x_ti = enc_out + (size_t) ti * D;
+                for (int d = 0; d < D; ++d) {
+                    const float* weights = conv_w + ((size_t) k * D + d) * D;
+                    const float input = x_ti[d];
+                    // Keep each output's accumulation order while vectorizing across outputs.
+                    for (int o = 0; o < D; ++o) {
+                        out_row[o] += weights[o] * input;
                     }
                 }
-                out_row[o] = val > 0.0f ? val : 0.0f; // ReLU
+            }
+            for (int o = 0; o < D; ++o) {
+                out_row[o] = out_row[o] > 0.0f ? out_row[o] : 0.0f;
             }
         }
     };

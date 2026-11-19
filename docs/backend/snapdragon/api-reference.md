@@ -201,6 +201,8 @@ pf-api: shut down cleanly
 
 最终事件附带 `vad_pieces`，静音时附带 `empty: silence`。`x.pf.metrics` 里的 `vad_ms`、`queue_ms`、`infer_ms` 和 `backend` 与 HTTP 响应头口径一致。
 
+服务启动时可用 `--realtime-punctuate` 为终稿启用停顿分句。中文 Realtime 终稿会用原始 PCM 复核 token 间的停顿，并保护座舱设备词和位置词的边界。`--punct-gap-ms` 调整时间戳门槛，`/health` 的 `realtime_punctuate` 标识当前配置。预览沿用原有格式。
+
 ```json
 // completed
 {"type":"conversation.item.input_audio_transcription.completed",

@@ -91,6 +91,7 @@ examples/paraformer/tools/install_local.sh --with-capabilities   # 加 VAD + 声
 | `PF_THREADS` | **4** | 见 §4，2 线程会慢 35 ms |
 | `PF_HOTWORDS` | 无 | **必须部署**，否则命令字段从 87.5% 掉到 65.6% |
 | `PF_CONTEXT` / `PF_CONTEXT_MAX_LOGIT_GAP` | 空 | 实验短语表和声学 logit 差值限制，见 [Realtime 热词评测](HOTWORDS.md) |
+| `PF_REALTIME_PUNCTUATE` | 0 | 设为 1，使用声学停顿给 Realtime 终稿添加分句标点 |
 | `PF_TEXT_RULES` | 空 | 英文模板/专名重写（`never get to` → `Navigate to`） |
 | `PF_VAD_MODEL` / `PF_SPEAKER_MODEL` + `PF_ENROLL_DIR` | 空 | 可选，各约 +60 MB |
 | `PF_WEB_DIR` | 空 | 测试台目录；生产可不部署 |
@@ -187,6 +188,8 @@ examples/paraformer/tools/reproduce_deployment.sh                     # 构建�
 ```
 
 `reproduce_deployment.sh` 会输出独立运行目录，包含包、源版本、工具链摘要和验收原始结果。已有 Paraformer HTP 进程时，复测脚本退出并保留包。可用 `PF_PACKAGE_ONLY=1` 在主机只构建与打包。`accept.sh` 可直接验收已有服务，校验 32 条夹具哈希并保存 REST 1/2/4 路和 WS 单路、四路同步、错峰、长短混合结果。28/32 和零方向反转为 Tingting 夹具回归门槛。延迟在报告中记录 P95/P99，整车 SLO 由目标环境单独验收。
+
+中文单路候选用 `PF_REALTIME_PUNCTUATE=1 PF_REPLAY_SINGLE=1` 复现。结果还包括手动提交、300 ms、180 ms 和 120 ms 四个档位的 Realtime 逐请求记录。 [单路中文对照与门槛](HOTWORDS.md#单路中文-realtime-候选)
 
 | 项 | 期望 |
 |---|---|

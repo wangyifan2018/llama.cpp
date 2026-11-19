@@ -43,6 +43,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -154,6 +155,7 @@ struct SpeakerResult {
 struct SegmentReply {
     int status = 200;
     std::string text;
+    std::optional<std::string> realtime_final;
     double queue_ms = 0;
     double infer_ms = 0;
     double vad_ms = 0;
@@ -640,19 +642,71 @@ static void append_words(std::vector<WordSpan>& out, const paraformer_tokens* t,
     }
 }
 
-// Insert a separator where consecutive words are separated by a pause longer
-// than gap_ms. Acoustic evidence, unlike the keyword restorer that split inside
-// single commands.
-static std::string punctuate_words(const std::vector<WordSpan>& words, bool zh, double gap_ms) {
+static bool has_clause_pause(const std::vector<float>& pcm, double begin_ms, double end_ms) {
+    constexpr int frame_ms = 20;
+    constexpr size_t frame_samples = pf_segment::sample_rate * frame_ms / 1000;
+    constexpr int quiet_frames = 120 / frame_ms;
+    constexpr double quiet_rms = 0.012;
+    const double samples_per_ms = pf_segment::sample_rate / 1000.0;
+    const size_t begin = (size_t) std::clamp(begin_ms * samples_per_ms, 0.0, (double) pcm.size());
+    const size_t end = (size_t) std::clamp(end_ms * samples_per_ms, 0.0, (double) pcm.size());
+    int quiet = 0;
+    for (size_t pos = begin; pos + frame_samples <= end; pos += frame_samples) {
+        double energy = 0;
+        for (size_t i = pos; i < pos + frame_samples; ++i) {
+            energy += (double) pcm[i] * pcm[i];
+        }
+        quiet = energy < quiet_rms * quiet_rms * frame_samples ? quiet + 1 : 0;
+        if (quiet >= quiet_frames) return true;
+    }
+    return false;
+}
+
+static std::string punctuate_words(const std::vector<WordSpan>& words, bool zh, double gap_ms,
+                                   const std::vector<float>* pcm = nullptr) {
+    const bool check_pause = zh && pcm;
+    std::string joined;
+    std::vector<size_t> offsets;
+    if (check_pause) {
+        offsets.reserve(words.size());
+        for (const auto& word : words) {
+            offsets.push_back(joined.size());
+            joined += word.text;
+        }
+    }
+    std::vector<bool> clause(words.size());
+    for (size_t i = 1; i < words.size(); ++i) {
+        const double begin = words[i - 1].end_ms;
+        const double end = words[i].start_ms;
+        if (!(end - begin >= gap_ms) || (check_pause && !has_clause_pause(*pcm, begin, end))) continue;
+
+        size_t boundary = i;
+        if (check_pause && offsets[i] > 0) {
+            // A CIF fire time can land on the far side of a pause.
+            static constexpr std::string_view cabin_terms[] = {
+                "座椅", "车窗", "出风口", "空调", "内循环", "风量", "温度", "阅读灯", "氛围灯", "顶灯", "脚窝灯",
+                "主驾驶", "副驾驶", "左前", "左后", "右前", "右后", "前排", "后排",
+            };
+            for (std::string_view term : cabin_terms) {
+                const size_t start = joined.rfind(term, offsets[i] - 1);
+                if (start == std::string::npos || start + term.size() <= offsets[i]) continue;
+                const auto first = std::lower_bound(offsets.begin(), offsets.begin() + i, start);
+                if (first != offsets.begin() + i && *first == start) {
+                    boundary = std::min(boundary, (size_t) (first - offsets.begin()));
+                }
+            }
+        }
+        clause[boundary] = true;
+    }
+
     std::string out;
     for (size_t i = 0; i < words.size(); ++i) {
         if (i > 0) {
-            const double gap = words[i].start_ms - words[i - 1].end_ms;
             // Spacing is per pair, not per utterance: a mixed zh+en transcript
             // needs spaces inside its English run and none inside its Chinese one.
             const bool latin_pair = !any_multibyte(words[i].text) && !any_multibyte(words[i - 1].text);
-            if (gap >= gap_ms) {
-                out += (!any_multibyte(words[i].text) && !any_multibyte(words[i - 1].text)) ? "," : "，";
+            if (clause[i]) {
+                out += latin_pair ? "," : "，";
             } else if (latin_pair) {
                 out += " ";
             }
@@ -1202,6 +1256,11 @@ static SegmentReply decode_task(Engine& eng, const PoolTask& task) {
             break;
         }
     }
+    if (task.ws_owner && task.want_tokens && !reply.words.empty() && reply.status == 200) {
+        const double begin_ms = now_ms();
+        reply.realtime_final = punctuate_words(reply.words, any_multibyte(reply.text), g_punct_gap_ms, &samples);
+        reply.infer_ms += now_ms() - begin_ms;
+    }
     return reply;
 }
 
@@ -1330,8 +1389,7 @@ static void ws_emit_segment(const std::shared_ptr<WsSession>& s, const std::stri
                        {{"item_id", item}, {"content_index", 0}, {"text", s->stream_text},
                         {"segment", reply.text}, {"final", false}});
     }
-    const std::string transcript = g_realtime_punctuate && !reply.words.empty()
-        ? punctuate_words(reply.words, any_multibyte(reply.text), g_punct_gap_ms) : reply.text;
+    const std::string& transcript = reply.realtime_final ? *reply.realtime_final : reply.text;
     json body = {{"item_id", item},
                  {"content_index", 0},
                  {"transcript", transcript},
