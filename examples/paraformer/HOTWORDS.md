@@ -90,6 +90,22 @@ Meijia 同文回放补上“风量”后，手动提交从 15/16 提到 16/16，
 
 另外测了 X-ASR INT8 480 ms 的宿主 CPU 对照。用模型自带的双语 BPE 和四路径 `modified_beam_search`，对热词增益 2、4、6 做扫描。原音色中文 1/7、英文 1/6，换音色中文 3/7、英文 1/6，所有档位与无热词对照相同，12 条近音反例均无目标实体误引入。早期 `cjkchar+bpe` 对照将中文逐字切分，和模型词表不匹配，记录在独立目录。该 X-ASR 配置没有进入实时链路。 [Sherpa-ONNX 热词接口](https://k2-fsa.github.io/sherpa/onnx/hotwords/index.html)
 
+## 会话热词
+
+Realtime 支持在 `session.audio.input.transcription.keywords` 设置中文热词。每次配置最多 24 个短语，每个短语 2 至 16 个模型词表内的汉字。`[]` 关闭会话短语增益，省略字段保留当前设置。热词 trie 在会话配置时建立，入队时按 `item_id` 持有不可变快照。HTP 与 CPU 工作线程读取同一快照，模型继续复用现有 logits，不增加模型推理。第一个字由原转写起头，后续字必须在最佳原始 logit 的 6.0 差值内才获得增益。
+
+用同一条音频并发开两条 WebSocket，只有带“王梓涵”的会话输出“给王梓涵打电话”。另一条同时返回“给王子涵打电话”。收到已接收回执后立即清空词表，已入队语段仍用旧词表，下一段恢复原转写。该检查同时覆盖 CPU、HTP 和服务端自动断句。嵌套配置的 24 kHz、非法 VAD 参数和超限词表均返回错误，之前配置保持有效。
+
+```sh
+python3 examples/paraformer/tools/check_realtime_session.py \
+    --url ws://127.0.0.1:8899/v1/realtime --wav "$PF_OUT/hotword-tts/entity_zh03.wav" --expect-vad
+
+python3 examples/paraformer/tools/eval_realtime.py \
+    --url ws://127.0.0.1:8899/v1/realtime --manifest "$PF_OUT/hotword-tts/manifest.tsv" \
+    --server-vad --unpaced --keyword 王梓涵 --keyword 虹桥火车站 \
+    --out "$PF_OUT/scoped.tsv" --details "$PF_OUT/scoped.jsonl"
+```
+
 ## 对照与放行
 
 1. 先锁定 `PF_HOTWORDS`/`PF_TEXT_RULES`，验证中文复合指令在 Realtime 终稿保留分句边界。用相同 WAV 对比 client commit 与 server VAD，分别统计动作、方向、位置、数值和否定。保留每段的 `item_id`、后端和端到端耗时。

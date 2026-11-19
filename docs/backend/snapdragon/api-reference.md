@@ -203,6 +203,20 @@ pf-api: shut down cleanly
 
 服务启动时可用 `--realtime-punctuate` 为终稿启用停顿分句。中文 Realtime 终稿会用原始 PCM 复核 token 间的停顿，并保护座舱设备词和位置词的边界。`--punct-gap-ms` 调整时间戳门槛，`/health` 的 `realtime_punctuate` 标识当前配置。预览沿用原有格式。
 
+`session.update` 支持 `session.audio.input` 下的 `format`、`transcription.language`、`transcription.keywords` 和 `turn_detection`，也接受现有顶层 `input_audio_format`、`input_audio_transcription` 和 `turn_detection`。每个设置只提交一次。更新通过校验后整体生效，`session.updated` 返回实际配置。热词和语言更新、重复发送相同的 VAD 配置都会保留未提交的音频。切换到不同的 VAD 配置会清掉未提交的音频，已接收的请求保留原设置。
+
+本地服务的 PCM 为 16 kHz、单声道、PCM16 LE。声明其他采样率会收到错误。OpenAI 的标准 24 kHz 示例需要在客户端重采样后再接到本地服务。`language` 用于会话配置回显，识别模型仍为启动时选定的 Paraformer。 [OpenAI Realtime 转写配置](https://developers.openai.com/api/docs/guides/realtime-transcription)
+
+```json
+{"type":"session.update","session":{"type":"transcription","audio":{"input":{
+  "format":{"type":"audio/pcm","rate":16000},
+  "transcription":{"language":"zh","keywords":["王梓涵","虹桥火车站"]},
+  "turn_detection":null
+}}}}
+```
+
+`keywords` 最多 24 项，每项使用当前模型词表中的 2 至 16 个汉字。`[]` 清空这条连接的短语增益，包括继承自 `PF_CONTEXT` 的全局短语。省略字段保留已有设置。关键词在语段被接收入队时固定，已确认的 `item_id` 使用当时的词表。一个连接的热词不会进入其他连接或 REST。允许调用方按当前导航或联系人会话收窄候选。
+
 ```json
 // completed
 {"type":"conversation.item.input_audio_transcription.completed",
