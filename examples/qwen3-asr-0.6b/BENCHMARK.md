@@ -170,3 +170,43 @@ ADB=$ANDROID_SDK/platform-tools/adb QWEN_SCHEDULE=idle QWEN_BUDGET_MS=-1 \
 2. **把 prefill 的 KV 写入变连续**：54 行是连续 idxs，用一次连续拷贝代替 56 次散布写，目标是压
    0.96 s 的 prefill 图。
 3. 量化维持 Q4_K（−27% decode），但要用 F16 源重量化，避免 q8→q4 的二次损失。
+
+### 编码器与 attention 的结构性发现（2026-11-20 补充）
+
+按算子名把 profile 分成三段（同一次运行）：
+
+| 段 | 算子数 | 累计 ms | 占比 |
+|---|---:|---:|---:|
+| 派发 OPBATCH | 28 | 5318 | 51.8% |
+| decoder 侧（MUL_MAT/MUL_MAT_NX/SET_ROWS…） | 10690 | 3752 | 35.3% |
+| **encoder 侧** | 426 | **1366** | 12.9% |
+
+encoder 的 1366 ms 里，**三层 conv2d 占 654 ms**：`a.conv2d.1` 82 ms、`a.conv2d.2` **224 ms**、
+`a.conv2d.3` 59 ms，再加 6 次 `IM2COL` 290 ms；`a.conv_out`（896→1024，q8_0）只有 17 ms。
+也就是说 encoder 的时间几乎全在第一层卷积块，不是 attention，也不是投影。
+
+试过的图结构变体都无效（同一条音频）：
+
+| 变体 | encoder ms | 终稿 ms |
+|---|---:|---:|
+| 默认（im2col + MUL_MAT） | 792 | 2980 |
+| `MTMD_QWEN3A_CONV_WEIGHT_FIRST=1`（权重优先布局） | 793 | 2977 |
+| `MTMD_QWEN3A_CONV=gather` | 796 | 2983 |
+
+结论：**改图结构解不了 encoder**，瓶颈是 DSP 上的 conv 核（`hvx-flat`、2 MB VTCM、f16×f16→f32，
+实测约 44 GFLOP/s，约为该 SoC f16 峰值的四分之一）。真要提速，要么写融合 conv 核，要么把 conv 权重
+降到 q8 以减少带宽与 VTCM 压力——两者都在 DSP 侧，不在图拓扑。
+
+### attention：flash 在这颗芯片上是正收益
+
+第一批假设“无 HMX 时 flash 会退化成多个小算子”，实测相反：
+
+| 配置 | 终稿 ms | 首 token | decoder prefill | decode 合计 |
+|---|---:|---:|---:|---:|
+| 默认（flash 关） | 2980 | 1853 | 1043 | 1024 |
+| **flash 开** | **2501** | **1557** | **761** | 864 |
+| Q4_K（flash 关） | 2766 | 1942 | 1142 | 744 |
+| **flash 开 + Q4_K** | **2348** | 1689 | 896 | **581** |
+
+flash 开把 prefill 砍掉 282 ms；再叠 Q4_K（decode −27%），单请求从 2.98 s 降到 **2.35 s（−21%）**。
+`QWEN_FLASH_ATTN=0` 可回到旧档。

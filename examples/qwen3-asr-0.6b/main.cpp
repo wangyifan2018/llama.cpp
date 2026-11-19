@@ -260,8 +260,13 @@ static void run(mtmd_context * audio, llama_context * decoder, const std::string
         if (ids.empty()) return false;
         const double begin = elapsed();
         require(llama_process(decoder, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "decoder batch failed");
+        const double processed = elapsed();
         llama_synchronize(decoder);
         const double duration = elapsed() - begin;
+        if (std::getenv("QWEN_TIMING")) {
+            std::fprintf(stderr, "qwen-timing decode process %.3f sync %.3f total %.3f ms rows %zu\n",
+                         processed - begin, duration - (processed - begin), duration, ids.size());
+        }
         decode_ms += duration;
         ++decode_calls;
         paired_calls += ids.size() == 2;
@@ -392,7 +397,13 @@ int main(int argc, char ** argv) {
         ctx_params.n_ubatch = 512;
         ctx_params.n_threads = 4;
         ctx_params.n_threads_batch = 4;
-        ctx_params.flash_attn_type = cpu ? LLAMA_FLASH_ATTN_TYPE_AUTO : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        // Batch 1 disabled flash attention on HTP, on the assumption that the
+        // fallback path without HMX is slower. Measured on this model it is not:
+        // 2501 ms against 2980 ms for one request, because the decoder prefill
+        // goes from 1043 to 761 ms. QWEN_FLASH_ATTN=0 restores the old arm.
+        const char * fa_env = std::getenv("QWEN_FLASH_ATTN");
+        const bool fa_off = fa_env && std::string(fa_env) == "0";
+        ctx_params.flash_attn_type = (!cpu && fa_off) ? LLAMA_FLASH_ATTN_TYPE_DISABLED : LLAMA_FLASH_ATTN_TYPE_AUTO;
         llama_context_ptr decoder(llama_init_from_model(model.get(), ctx_params));
         require(decoder != nullptr, "could not initialize decoder");
         auto audio_params = mtmd_context_params_default();

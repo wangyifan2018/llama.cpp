@@ -2588,8 +2588,17 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
         }
     }
 
+    static const bool timing = std::getenv("GGML_HEXAGON_TIMING") != nullptr;
+    const int64_t t0 = timing ? ggml_time_us() : 0;
     for (const auto & node : *nodes_ptr) {
         sess->enqueue_op(node);
+    }
+    if (timing) {
+        // Split the CPU-side enqueue from the DSP wait: the op nodes are cached by
+        // graph uid, but the per-op request build is not, and on a 28-layer decode
+        // graph that is a few hundred small operations every token.
+        GGML_LOG_ERROR("ggml-hex: %s timing enqueue n_ops %zu cached %d %.3f ms\n", sess->c_name(),
+                       nodes_ptr->size(), (int) cache_hit, (ggml_time_us() - t0) / 1000.0);
     }
 
     if (sess->last_error > HTP_STATUS_OK) {
@@ -2605,7 +2614,12 @@ static void ggml_backend_hexagon_synchronize(ggml_backend_t backend) {
     HEX_VERBOSE("ggml-hex: %s synchronize\n", sess->c_name());
 
     // Wait until all pending ops complete
+    static const bool timing = std::getenv("GGML_HEXAGON_TIMING") != nullptr;
+    const int64_t t0 = timing ? ggml_time_us() : 0;
     sess->flush_sync();
+    if (timing) {
+        GGML_LOG_ERROR("ggml-hex: %s timing sync %.3f ms\n", sess->c_name(), (ggml_time_us() - t0) / 1000.0);
+    }
     if (sess->last_error > HTP_STATUS_OK) {
         GGML_ABORT("ggml-hex: %s synchronize failed : dsp-error %s\n", sess->c_name(), status_to_str(sess->last_error));
     }
