@@ -164,8 +164,9 @@ ADB=$ANDROID_SDK/platform-tools/adb QWEN_SCHEDULE=idle QWEN_BUDGET_MS=-1 \
 
 ### 下一步（按收益排序）
 
-1. **降低每 token 的派发开销**（当前 50–100 ms/步）：单请求最大的一块，方向是同一形状的 decode 图
-   跨步复用、以及 `GGML_HEXAGON_OPBATCH` 一类批处理参数；每步 `OPBATCH` 时间可直接用 profile 量到。
+1. **降低每 token 的派发开销**（当前 50–100 ms/步）：单请求最大的一块。方向是同一形状的 decode 图
+   跨步复用；**不是** `GGML_HEXAGON_OPBATCH`——512/2048/8192 三档实测终稿 2967/2986/2992 ms，
+   与默认 2980 ms 无差别（±1%），说明开销在每次 `llama_process` 的固定往返，不在缓冲区批数。
 2. **把 prefill 的 KV 写入变连续**：54 行是连续 idxs，用一次连续拷贝代替 56 次散布写，目标是压
    0.96 s 的 prefill 图。
 3. 量化维持 Q4_K（−27% decode），但要用 F16 源重量化，避免 q8→q4 的二次损失。

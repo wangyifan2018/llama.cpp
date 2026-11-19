@@ -53,6 +53,7 @@ trap 'exit 143' TERM
 
 # Batch 2 adds a scheduling dimension. QWEN_SCHEDULE picks the policy and
 # QWEN_BUDGET_MS bounds one round of prefill (only used by "interleaved").
+EXTRA_ENV="${QWEN_EXTRA_ENV:-}"
 SCHEDULE="${QWEN_SCHEDULE:-blocking}"
 BUDGET_MS="${QWEN_BUDGET_MS:--1}"
 
@@ -69,7 +70,7 @@ run() {
         gather) conv=gather ;;
         packed-gather) policy=packed; conv=gather ;;
     esac
-    "${adb[@]}" shell -T "cd '$remote' && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=\$PWD GGML_HEXAGON_DEVICES=HTP0:0 MTMD_QWEN3A_CONV=$conv $profile_env ./llama-qwen3-asr-batch model.gguf projector.gguf HTP0:0 $slots $trace.tsv 96 $policy $SCHEDULE $BUDGET_MS" \
+    "${adb[@]}" shell -T "cd '$remote' && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=\$PWD GGML_HEXAGON_DEVICES=HTP0:0 MTMD_QWEN3A_CONV=$conv $EXTRA_ENV $profile_env ./llama-qwen3-asr-batch model.gguf projector.gguf HTP0:0 $slots $trace.tsv 96 $policy $SCHEDULE $BUDGET_MS" \
         >"$out/$prefix.jsonl" 2>"$out/$prefix.log"
 }
 
