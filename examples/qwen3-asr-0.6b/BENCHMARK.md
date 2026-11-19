@@ -239,3 +239,36 @@ profile 打出的 `n-ops` 与 `usec` 就是这次打包执行在 DSP 上的时�
 | de | Navigiere bitte zum Berliner Hauptbahnhof. | 同左 | ✓ |
 
 三条夹具逐字一致（注意这是从 Q8_0 再量化，不是 F16 源；F16 源需要原始 checkpoint，本机没有）。
+
+### 单请求优化收尾：最终配置与“没用的方向”（2026-11-20）
+
+最终配置：**Q4_K 权重 + flash attention 开 + 4 线程**，一条 2.65 s 中文命令 **2348 ms**
+（基线 Q8_0/flash 关是 2980 ms，−21%）。分阶段：encoder 779、decoder prefill 896、decode 581。
+
+逐项结论（全部在 SM6650、同一 trace 同一天测得）：
+
+| 方向 | 结果 | 判定 |
+|---|---|---|
+| decode 图跨步复用 | op 节点按 graph uid 命中（cached 1），enqueue 2.6 ms，sync 0.01 ms，每步 100–115 ms | 无 CPU 侧可省，时间在 DSP 执行 |
+| 静态图 + 补齐 | 两轮同 trace 差 <1%；encoder 随帧数线性（2.65 s→778 ms，8.3 s→3190 ms） | 静态图无收益，补齐是负收益 |
+| prefill KV 连续写 | flash 开后独立 K/V SET_ROWS 从 profile 消失（原 750 ms），换成 FLASH_ATTN_EXT 430 ms | 已被 flash 覆盖，无需再做 |
+| OPBATCH 512/2048/8192 | 2967/2986/2992 ms | 无效 |
+| 宿主线程 2/4 | 2351/2355 ms | 无差别（DSP 受限） |
+| packed 打包 | flash 关时 prefill 1043→969 ms | 小幅正收益，最终配置未启用 |
+| conv 图变体 | weight-first 793 ms / gather 796 ms vs 792 ms | 无效 |
+| Q4_K（q8 源再量化） | decode 1024→744 ms，三条夹具文本一致 | 采用 |
+
+剩下的两个真实瓶颈都不在可改的层：
+
+1. encoder 的三层 conv2d（654 ms，占 encoder 84%）：hvx-flat、f16×f16→f32、2 MB VTCM，实测约
+   44 GFLOP/s（该 SoC f16 峰值约四分之一）。提速需要 DSP 侧融合 conv 核或 conv 权重 q8。
+2. decode 每 token 的 DSP 执行（Q4_K 后约 58 ms）：28 层一次前向，无法再摊薄，除非一次提交多个
+   token（speculative decoding）或多个请求（continuous batching）。
+
+复现命令：
+
+    QWEN_EXTRA_ENV='QWEN_FLASH_ATTN=1' QWEN_SCHEDULE=blocking \
+      examples/qwen3-asr-0.6b/run_device.sh build-android-xasr \
+        $CACHE/Qwen3-ASR-0.6B-q4k.gguf \
+        $CACHE/mmproj-Qwen3-ASR-0.6B-Q8_0-convout-q8.gguf \
+        $NDK/.../libc++_shared.so /tmp/qwen-solo /tmp/qwen-q/final 1

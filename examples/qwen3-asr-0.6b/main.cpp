@@ -395,8 +395,17 @@ int main(int argc, char ** argv) {
         ctx_params.n_seq_max = 2;
         ctx_params.n_batch = 512;
         ctx_params.n_ubatch = 512;
-        ctx_params.n_threads = 4;
-        ctx_params.n_threads_batch = 4;
+        // Host threads only cover graph build, fbank and sampling: the HTP work is
+        // asynchronous. QWEN_THREADS lets that be checked instead of assumed.
+        int n_threads = 4;
+        if (const char * th = std::getenv("QWEN_THREADS")) {
+            const int parsed = std::atoi(th);
+            if (parsed >= 1 && parsed <= 16) {
+                n_threads = parsed;
+            }
+        }
+        ctx_params.n_threads = n_threads;
+        ctx_params.n_threads_batch = n_threads;
         // Batch 1 disabled flash attention on HTP, on the assumption that the
         // fallback path without HMX is slower. Measured on this model it is not:
         // 2501 ms against 2980 ms for one request, because the decoder prefill
