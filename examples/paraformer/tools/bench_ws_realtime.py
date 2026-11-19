@@ -25,10 +25,16 @@ def read_wav(path):
         return f.readframes(f.getnframes())
 
 
-async def session(url, pcm, results, idx, start_at, chunk_ms=20):
+async def session(url, pcm, results, idx, start_at, chunk_ms=20, keywords=None):
     step = chunk_ms * 32
     async with websockets.connect(url, max_size=None) as ws:
         await asyncio.wait_for(ws.recv(), timeout=5)  # session.created
+        if keywords:
+            await ws.send(json.dumps({"type": "session.update", "session": {"audio": {"input": {
+                "transcription": {"keywords": keywords}}}}}))
+            event = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+            if event.get("type") != "session.updated" or event["session"]["audio"]["input"]["transcription"]["keywords"] != keywords:
+                raise RuntimeError(f"server did not apply requested keywords: {event}")
         await asyncio.sleep(max(0.0, start_at - asyncio.get_event_loop().time()))
         for off in range(0, len(pcm), step):
             await ws.send(json.dumps({"type": "input_audio_buffer.append",
@@ -78,6 +84,7 @@ async def main():
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--stagger-ms", type=int, default=0)
     ap.add_argument("--start-offsets-ms", nargs="+", type=int)
+    ap.add_argument("--keyword", action="append", help="Mandarin keyword scoped to each benchmark session")
     ap.add_argument("--out", type=Path)
     args = ap.parse_args()
 
@@ -93,7 +100,8 @@ async def main():
     for r in range(args.rounds):
         results = [None] * args.sessions
         start = asyncio.get_event_loop().time() + 0.3
-        tasks = [session(args.url, pcm, results, i, start + offsets[i] / 1000.0) for i, pcm in enumerate(clips)]
+        tasks = [session(args.url, pcm, results, i, start + offsets[i] / 1000.0, keywords=args.keyword)
+                 for i, pcm in enumerate(clips)]
         outcomes = await asyncio.gather(*tasks, return_exceptions=True)
         for i, outcome in enumerate(outcomes):
             if isinstance(outcome, Exception):

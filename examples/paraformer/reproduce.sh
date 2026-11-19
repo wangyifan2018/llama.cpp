@@ -100,7 +100,9 @@ do_check() {
              "$HERE/tools/cabin_mixed.tsv" "$HERE/tools/eval_mixed.py" \
              "$HERE/tools/gen_voice_fixtures.py" \
              "$HERE/tools/cabin_expanded.tsv" "$HERE/tools/vehicle_semantics_expanded.tsv" \
-             "$HERE/tools/check_vocab_coverage.py" "$HERE/tools/check_hotword_rules.py"; do
+             "$HERE/tools/check_vocab_coverage.py" "$HERE/tools/check_hotword_rules.py" \
+             "$HERE/tools/check_realtime_session.py" "$HERE/tools/eval_realtime.py" \
+             "$HERE/tools/bench_ws_realtime.py"; do
         [ -f "$f" ] && note "ok      $(basename "$f")" || { note "MISSING $f"; bad=1; }
     done
 

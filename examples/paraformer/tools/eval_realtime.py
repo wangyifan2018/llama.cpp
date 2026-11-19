@@ -12,7 +12,7 @@ import websockets
 from bench_ws_realtime import pct, read_wav
 
 
-async def transcribe(url, pcm, server_vad, paced, start_at, silence_ms):
+async def transcribe(url, pcm, server_vad, paced, start_at, silence_ms, keywords):
     loop = asyncio.get_running_loop()
     async with websockets.connect(url) as ws:
         assert json.loads(await asyncio.wait_for(ws.recv(), timeout=5))["type"] == "session.created"
@@ -20,11 +20,18 @@ async def transcribe(url, pcm, server_vad, paced, start_at, silence_ms):
         async def send(kind, **fields):
             await ws.send(json.dumps({"type": kind, **fields}))
 
-        if server_vad:
-            await send("session.update", session={"turn_detection": {"type": "server_vad", "silence_duration_ms": silence_ms}})
+        if server_vad or keywords:
+            settings = {}
+            if server_vad:
+                settings["turn_detection"] = {"type": "server_vad", "silence_duration_ms": silence_ms}
+            if keywords:
+                settings["transcription"] = {"keywords": keywords}
+            await send("session.update", session={"audio": {"input": settings}} if keywords else settings)
             updated = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
             if updated["type"] != "session.updated":
                 raise RuntimeError(updated)
+            if keywords and updated["session"]["audio"]["input"]["transcription"]["keywords"] != keywords:
+                raise RuntimeError(f"server did not apply requested keywords: {updated}")
 
         seen = {}
         ready = asyncio.Event()
@@ -102,7 +109,8 @@ async def replay(args):
         row = {"wav": str(wav), "reference": reference}
         try:
             pcm = read_wav(str(wav))
-            items, elapsed = await transcribe(args.url, pcm, args.server_vad, not args.unpaced, start_at, args.silence_ms)
+            items, elapsed = await transcribe(args.url, pcm, args.server_vad, not args.unpaced, start_at,
+                                              args.silence_ms, args.keyword)
             separator = "，" if language == "zh" else ", "
             text = separator.join(item["transcript"] for item in items.values() if item["transcript"])
             row.update(text=text, items=items, endpoint_to_final_ms=elapsed, audio_ms=len(pcm) / 32)
@@ -142,6 +150,7 @@ if __name__ == "__main__":
     parser.add_argument("--language", help="select one language from the manifest")
     parser.add_argument("--server-vad", action="store_true")
     parser.add_argument("--silence-ms", type=int, default=300, help="minimum silence for server VAD")
+    parser.add_argument("--keyword", action="append", help="Mandarin keyword scoped to each replay session")
     parser.add_argument("--unpaced", action="store_true", help="reduce runtime for accuracy-only checks")
     parser.add_argument("--lanes", type=int, choices=range(1, 5), default=1)
     parser.add_argument("--stagger-ms", type=int, default=0, help="start offset between adjacent lanes")
