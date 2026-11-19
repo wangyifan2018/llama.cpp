@@ -173,6 +173,15 @@ struct pf_stage_cache {
     uint64_t hits = 0, misses = 0;
 };
 
+struct paraformer_keyword_bias {
+    struct Node {
+        std::vector<std::pair<int, int>> child;
+        float gain = 0.0f;
+    };
+    std::vector<Node> trie;
+    float max_logit_gap = std::numeric_limits<float>::infinity();
+};
+
 struct paraformer_context {
     paraformer_model model;
     core_gguf::WeightLoad wl;
@@ -209,13 +218,8 @@ struct paraformer_context {
     // contact names, cabin words). While decoding, the token that continues an
     // active phrase gets its logit boosted, so a phrase the model started is
     // much more likely to be finished as the domain spells it.
-    struct CtxNode {
-        std::vector<std::pair<int, int>> child; // token id -> node index
-        float gain = 0.0f;                      // boost for entering this node
-    };
-    std::vector<CtxNode> ctx_trie;
-    mutable std::unordered_map<std::string, int> vocab_index; // built lazily for phrase tokenisation
-    float ctx_max_logit_gap = std::numeric_limits<float>::infinity();
+    paraformer_keyword_bias file_bias;
+    std::unordered_map<std::string, int> vocab_index;
     int ctx_phrases = 0;
     bool ctx_loaded = false;
     int hotword_count = 0;
@@ -374,11 +378,6 @@ static std::vector<int> pf_tokenize_phrase(const paraformer_context* ctx, const 
     // encode is impossible. Encode the way this vocab is built instead: cover
     // the text with vocab pieces where every non-final piece ends in "@@" and
     // the last one does not, preferring fewer pieces and then longer ones.
-    if (ctx->vocab_index.empty()) {
-        for (size_t k = 0; k < ctx->vocab.size(); ++k) {
-            ctx->vocab_index.emplace(ctx->vocab[k], (int) k);
-        }
-    }
     // Objective: fewest pieces, then the longest piece. Exact for CJK (single
     // characters). For Latin words this cannot reproduce the model's merge
     // order (the GGUF has no merge table), so it is best-effort and the explicit
@@ -438,6 +437,24 @@ static std::vector<int> pf_tokenize_phrase(const paraformer_context* ctx, const 
 
 // PF_CONTEXT: one "<gain> <phrase>" per line. Phrases share a prefix tree, so
 // only the continuation of a started phrase is boosted.
+static void pf_add_context_phrase(paraformer_keyword_bias& bias, const std::vector<int>& ids, float gain) {
+    if (bias.trie.empty()) bias.trie.emplace_back();
+    int node = 0;
+    for (int id : ids) {
+        auto& children = bias.trie[(size_t) node].child;
+        const auto it = std::find_if(children.begin(), children.end(), [id](const auto& edge) { return edge.first == id; });
+        if (it != children.end()) {
+            node = it->second;
+        } else {
+            const int next = (int) bias.trie.size();
+            children.emplace_back(id, next);
+            bias.trie.emplace_back();
+            bias.trie.back().gain = gain;
+            node = next;
+        }
+    }
+}
+
 static void paraformer_load_context(paraformer_context* ctx) {
     if (!ctx || ctx->ctx_loaded || ctx->vocab.empty()) {
         return;
@@ -460,10 +477,8 @@ static void paraformer_load_context(paraformer_context* ctx) {
             std::fclose(f);
             return;
         }
-        ctx->ctx_max_logit_gap = value;
+        ctx->file_bias.max_logit_gap = value;
     }
-    ctx->ctx_trie.clear();
-    ctx->ctx_trie.emplace_back(); // root
     char line[512];
     while (std::fgets(line, sizeof(line), f)) {
         std::string text(line);
@@ -490,28 +505,41 @@ static void paraformer_load_context(paraformer_context* ctx) {
             }
             fprintf(stderr, "pf-phrase: %s -> %s\n", body, seq.c_str());
         }
-        int node = 0;
-        for (int id : ids) {
-            int next = -1;
-            for (const auto& kv : ctx->ctx_trie[(size_t) node].child) {
-                if (kv.first == id) {
-                    next = kv.second;
-                    break;
-                }
-            }
-            if (next < 0) {
-                next = (int) ctx->ctx_trie.size();
-                ctx->ctx_trie.emplace_back();
-                ctx->ctx_trie[(size_t) next].gain = gain;
-                ctx->ctx_trie[(size_t) node].child.push_back({id, next});
-            }
-            node = next;
-        }
+        pf_add_context_phrase(ctx->file_bias, ids, gain);
         ++ctx->ctx_phrases;
     }
     std::fclose(f);
     fprintf(stderr, "paraformer: loaded %d context phrases (%zu trie nodes)\n", ctx->ctx_phrases,
-            ctx->ctx_trie.size());
+            ctx->file_bias.trie.size());
+}
+
+paraformer_keyword_bias* paraformer_keyword_bias_create(const paraformer_context* ctx, const char* const* words, size_t count) {
+    if (!ctx || (count && !words) || count > 24) return nullptr;
+    auto bias = std::make_unique<paraformer_keyword_bias>();
+    bias->max_logit_gap = 6.0f;
+    for (size_t i = 0; i < count; ++i) {
+        if (!words[i]) return nullptr;
+        const std::string word(words[i]);
+        if (word.size() < 6 || word.size() > 48 || word.size() % 3 != 0) return nullptr;
+        std::vector<int> ids;
+        for (size_t off = 0; off < word.size(); off += 3) {
+            const auto a = (unsigned char) word[off];
+            const auto b = (unsigned char) word[off + 1];
+            const auto c = (unsigned char) word[off + 2];
+            if ((a & 0xf0) != 0xe0 || (b & 0xc0) != 0x80 || (c & 0xc0) != 0x80) return nullptr;
+            const unsigned cp = ((a & 0x0f) << 12) | ((b & 0x3f) << 6) | (c & 0x3f);
+            if (cp < 0x3400 || cp > 0x9fff) return nullptr;
+            const auto it = ctx->vocab_index.find(word.substr(off, 3));
+            if (it == ctx->vocab_index.end()) return nullptr;
+            ids.push_back(it->second);
+        }
+        pf_add_context_phrase(*bias, ids, 6.0f);
+    }
+    return bias.release();
+}
+
+void paraformer_keyword_bias_free(paraformer_keyword_bias* bias) {
+    delete bias;
 }
 
 static void paraformer_load_hotwords(paraformer_context* ctx) {
@@ -1437,6 +1465,13 @@ static pf_word_marker pf_detect_word_marker(const std::vector<std::string>& voca
 // init paths need this and they used to do it inline, so a change to one
 // silently skipped the other (that is how the English vocab ended up scored
 // with zh stitching rules).
+static void pf_index_vocab(paraformer_context* ctx) {
+    ctx->vocab_index.reserve(ctx->vocab.size());
+    for (size_t i = 0; i < ctx->vocab.size(); ++i) {
+        ctx->vocab_index.emplace(ctx->vocab[i], (int) i);
+    }
+}
+
 static void pf_load_vocab(paraformer_context* ctx) {
     if (gguf_context* gctx = core_gguf::open_metadata(ctx->model_path.c_str())) {
         const int idx = gguf_find_key(gctx, "tokenizer.tokens");
@@ -1559,7 +1594,8 @@ static void pf_apply_text_rules(paraformer_context* ctx, std::string& text) {
 static std::optional<std::string> paraformer_transcribe_impl(paraformer_context* ctx, const float* pcm, int n_samples,
                                               std::vector<float>* staged_out = nullptr, const char* stage = nullptr,
                                               std::vector<pf_token>* out_tokens = nullptr,
-                                              paraformer_placement* warmup = nullptr) {
+                                              paraformer_placement* warmup = nullptr,
+                                              const paraformer_keyword_bias* keywords = nullptr) {
     const auto& hp = ctx->model.hp;
     const int D = (int)hp.d_model;
     paraformer_bench_lap _lap;
@@ -1897,7 +1933,9 @@ static std::optional<std::string> paraformer_transcribe_impl(paraformer_context*
     // §13: optional diagnostics — how many positions to dump top-K logits at.
     const char* dump_env = std::getenv("PF_DUMP_LOGITS");
     const int dump_n = dump_env ? std::atoi(dump_env) : 0;
-    const bool apply_bias = !ctx->hotword_bonus.empty() || !ctx->hotword_seq.empty() || !ctx->ctx_trie.empty();
+    const auto& context_bias = keywords ? *keywords : ctx->file_bias;
+    const auto& trie = context_bias.trie;
+    const bool apply_bias = !ctx->hotword_bonus.empty() || !ctx->hotword_seq.empty() || !trie.empty();
     std::vector<float> biased_row; // only allocated when dumping with bias on
     if (dump_n > 0 && apply_bias)
         biased_row.resize(V);
@@ -1906,11 +1944,13 @@ static std::optional<std::string> paraformer_transcribe_impl(paraformer_context*
     // can start anywhere; its children carry a configurable start gain (default
     // 0) while continuations carry the full phrase gain.
     float ctx_start_gain = 0.0f;
-    if (const char* sg = std::getenv("PF_CONTEXT_START")) {
-        ctx_start_gain = (float) std::atof(sg);
+    if (!keywords) {
+        if (const char* sg = std::getenv("PF_CONTEXT_START")) {
+            ctx_start_gain = (float) std::atof(sg);
+        }
     }
     std::vector<int> ctx_active;
-    if (!ctx->ctx_trie.empty()) {
+    if (!trie.empty()) {
         ctx_active.push_back(0);
     }
     std::vector<std::pair<int, float>> ctx_here;
@@ -1936,15 +1976,15 @@ static std::optional<std::string> paraformer_transcribe_impl(paraformer_context*
         // Ignore context candidates too far below the best acoustic token.
         ctx_here.clear();
         float ctx_min_logit = -std::numeric_limits<float>::infinity();
-        if (std::isfinite(ctx->ctx_max_logit_gap) && (ctx_active.size() > 1 || ctx_start_gain > 0.0f)) {
-            ctx_min_logit = *std::max_element(row, row + V) - ctx->ctx_max_logit_gap;
+        if (std::isfinite(context_bias.max_logit_gap) && (ctx_active.size() > 1 || ctx_start_gain > 0.0f)) {
+            ctx_min_logit = *std::max_element(row, row + V) - context_bias.max_logit_gap;
         }
         for (int node : ctx_active) {
             if (node == 0 && ctx_start_gain <= 0.0f) {
                 continue;
             }
-            for (const auto& kv : ctx->ctx_trie[(size_t) node].child) {
-                const float g = node == 0 ? ctx_start_gain : ctx->ctx_trie[(size_t) kv.second].gain;
+            for (const auto& kv : trie[(size_t) node].child) {
+                const float g = node == 0 ? ctx_start_gain : trie[(size_t) kv.second].gain;
                 if (g > 0.0f && row[kv.first] >= ctx_min_logit) {
                     ctx_here.push_back({ kv.first, g });
                 }
@@ -1980,11 +2020,11 @@ static std::optional<std::string> paraformer_transcribe_impl(paraformer_context*
                 paraformer_dump_logits(ctx, row, V, n, 5);
             }
         }
-        if (!ctx->ctx_trie.empty()) {
+        if (!trie.empty()) {
             std::vector<int> next_active;
             next_active.push_back(0); // root: a new phrase may start later
             for (int node : ctx_active) {
-                for (const auto& kv : ctx->ctx_trie[(size_t) node].child) {
+                for (const auto& kv : trie[(size_t) node].child) {
                     if (kv.first == best) {
                         next_active.push_back(kv.second);
                     }
@@ -2153,7 +2193,8 @@ static pf_long_cfg paraformer_long_cfg() {
 // halves may come from different windows and disagree (`seed` vs `seat`), which
 // is the documented cost of context windows, not a stitch bug.
 static std::optional<std::string> paraformer_transcribe_long(paraformer_context* ctx, const float* pcm, int n_samples,
-                                                            const pf_long_cfg& cfg, std::vector<pf_token>* out_tokens) {
+                                                            const pf_long_cfg& cfg, std::vector<pf_token>* out_tokens,
+                                                            const paraformer_keyword_bias* keywords) {
     const pf_word_marker mark = (pf_word_marker) ctx->word_marker;
     const int sr = 16000;
     const int64_t total_ms = (int64_t) n_samples * 1000 / sr;
@@ -2190,7 +2231,7 @@ static std::optional<std::string> paraformer_transcribe_long(paraformer_context*
         if (off < 0 || len <= 0 || off + len > n_samples)
             continue;
         std::vector<pf_token> toks;
-        if (!paraformer_transcribe_impl(ctx, pcm + off, len, nullptr, nullptr, &toks)) {
+        if (!paraformer_transcribe_impl(ctx, pcm + off, len, nullptr, nullptr, &toks, nullptr, keywords)) {
             return std::nullopt;
         }
         seams.push_back(merged.size());
@@ -2344,12 +2385,13 @@ static int trim_trailing_silence(const float* pcm, int n_samples) {
 }
 
 static std::optional<std::string> paraformer_run(paraformer_context* ctx, const float* pcm, int n_samples,
-                                                std::vector<pf_token>* tokens = nullptr) {
+                                                std::vector<pf_token>* tokens = nullptr,
+                                                const paraformer_keyword_bias* keywords = nullptr) {
     n_samples = trim_trailing_silence(pcm, n_samples);
     const pf_long_cfg lc = paraformer_long_cfg();
     if (paraformer_use_long(lc, n_samples))
-        return paraformer_transcribe_long(ctx, pcm, n_samples, lc, tokens);
-    return paraformer_transcribe_impl(ctx, pcm, n_samples, nullptr, nullptr, tokens);
+        return paraformer_transcribe_long(ctx, pcm, n_samples, lc, tokens, keywords);
+    return paraformer_transcribe_impl(ctx, pcm, n_samples, nullptr, nullptr, tokens, nullptr, keywords);
 }
 
 paraformer_context_params paraformer_context_default_params() {
@@ -2431,6 +2473,7 @@ paraformer_context* paraformer_init_shared(paraformer_weights* w, paraformer_con
         return nullptr;
     }
     ctx->vocab = w->vocab; // cheap: ~8404 short strings copied once at init
+    pf_index_vocab(ctx);
     ctx->word_marker = (int) pf_detect_word_marker(ctx->vocab);
     if (ctx->verbosity >= 1)
         fprintf(stderr, "paraformer: word marker = %s (vocab %zu)\n",
@@ -2498,6 +2541,7 @@ paraformer_context* paraformer_init_from_file(const char* path, paraformer_conte
     }
 
     pf_load_vocab(ctx);
+    pf_index_vocab(ctx);
 
     if (ctx->verbosity >= 1) {
         fprintf(stderr, "paraformer: loaded %zu tensors, vocab %zu (%s), enc %u+%u blocks, dec %u blocks\n",
@@ -2557,9 +2601,14 @@ paraformer_placement paraformer_warmup_placement(const paraformer_context* ctx) 
 }
 
 char* paraformer_transcribe(paraformer_context* ctx, const float* samples, int n_samples) {
+    return paraformer_transcribe_biased(ctx, samples, n_samples, nullptr);
+}
+
+char* paraformer_transcribe_biased(paraformer_context* ctx, const float* samples, int n_samples,
+                                 const paraformer_keyword_bias* keywords) {
     if (!ctx || !samples || n_samples <= 0)
         return nullptr;
-    auto result = paraformer_run(ctx, samples, n_samples);
+    auto result = paraformer_run(ctx, samples, n_samples, nullptr, keywords);
     if (!result) return nullptr;
     std::string s = *result;
     pf_apply_text_rules(ctx, s);
@@ -2628,10 +2677,15 @@ paraformer_result* paraformer_transcribe_with_timestamps(paraformer_context* ctx
 }
 
 paraformer_tokens* paraformer_transcribe_tokens(paraformer_context* ctx, const float* samples, int n_samples) {
+    return paraformer_transcribe_tokens_biased(ctx, samples, n_samples, nullptr);
+}
+
+paraformer_tokens* paraformer_transcribe_tokens_biased(paraformer_context* ctx, const float* samples, int n_samples,
+                                                     const paraformer_keyword_bias* keywords) {
     if (!ctx || !samples || n_samples <= 0)
         return nullptr;
     std::vector<pf_token> toks;
-    auto result = paraformer_run(ctx, samples, n_samples, &toks);
+    auto result = paraformer_run(ctx, samples, n_samples, &toks, keywords);
     if (!result) return nullptr;
     const auto& s = *result;
     auto* r = (paraformer_tokens*) std::malloc(sizeof(paraformer_tokens));

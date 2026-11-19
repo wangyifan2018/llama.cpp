@@ -167,6 +167,7 @@ struct SegmentReply {
 };
 
 using pool_done = std::function<void(SegmentReply)>;
+using KeywordBias = std::shared_ptr<const paraformer_keyword_bias>;
 struct WsSession;
 
 struct PoolTask {
@@ -176,6 +177,7 @@ struct PoolTask {
     pf_clock::time_point deadline = pf_clock::time_point::max();
     int priority = 0;    // 1 = commit, 0 = partial
     bool want_tokens = false;
+    KeywordBias keywords;
     const WsSession* ws_owner = nullptr;
     std::function<bool()> cancelled;
     std::shared_ptr<SpeakerTicket> speaker;
@@ -549,11 +551,12 @@ static void worker_loop(Engine* eng) {
 // Returns false when the queue is full (the caller maps that to 429 / an error event).
 static bool submit(std::vector<float>&& samples, int priority, pool_done done, bool want_tokens = false,
                    std::function<bool()> cancelled = {}, pf_clock::time_point deadline = pf_clock::time_point::max(),
-                   const WsSession* ws_owner = nullptr) {
+                   const WsSession* ws_owner = nullptr, KeywordBias keywords = {}) {
     auto task = std::make_unique<PoolTask>();
     task->done = std::move(done);
     task->priority = priority;
     task->want_tokens = want_tokens;
+    task->keywords = std::move(keywords);
     task->ws_owner = ws_owner;
     task->cancelled = std::move(cancelled);
     task->enqueued_ms = now_ms();
@@ -738,7 +741,7 @@ static std::string utterance_language(const std::vector<WordSpan>& words) {
     return "mixed";
 }
 
-static json segments_json(const std::vector<WordSpan>& words, bool zh, double gap_ms, const std::string& fallback) {
+static json segments_json(const std::vector<WordSpan>& words, double gap_ms, const std::string& fallback) {
     json segs = json::array();
     if (words.empty()) {
         segs.push_back({{"id", 0}, {"start", 0.0}, {"end", 0.0}, {"text", fallback}, {"language", "zh"}});
@@ -1238,7 +1241,8 @@ static SegmentReply decode_task(Engine& eng, const PoolTask& task) {
         const double begin_ms = now_ms();
         HtpWatchdog::Guard guard(eng.watchdog, "inference");
         if (task.want_tokens) {
-            std::unique_ptr<paraformer_tokens, TokensDeleter> tokens(paraformer_transcribe_tokens(eng.ctx.get(), pcm, count));
+            std::unique_ptr<paraformer_tokens, TokensDeleter> tokens(
+                paraformer_transcribe_tokens_biased(eng.ctx.get(), pcm, count, task.keywords.get()));
             if (tokens) {
                 append_text(reply.text, tokens->text);
                 append_words(reply.words, tokens.get(), (double) piece.first / 16.0);
@@ -1246,7 +1250,8 @@ static SegmentReply decode_task(Engine& eng, const PoolTask& task) {
                 reply.status = 500;
             }
         } else {
-            std::unique_ptr<char, decltype(&std::free)> text(paraformer_transcribe(eng.ctx.get(), pcm, count), &std::free);
+            std::unique_ptr<char, decltype(&std::free)> text(
+                paraformer_transcribe_biased(eng.ctx.get(), pcm, count, task.keywords.get()), &std::free);
             if (text) append_text(reply.text, text.get());
             else reply.status = 500;
         }
@@ -1324,8 +1329,11 @@ struct WsSession {
 #endif
     bool stream_vad = false;
     double stream_silence_ms = 0;
+    json turn_detection = nullptr;
     std::string stream_text;      // running transcript across closed segments
     std::string language = "zh";
+    KeywordBias keywords;
+    std::vector<std::string> keyword_names;
     std::string partial_text;
     uint64_t gen = 0;             // invalidates previews on commit or clear
     size_t partial_mark = 0;      // pcm size when the last partial was scheduled
@@ -1365,11 +1373,15 @@ static void ws_final_error(WsSession& s, const std::string& item, const SegmentR
 }
 
 static json session_object(const WsSession& s) {
+    const json transcription = {{"model", g_model_id}, {"language", s.language}, {"keywords", s.keyword_names}};
     return json{{"id", "sess_" + std::to_string((uintptr_t) &s % 100000)},
                 {"object", "realtime.session"},
+                {"type", "transcription"},
                 {"model", g_model_id},
-                {"audio", {{"input", {{"format", {{"type", "audio/pcm"}, {"rate", 16000}}}}}}},
-                {"input_audio_transcription", {{"model", g_model_id}, {"language", s.language}}}};
+                {"audio", {{"input", {{"format", {{"type", "audio/pcm"}, {"rate", pf_segment::sample_rate}}},
+                                     {"transcription", transcription}, {"turn_detection", s.turn_detection}}}}},
+                {"turn_detection", s.stream_vad ? s.turn_detection : json{{"type", "none"}}},
+                {"input_audio_transcription", transcription}};
 }
 
 static void ws_emit_segment(const std::shared_ptr<WsSession>& s, const std::string& item, const SegmentReply& reply,
@@ -1433,7 +1445,7 @@ static bool ws_submit_segment(const std::shared_ptr<WsSession>& s, std::vector<f
     }, g_realtime_punctuate, [s] {
         std::lock_guard<std::mutex> lock(s->m);
         return s->closed;
-    }, deadline, s.get());
+    }, deadline, s.get(), s->keywords);
     if (!ok) {
         ws_queue_event(*s, "error", error_body("server is busy, retry later", "rate_limit_error"));
         return false;
@@ -1574,12 +1586,165 @@ static void maybe_schedule_partial(const std::shared_ptr<WsSession>& s) {
     }, false, [s, gen] {
         std::lock_guard<std::mutex> lock(s->m);
         return s->closed || gen != s->gen;
-    }, pf_clock::time_point::max(), s.get());
+    }, pf_clock::time_point::max(), s.get(), s->keywords);
     if (!ok) {
         s->partial_inflight = false;
         return;
     }
     g_partials_run.fetch_add(1);
+}
+
+static void ws_update_session(const std::shared_ptr<WsSession>& s, const json& session) {
+    auto bad = [&](const char* message, const char* field) {
+        ws_send_error(*s, message, "invalid_request_error", field);
+    };
+    if (!session.is_object()) {
+        return bad("session must be an object", "session");
+    }
+    const json empty = json::object();
+    const json& audio = session.contains("audio") ? session["audio"] : empty;
+    if (!audio.is_object()) {
+        return bad("audio must be an object", "audio");
+    }
+    const json& input = audio.contains("input") ? audio["input"] : empty;
+    if (!input.is_object()) {
+        return bad("input must be an object", "audio.input");
+    }
+    if (input.contains("format")) {
+        const auto& format = input["format"];
+        if (!format.is_object() || !format.contains("type") || format["type"] != "audio/pcm" ||
+            !format.contains("rate") || !format["rate"].is_number_integer() || format["rate"] != pf_segment::sample_rate) {
+            return bad("Realtime expects 16000 Hz audio/pcm", "audio.input.format");
+        }
+    }
+    if (session.contains("input_audio_format") && session["input_audio_format"] != "pcm16") {
+        return bad("Realtime expects pcm16", "input_audio_format");
+    }
+    if ((input.contains("transcription") && session.contains("input_audio_transcription")) ||
+        (input.contains("turn_detection") && session.contains("turn_detection"))) {
+        return bad("provide each setting once", "session");
+    }
+
+    const json& transcription = input.contains("transcription") ? input["transcription"] :
+        session.contains("input_audio_transcription") ? session["input_audio_transcription"] : empty;
+    if (!transcription.is_object()) {
+        return bad("transcription must be an object", "audio.input.transcription");
+    }
+    std::string language = s->language;
+    if (transcription.contains("language")) {
+        const auto& value = transcription["language"];
+        if (!value.is_string() || value.get_ref<const std::string&>().size() > 32) {
+            return bad("language must be a string of at most 32 bytes", "audio.input.transcription.language");
+        }
+        language = value.get<std::string>();
+    }
+
+    const bool update_keywords = transcription.contains("keywords");
+    KeywordBias keywords;
+    std::vector<std::string> names;
+    if (update_keywords) {
+        const auto& list = transcription["keywords"];
+        if (!list.is_array() || list.size() > 24) {
+            return bad("keywords must be an array of at most 24 phrases", "audio.input.transcription.keywords");
+        }
+        for (const auto& phrase : list) {
+            if (!phrase.is_string()) {
+                return bad("keyword must be a string", "audio.input.transcription.keywords");
+            }
+            const auto& word = phrase.get_ref<const std::string&>();
+            if (word.size() > 48 || word.find('\0') != std::string::npos) {
+                return bad("keyword must contain 2 to 16 supported Han characters", "audio.input.transcription.keywords");
+            }
+            if (std::find(names.begin(), names.end(), word) == names.end()) names.push_back(word);
+        }
+        std::vector<const char*> words;
+        for (const auto& name : names) words.push_back(name.c_str());
+        auto* bias = paraformer_keyword_bias_create(g_engines.front()->ctx.get(), words.data(), words.size());
+        if (!bias) {
+            return bad("keyword must contain 2 to 16 supported Han characters", "audio.input.transcription.keywords");
+        }
+        keywords = KeywordBias(bias, paraformer_keyword_bias_free);
+    }
+
+    const bool update_vad = input.contains("turn_detection") || session.contains("turn_detection");
+    json detection = nullptr;
+    double silence = 0;
+#ifdef XASR_SPEAKER
+    decltype(s->vad) detector(nullptr, &SherpaOnnxDestroyVoiceActivityDetector);
+#endif
+    if (update_vad) {
+        const auto& td = input.contains("turn_detection") ? input["turn_detection"] : session["turn_detection"];
+        if (!td.is_null() && (!td.is_object() || !td.contains("type") || !td["type"].is_string())) {
+            return bad("turn_detection must be null or an object with a string type", "turn_detection");
+        }
+        const std::string kind = td.is_null() ? "none" : td["type"].get<std::string>();
+        if (kind != "none" && kind != "server_vad") {
+            return bad("unsupported turn detection type", "turn_detection");
+        }
+        if (kind == "server_vad") {
+#ifdef XASR_SPEAKER
+            if (g_vad_model.empty()) {
+                return bad("server_vad needs --vad-model", "turn_detection");
+            }
+            auto number = [&](const char* key, double fallback) {
+                auto it = td.find(key);
+                if (it == td.end()) return fallback;
+                return it->is_number() ? it->get<double>() : NAN;
+            };
+            silence = number("silence_duration_ms", g_vad_silence_ms);
+            const double speech = number("min_speech_duration_ms", 200);
+            const double threshold = number("threshold", 0.5);
+            if (!(silence >= 32 && silence <= 2000 && speech >= 32 && speech <= 2000 && threshold > 0 && threshold <= 1)) {
+                return bad("invalid server_vad duration or threshold", "turn_detection");
+            }
+            detection = {{"type", kind}, {"silence_duration_ms", silence},
+                         {"min_speech_duration_ms", speech}, {"threshold", threshold}};
+            if (detection != s->turn_detection) {
+                SherpaOnnxVadModelConfig cfg{};
+                cfg.silero_vad.model = g_vad_model.c_str();
+                cfg.silero_vad.threshold = (float) threshold;
+                cfg.silero_vad.min_silence_duration = (float) (silence / 1000);
+                cfg.silero_vad.min_speech_duration = (float) (speech / 1000);
+                cfg.silero_vad.window_size = 512;
+                cfg.silero_vad.max_speech_duration = g_vad_split_s;
+                cfg.sample_rate = pf_segment::sample_rate;
+                cfg.num_threads = 1;
+                cfg.provider = "cpu";
+                detector.reset(SherpaOnnxCreateVoiceActivityDetector(&cfg, 60.0f));
+                if (!detector) {
+                    ws_send_error(*s, "server_vad initialization failed", "server_error", "turn_detection");
+                    return;
+                }
+            }
+#else
+            return bad("server_vad is not compiled in", "turn_detection");
+#endif
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(s->m);
+    const bool change_vad = update_vad && detection != s->turn_detection;
+    if (change_vad) {
+#ifdef XASR_SPEAKER
+        s->vad = std::move(detector);
+#endif
+        s->stream_vad = !detection.is_null();
+        s->stream_silence_ms = silence;
+        s->turn_detection = std::move(detection);
+        s->stream_text.clear();
+        s->pcm.clear();
+    }
+    if (update_keywords) {
+        s->keywords = std::move(keywords);
+        s->keyword_names = std::move(names);
+    }
+    if (change_vad || update_keywords) {
+        s->partial_text.clear();
+        s->partial_mark = 0;
+        ++s->gen;
+    }
+    s->language = std::move(language);
+    ws_queue_event(*s, "session.updated", {{"session", session_object(*s)}});
 }
 
 static void ws_handle_text(const std::shared_ptr<WsSession>& s, const std::string& msg) {
@@ -1600,86 +1765,7 @@ static void ws_handle_text(const std::shared_ptr<WsSession>& s, const std::strin
     }
     const std::string type = j["type"].get<std::string>();
     if (type == "session.update") {
-        const json& sess = j.contains("session") ? j["session"] : json::object();
-        if (!sess.is_object() || (sess.contains("input_audio_transcription") && !sess["input_audio_transcription"].is_object())) {
-            ws_send_error(*s, "session and input_audio_transcription must be objects", "invalid_request_error", "session");
-            return;
-        }
-        if (sess.contains("turn_detection")) {
-            const auto& td = sess["turn_detection"];
-            if (!td.is_null() && (!td.is_object() || !td.contains("type") || !td["type"].is_string())) {
-                ws_send_error(*s, "turn_detection must be null or an object with a string type", "invalid_request_error", "turn_detection");
-                return;
-            }
-            const std::string kind = td.is_null() ? "none" : td["type"].get<std::string>();
-            if (kind != "none" && kind != "server_vad") {
-                ws_send_error(*s, "unsupported turn detection type", "invalid_request_error", "turn_detection");
-                return;
-            }
-#ifdef XASR_SPEAKER
-            const SherpaOnnxVoiceActivityDetector* detector = nullptr;
-            double silence = 0;
-            if (kind == "server_vad") {
-                if (g_vad_model.empty()) {
-                    ws_send_error(*s, "server_vad needs --vad-model", "invalid_request_error", "turn_detection");
-                    return;
-                }
-                auto number = [&](const char* key, double fallback) {
-                    auto it = td.find(key);
-                    if (it == td.end()) return fallback;
-                    return it->is_number() ? it->get<double>() : NAN;
-                };
-                silence = number("silence_duration_ms", g_vad_silence_ms);
-                const double speech = number("min_speech_duration_ms", 200);
-                const double threshold = number("threshold", 0.5);
-                if (!(silence >= 32 && silence <= 2000 && speech >= 32 && speech <= 2000 && threshold > 0 && threshold <= 1)) {
-                    ws_send_error(*s, "invalid server_vad duration or threshold", "invalid_request_error", "turn_detection");
-                    return;
-                }
-                SherpaOnnxVadModelConfig cfg{};
-                cfg.silero_vad.model = g_vad_model.c_str();
-                cfg.silero_vad.threshold = (float) threshold;
-                cfg.silero_vad.min_silence_duration = (float) (silence / 1000);
-                cfg.silero_vad.min_speech_duration = (float) (speech / 1000);
-                cfg.silero_vad.window_size = 512;
-                cfg.silero_vad.max_speech_duration = g_vad_split_s;
-                cfg.sample_rate = pf_segment::sample_rate;
-                cfg.num_threads = 1;
-                cfg.provider = "cpu";
-                detector = SherpaOnnxCreateVoiceActivityDetector(&cfg, 60.0f);
-                if (!detector) {
-                    ws_send_error(*s, "server_vad initialization failed", "server_error", "turn_detection");
-                    return;
-                }
-            }
-            std::lock_guard<std::mutex> lock(s->m);
-            s->vad.reset(detector);
-            s->stream_vad = detector != nullptr;
-            s->stream_silence_ms = silence;
-            s->stream_text.clear();
-            s->partial_text.clear();
-            s->partial_mark = 0;
-            s->pcm.clear();
-            ++s->gen;
-            ws_queue_event(*s, "session.updated", {{"session", {{"turn_detection", {{"type", kind}}}}}});
-#else
-            if (kind == "server_vad") {
-                ws_send_error(*s, "server_vad is not compiled in", "invalid_request_error", "turn_detection");
-            } else {
-                ws_send_event(*s, "session.updated", {{"session", {{"turn_detection", {{"type", kind}}}}}});
-            }
-#endif
-            return;
-        }
-        if (sess.contains("input_audio_transcription") && sess["input_audio_transcription"].contains("language")) {
-            const auto& language = sess["input_audio_transcription"]["language"];
-            if (!language.is_string() || language.get_ref<const std::string&>().size() > 32) {
-                ws_send_error(*s, "language must be a string of at most 32 bytes", "invalid_request_error", "language");
-                return;
-            }
-            s->language = language.get<std::string>();
-        }
-        ws_send_event(*s, "session.updated", {{"session", session_object(*s)}});
+        ws_update_session(s, j.contains("session") ? j["session"] : json::object());
         return;
     }
     if (type == "input_audio_buffer.append") {
@@ -1985,7 +2071,7 @@ static void handle_transcription(const httplib::Request& req, httplib::Response&
                   {"duration", duration},
                   {"text", text},
                   {"words", jw},
-                  {"segments", r.silence ? json::array() : segments_json(words, zh, g_seg_gap_ms, text)}};
+                  {"segments", r.silence ? json::array() : segments_json(words, g_seg_gap_ms, text)}};
         set_speaker_json(j, r.speaker);
         res.set_content(j.dump(2), "application/json");
         return;
@@ -1995,7 +2081,7 @@ static void handle_transcription(const httplib::Request& req, httplib::Response&
             res.set_content("", "text/plain; charset=utf-8");
             return;
         }
-        const json segs = segments_json(words, zh, g_seg_gap_ms, text);
+        const json segs = segments_json(words, g_seg_gap_ms, text);
         std::string body;
         for (size_t i = 0; i < segs.size(); ++i) {
             body += std::to_string(i + 1) + "\n" + srt_time(segs[i]["start"].get<double>()) + " --> " +
@@ -2362,7 +2448,7 @@ int main(int argc, char** argv) {
         ggml_backend_load_all();
         htp_present = pf_htp_present();
         device = pf_default_device();
-        pf_report_device(device, htp_present, recover_on_cpu);
+        pf_report_device(device, htp_present, recover_on_cpu, /*service=*/true);
     }
     // From here on `device` is the single source of truth: whether it came from
     // --device or from the probe above, "not CPU" means an accelerator engine.

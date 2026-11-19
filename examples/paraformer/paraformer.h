@@ -23,6 +23,7 @@ extern "C" {
 #endif
 
 struct paraformer_context;
+struct paraformer_keyword_bias;
 
 // Graph-cache counters: encoder hits/misses, decoder hits/misses.
 void paraformer_cache_stats(const paraformer_context* ctx, unsigned long long* enc_hit, unsigned long long* enc_miss,
@@ -56,6 +57,13 @@ void paraformer_free(paraformer_context* ctx);
 // Transcribe audio (16 kHz mono PCM). NULL means failure. Empty text is valid.
 // The caller frees the returned string.
 char* paraformer_transcribe(paraformer_context* ctx, const float* samples, int n_samples);
+
+// Build immutable Mandarin phrase hints against the model vocabulary. Returns NULL on invalid input.
+struct paraformer_keyword_bias* paraformer_keyword_bias_create(const struct paraformer_context* ctx,
+                                                              const char* const* words, size_t count);
+void paraformer_keyword_bias_free(struct paraformer_keyword_bias* bias);
+char* paraformer_transcribe_biased(struct paraformer_context* ctx, const float* samples, int n_samples,
+                                 const struct paraformer_keyword_bias* bias);
 
 // Literal phrase rewrites applied to the final transcript (TSV: from <TAB> to).
 // A rule fires only on an exact case-insensitive match, so it cannot invent a
@@ -111,6 +119,8 @@ struct paraformer_tokens {
 
 // Returns NULL on failure. Free with paraformer_tokens_free().
 struct paraformer_tokens* paraformer_transcribe_tokens(paraformer_context* ctx, const float* samples, int n_samples);
+struct paraformer_tokens* paraformer_transcribe_tokens_biased(struct paraformer_context* ctx, const float* samples,
+                                                             int n_samples, const struct paraformer_keyword_bias* bias);
 void paraformer_tokens_free(struct paraformer_tokens* r);
 
 // Stage-capture API for the diff harness.
