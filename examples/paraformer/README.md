@@ -257,6 +257,7 @@ Q5_K/Q6_K use the same tool. See design doc section 24.
 ## API
 
 See [PRODUCTION.md](PRODUCTION.md) for hardening changes, regression replays, and open release checks.
+See [HOTWORDS.md](HOTWORDS.md) for the Realtime cabin terminology baseline and experiment gates.
 
 Callers should read [docs/backend/snapdragon/api-reference.md](../../docs/backend/snapdragon/api-reference.md):
 endpoints, request fields, response formats, headers (`X-Queue-Ms`, `X-Infer-Ms`,

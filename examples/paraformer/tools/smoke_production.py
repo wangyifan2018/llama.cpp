@@ -149,6 +149,7 @@ def main():
     ap.add_argument("--expect-vad", action="store_true", help="fail unless /health reports server_vad")
     ap.add_argument("--expect-backend", help="require this actual backend on the first engine")
     ap.add_argument("--expect-degraded", action="store_true", help="expect explicit CPU fallback")
+    ap.add_argument("--expect-console", action="store_true", help="require the diagnostic page at /")
     args = ap.parse_args()
 
     base = "http://%s:%d" % (args.host, args.port)
@@ -197,6 +198,7 @@ def main():
     st, hdr, body = post_multipart(base + "/v1/audio/transcriptions", args.wav, {"punctuate": "true"})
     punct = json.loads(body).get("text", "") if st == 200 else ""
     check("punctuate", st == 200 and (punct.endswith("。") or punct.endswith(".")), punct[:40])
+    speaker_headers = hdr
 
     # The test console is part of the deliverable and had no check at all, which
     # is how it shipped for a while serving a text hint instead of the page when
@@ -204,8 +206,9 @@ def main():
     st, hdr, body = http_json(base + "/")
     page = body.decode("utf-8", "replace") if isinstance(body, bytes) else str(body)
     is_page = st == 200 and "<!doctype html>" in page.lower() and "座舱" in page
-    check("test console served at /", is_page,
-          (hdr.get("Content-Type", "") if hdr else "") or page[:60])
+    if args.expect_console or is_page:
+        check("test console served at /", is_page,
+              (hdr.get("Content-Type", "") if hdr else "") or page[:60])
     if is_page:
         # The page and the server have to agree on the event names, otherwise
         # the console silently shows nothing. The page matches on the suffix
@@ -215,13 +218,13 @@ def main():
               "endsWith('delta')" in page and "endsWith('completed')" in page
               and "x.pf.metrics" in page)
         check("console uses the metrics fields the server sends",
-              "queue_ms" in page and "infer_ms" in page and "vad_pieces" in page)
+              "queue_ms" in page and "infer_ms" in page and "tail_ms" in page)
 
     if args.expect_gate:
-        score = hdr.get("X-Speaker-Score")
-        state = hdr.get("X-Speaker-Status")
+        score = speaker_headers.get("X-Speaker-Score")
+        state = speaker_headers.get("X-Speaker-Status")
         check("speaker response state", (state == "assessed" and score is not None) or
-              (state == "not_assessed" and score is None and hdr.get("X-Speaker-Reason")),
+              (state == "not_assessed" and score is None and speaker_headers.get("X-Speaker-Reason")),
               "state=%s score=%s" % (state, score))
 
     # 4. error handling

@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <unordered_map>
@@ -214,6 +215,7 @@ struct paraformer_context {
     };
     std::vector<CtxNode> ctx_trie;
     mutable std::unordered_map<std::string, int> vocab_index; // built lazily for phrase tokenisation
+    float ctx_max_logit_gap = std::numeric_limits<float>::infinity();
     int ctx_phrases = 0;
     bool ctx_loaded = false;
     int hotword_count = 0;
@@ -450,6 +452,16 @@ static void paraformer_load_context(paraformer_context* ctx) {
         fprintf(stderr, "paraformer: cannot open PF_CONTEXT '%s'\n", path);
         return;
     }
+    if (const char* gap = std::getenv("PF_CONTEXT_MAX_LOGIT_GAP")) {
+        char* end = nullptr;
+        const float value = std::strtof(gap, &end);
+        if (end == gap || *end || value < 0.0f || !std::isfinite(value)) {
+            fprintf(stderr, "paraformer: invalid PF_CONTEXT_MAX_LOGIT_GAP, skipping context\n");
+            std::fclose(f);
+            return;
+        }
+        ctx->ctx_max_logit_gap = value;
+    }
     ctx->ctx_trie.clear();
     ctx->ctx_trie.emplace_back(); // root
     char line[512];
@@ -464,7 +476,7 @@ static void paraformer_load_context(paraformer_context* ctx) {
         }
         float gain = 0.0f;
         char body[400] = {0};
-        if (std::sscanf(text.c_str(), "%f %399s", &gain, body) != 2 || gain <= 0.0f || gain > 8.0f) {
+        if (std::sscanf(text.c_str(), "%f %399s", &gain, body) != 2 || gain <= 0.0f || gain > 8.0f || !std::isfinite(gain)) {
             continue;
         }
         const std::vector<int> ids = pf_tokenize_phrase(ctx, std::string(body));
@@ -1911,37 +1923,21 @@ static std::optional<std::string> paraformer_transcribe_impl(paraformer_context*
                 if (r.prefix == prev_token)
                     seq_here.push_back({ r.target, r.gain });
         }
-        // §28: gains for tokens that continue an active context phrase. Root
-        // children (phrase starts) take the maximum, not the sum, so the start
-        // bias stays bounded no matter how many phrases are registered.
+        // Ignore context candidates too far below the best acoustic token.
         ctx_here.clear();
-        std::vector<std::pair<int, float>> ctx_start;
+        float ctx_min_logit = -std::numeric_limits<float>::infinity();
+        if (std::isfinite(ctx->ctx_max_logit_gap) && (ctx_active.size() > 1 || ctx_start_gain > 0.0f)) {
+            ctx_min_logit = *std::max_element(row, row + V) - ctx->ctx_max_logit_gap;
+        }
         for (int node : ctx_active) {
+            if (node == 0 && ctx_start_gain <= 0.0f) {
+                continue;
+            }
             for (const auto& kv : ctx->ctx_trie[(size_t) node].child) {
-                const float g = ctx->ctx_trie[(size_t) kv.second].gain;
-                if (node == 0) {
-                    bool merged = false;
-                    for (auto& s : ctx_start) {
-                        if (s.first == kv.first) {
-                            s.second = std::max(s.second, g);
-                            merged = true;
-                            break;
-                        }
-                    }
-                    if (!merged) {
-                        ctx_start.push_back({ kv.first, g });
-                    }
-                } else if (g > 0.0f) {
+                const float g = node == 0 ? ctx_start_gain : ctx->ctx_trie[(size_t) kv.second].gain;
+                if (g > 0.0f && row[kv.first] >= ctx_min_logit) {
                     ctx_here.push_back({ kv.first, g });
                 }
-            }
-        }
-        if (ctx_start_gain > 0.0f) {
-            // Absolute logits, not a multiplier: the start bias must stay small
-            // or it dominates the acoustic scores (measured: 3x gain destroyed
-            // every transcript).
-            for (const auto& s : ctx_start) {
-                ctx_here.push_back({ s.first, ctx_start_gain });
             }
         }
         auto bias_of = [&](int v) -> float {

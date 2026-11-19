@@ -1,0 +1,19 @@
+wav	group	required	forbidden
+entity_zh01.wav	zh	虹桥火车站	五角场|陆家嘴
+entity_zh02.wav	zh	五角场	虹桥火车站|陆家嘴
+entity_zh03.wav	zh	王梓涵	周杰伦
+entity_zh04.wav	zh	瑞幸咖啡	王梓涵
+entity_zh05.wav	zh	陆家嘴	虹桥火车站|五角场
+entity_zh06.wav	zh	周杰伦|稻香	王梓涵
+entity_en01.wav	en	Tiananmen Square	Wangfujing|Hongqiao Railway Station
+entity_en02.wav	en	Luckin Coffee	Americano
+entity_en03.wav	en	Hongqiao Railway Station	Wangfujing|Tiananmen Square
+entity_en04.wav	en	Wangfujing	Hongqiao Railway Station|Tiananmen Square
+entity_en05.wav	en	Jay Chou	Americano
+entity_en06.wav	en	Americano	Luckin Coffee
+control_zh01.wav	zh-control		虹桥火车站|五角场|王梓涵|瑞幸咖啡|陆家嘴|周杰伦|稻香
+control_zh02.wav	zh-control		虹桥火车站|五角场|王梓涵|瑞幸咖啡|陆家嘴|周杰伦|稻香
+control_zh03.wav	zh-control		虹桥火车站|五角场|王梓涵|瑞幸咖啡|陆家嘴|周杰伦|稻香
+control_en01.wav	en-control		Tiananmen Square|Luckin Coffee|Hongqiao Railway Station|Wangfujing|Jay Chou|Americano
+control_en02.wav	en-control		Tiananmen Square|Luckin Coffee|Hongqiao Railway Station|Wangfujing|Jay Chou|Americano
+control_en03.wav	en-control		Tiananmen Square|Luckin Coffee|Hongqiao Railway Station|Wangfujing|Jay Chou|Americano

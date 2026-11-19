@@ -254,9 +254,10 @@ partial 的节流：新增音频 ≥ `--partial-ms`（默认 800 ms）且距上�
 - 段落音频由检测器给出，**包含尾部静音**，因此不会出现"客户端切太早、末尾被截断"的问题。
 - 停顿短于 `silence_duration_ms` 不会断句；一句话中间的长停顿会把它切成两段（实测 2 s 停顿
   切出两段，500 ms 停顿不切）。
-- 仍然可以显式 `commit`（例如用户手动结束），服务端会把剩余音频作为最后一段。
-- 每闭合一段，服务端在 `committed` 之前先发一条 **`x.pf.partial`**，`text` 是**到目前为止的累积转写**，
-  `segment` 是本段文本，所以客户端可以用它渲染一行不断变长的字幕，而 `completed` 仍是每段的终稿：
+- 显式 `commit` 会刷新检测器里剩下的音频。成功入队的每段都有自己的 `committed` 和 `item_id`，空刷新返回请求错误。
+- 服务端在段落成功入队时发送 `committed`，之后对同一 `item_id` 发一次 `completed` 或终态 `error`。
+  成功时，`completed` 前会附带 **`x.pf.partial`**。`text` 预览保留最近约 8 KiB 的累积转写，`segment` 是本段。
+  客户端应保留各段终稿以组成完整文本：
 
   ```json
   {"type":"x.pf.partial","item_id":"item_2","text":"把主驾空调调到二十一度别关氛围灯把顶灯关掉",
@@ -534,7 +535,7 @@ asyncio.run(main())
 
 ### 12.5 实时：服务端断句（推荐）
 
-客户端只推音频，服务端在停顿处断句；每段先给 partial（累积 + 本段），再给 committed/completed。
+客户端只推音频，服务端在停顿处断句。先用 `committed` 确认接收，再用对应的 `completed` 读取终稿。
 
 ```python
 import asyncio, base64, json, wave

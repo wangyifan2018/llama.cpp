@@ -18,6 +18,8 @@ REPO=$(cd "$EX/../.." && pwd)
 
 BUILD=${BUILD:-$REPO/build-android-xasr}
 PF_MODELS=${PF_MODELS:-$HOME/models/paraformer}
+PF_VAD_FILE=${PF_VAD_FILE:-$PF_MODELS/silero_vad.onnx}
+PF_WARMUP_WAV=${PF_WARMUP_WAV:-$PF_MODELS/tingting/hvac_zh01.wav}
 CHECK_ONLY=0
 
 OUT=
@@ -42,6 +44,11 @@ BIN=$BUILD/bin/llama-paraformer-api
 # tell you which path was tried.
 MODEL=$PF_MODELS/paraformer-zh-q8_0.gguf
 [ -r "$MODEL" ] || fail "missing model $MODEL (set PF_MODELS to the directory that holds paraformer-zh-q8_0.gguf)"
+python3 "$HERE/fetch_models.py" --out "$PF_MODELS" --only paraformer-zh-q8_0.gguf --verify-only
+[ -r "$PF_VAD_FILE" ] || fail "missing Silero VAD file $PF_VAD_FILE (set PF_VAD_FILE)"
+[ -r "$PF_WARMUP_WAV" ] || fail "missing warmup WAV $PF_WARMUP_WAV (set PF_WARMUP_WAV)"
+VAD_SHA=$(sha256sum "$PF_VAD_FILE" | awk '{print $1}')
+[ "$VAD_SHA" = 2623a2953f6ff3d2c1e61740c6cdb7168133479b267dfef114a4a3cc5bdd788f ] || fail "unexpected Silero VAD SHA-256"
 
 # Libraries: the ggml set plus the DSP skeleton. The skeleton is named per arch
 # and lives next to the ARM64 library of the same name, so both go in one
@@ -56,26 +63,20 @@ shopt -u nullglob
 # without it starts fine and then fails on the DSP with 0x80000406. It is also
 # not in bin/ -- the build puts it next to the hexagon backend source. Look for
 # the v73 target first, because that is what SM6650 reports.
-SKEL=()
-for cand in "$BUILD/ggml/src/ggml-hexagon/libggml-htp-v73.so" \
-            "$BUILD"/ggml/src/ggml-hexagon/libggml-htp-v*.so; do
-    if [ -r "$cand" ]; then
-        SKEL=("$cand")
-        break
-    fi
-done
-[ ${#SKEL[@]} -gt 0 ] || fail "no DSP skeleton (libggml-htp-v73.so) under $BUILD/ggml/src/ggml-hexagon. Without it the service cannot open an HTP session: the failure is a runtime 0x80000406 from the adsp daemon, not a link error."
+SKEL=$BUILD/ggml/src/ggml-hexagon/libggml-htp-v73.so
+CXX=${PF_CXX_SHARED:-$BUILD/ggml/src/ggml-hexagon/ship/libc++_shared.so}
+[ -r "$SKEL" ] || fail "missing SM6650 DSP skeleton $SKEL"
+[ -r "$CXX" ] || fail "missing C++ runtime $CXX (set PF_CXX_SHARED)"
 
 # Sherpa and ONNX Runtime come from the prebuilt SDK, not from this build tree.
 # Look in the places they actually are, in order: an explicit PF_ONNX_DIR, the
 # build tree, then a checkout that has been pulled from a device. The last one
 # matters because the SDK is only staged on the phone in this repo's workflow.
 ONNX_LIBS=()
-for cand in "${PF_ONNX_DIR:-}" "$BUILD/onnx/bin" "$REPO/onnx-sdk/bin"; do
+for cand in "${PF_ONNX_DIR:-}" "$BUILD/onnx/bin" "$REPO/onnx-sdk/bin" /tmp/sherpa/lib; do
     [ -n "$cand" ] || continue
     if [ -r "$cand/libonnxruntime.so" ] && [ -r "$cand/libsherpa-onnx-c-api.so" ]; then
         ONNX_LIBS=("$cand/libonnxruntime.so" "$cand/libsherpa-onnx-c-api.so")
-        ONNX_DIR=$cand
         break
     fi
 done
@@ -84,10 +85,10 @@ if [ ${#ONNX_LIBS[@]} -eq 0 ]; then
   mkdir -p $REPO/onnx-sdk/bin && adb pull /data/local/tmp/llama.cpp/onnx/bin/. $REPO/onnx-sdk/bin/"
 fi
 
-# Optional content. A missing file is reported and skipped, never fatal: the
-# service starts without the console, the profile or the warmup clip.
-opt_dirs=(web)
-opt_files=(hotwords_vehicle.txt cabin_text_rules.tsv)
+HOTWORDS=$EX/hotwords_vehicle.txt
+CONTEXT=$EX/context_vehicle.txt
+RULES=$HERE/cabin_text_rules.tsv
+[ -r "$HOTWORDS" ] && [ -r "$CONTEXT" ] && [ -r "$RULES" ] || fail "missing the cabin accuracy profile"
 
 # ---------------------------------------------------------------- layout
 # Keep the pieces in variables so --check can validate the same names the
@@ -103,7 +104,7 @@ done
 # ---------------------------------------------------------------- check
 say "binary   $BIN"
 say "model    $MODEL"
-say "libs     ${#GGML_LIBS[@]} ggml + ${#SKEL[@]} skeleton + ${#ONNX_LIBS[@]} onnx"
+say "libs     ${#GGML_LIBS[@]} ggml + v73 skeleton + C++ runtime + ${#ONNX_LIBS[@]} onnx"
 say "rc       $RC_SRC"
 say "launcher $LAUNCHER_SRC"
 say "conf     $CONF_SRC"
@@ -112,7 +113,7 @@ say "conf     $CONF_SRC"
 # mismatch would break silently rather than at startup: the binary and libdir.
 grep -q '^PF_BIN=/vendor/bin/llama-paraformer-api$' "$CONF_SRC" \
     || fail "paraformer-asr.conf PF_BIN does not match where this package installs the binary"
-grep -q '^PF_LIBDIR=/vendor/lib64$' "$CONF_SRC" \
+grep -q '^PF_LIBDIR=/vendor/lib64/paraformer$' "$CONF_SRC" \
     || fail "paraformer-asr.conf PF_LIBDIR does not match where this package installs the libraries"
 
 if [ "$CHECK_ONLY" = 1 ]; then
@@ -123,9 +124,11 @@ fi
 [ -n "$OUT" ] || fail "no output directory given"
 
 # ---------------------------------------------------------------- write
-rm -rf "$OUT"
+if [ -e "$OUT" ] && { [ ! -d "$OUT" ] || [ -n "$(ls -A "$OUT")" ]; }; then
+    fail "output must be a new or empty directory: $OUT"
+fi
 mkdir -p "$OUT/system/vendor/bin" \
-         "$OUT/system/vendor/lib64" \
+         "$OUT/system/vendor/lib64/paraformer" \
          "$OUT/system/vendor/etc/init" \
          "$OUT/system/vendor/etc/paraformer" \
          "$OUT/data/vendor/paraformer"
@@ -136,10 +139,8 @@ chmod 0755 "$OUT/system/vendor/bin/paraformer-asr"
 cp "$BIN" "$OUT/system/vendor/bin/llama-paraformer-api"
 chmod 0755 "$OUT/system/vendor/bin/llama-paraformer-api"
 
-cp "${GGML_LIBS[@]}" "$OUT/system/vendor/lib64/"
-cp "${SKEL[@]}" "$OUT/system/vendor/lib64/"
-cp "${ONNX_LIBS[@]}" "$OUT/system/vendor/lib64/"
-chmod 0644 "$OUT/system/vendor/lib64/"*.so
+cp "${GGML_LIBS[@]}" "$SKEL" "$CXX" "${ONNX_LIBS[@]}" "$OUT/system/vendor/lib64/paraformer/"
+chmod 0644 "$OUT/system/vendor/lib64/paraformer/"*.so
 
 cp "$RC_SRC" "$OUT/system/vendor/etc/init/paraformer-asr.rc"
 chmod 0644 "$OUT/system/vendor/etc/init/paraformer-asr.rc"
@@ -149,33 +150,21 @@ chmod 0644 "$OUT/system/vendor/etc/paraformer/paraformer-asr.conf"
 cp "$MODEL" "$OUT/system/vendor/etc/paraformer/"
 chmod 0644 "$OUT/system/vendor/etc/paraformer/paraformer-zh-q8_0.gguf"
 
-for d in "${opt_dirs[@]}"; do
-    if [ -d "$EX/$d" ]; then
-        cp -R "$EX/$d" "$OUT/system/vendor/etc/paraformer/$d"
-        say "packed   $d (console, -PF_WEB_DIR to enable)"
-    else
-        say "skipped  $d (absent)"
-    fi
-done
-for f in "${opt_files[@]}"; do
-    if [ -r "$EX/$f" ]; then
-        cp "$EX/$f" "$OUT/system/vendor/etc/paraformer/$f"
-        say "packed   $f"
-    else
-        say "skipped  $f (absent)"
-    fi
-done
-
-# The install script is generated next to the tree so the checksums it verifies
-# are the ones this run produced, not a stale list.
-( cd "$OUT" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum >SHA256SUMS )
-say "wrote    $OUT/SHA256SUMS"
+assets=$OUT/system/vendor/etc/paraformer
+cp "$HOTWORDS" "$CONTEXT" "$RULES" "$assets/"
+cp "$PF_VAD_FILE" "$assets/silero_vad.onnx"
+cp "$PF_WARMUP_WAV" "$assets/warmup.wav"
+chmod 0644 "$assets/$(basename "$HOTWORDS")" "$assets/$(basename "$CONTEXT")" "$assets/$(basename "$RULES")" \
+    "$assets/silero_vad.onnx" "$assets/warmup.wav"
+cp -R "$EX/web" "$assets/web"
+git -C "$REPO" rev-parse HEAD >"$OUT/SOURCE_REVISION"
+git -C "$REPO" status --porcelain -- examples/paraformer docs/backend/snapdragon/api-reference.md >"$OUT/SOURCE_STATUS"
 
 # Assert the two things a package can silently get wrong. Both have happened:
 # a skeleton that was never copied (runtime 0x80000406 on the DSP, no startup
 # error) and a config whose paths do not match the tree. Checking the tree that
 # was actually written, not the source paths, is what makes this worth running.
-[ -r "$OUT/system/vendor/lib64/$(basename "${SKEL[0]}")" ] \
+[ -r "$OUT/system/vendor/lib64/paraformer/$(basename "$SKEL")" ] \
     || fail "the skeleton did not land in the package"
 [ -r "$OUT/system/vendor/bin/llama-paraformer-api" ] \
     || fail "the server binary did not land in the package"
@@ -209,7 +198,7 @@ mount -o rw,remount /vendor 2>/dev/null || true
 cp -R system/. /
 chmod 0755 /vendor/bin/paraformer-asr /vendor/bin/llama-paraformer-api
 chmod 0644 /vendor/etc/init/paraformer-asr.rc /vendor/etc/paraformer/paraformer-asr.conf
-chmod 0644 /vendor/lib64/*.so
+chmod 0644 /vendor/lib64/paraformer/*.so
 # The service runs as system and must read the model, which is the largest file
 # here; keep it group-readable rather than world-readable.
 chown root:system /vendor/etc/paraformer/paraformer-zh-q8_0.gguf
@@ -229,6 +218,8 @@ fi
 echo "installed; reboot to let init pick up the new .rc"
 INSTALL
 chmod 0755 "$OUT/install.sh"
+( cd "$OUT" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum >SHA256SUMS )
+say "wrote    $OUT/SHA256SUMS"
 
 say "wrote    $OUT/install.sh"
 say ""

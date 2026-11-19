@@ -44,7 +44,7 @@ PF_THREADS=${PF_THREADS:-4}
 [ -r "$PF_MODEL" ] || die "cannot read model $PF_MODEL"
 [ -d "$PF_LIBDIR" ] || die "cannot read library directory $PF_LIBDIR"
 
-mkdir -p "$PF_WORKDIR" "$STATE_DIR" 2>/dev/null
+mkdir -p "$PF_WORKDIR" "$STATE_DIR" 2>/dev/null || die "cannot create launcher work or state directory"
 
 # ---- crash-loop guard ------------------------------------------------------
 # A failed HTP init exits 3, and init restarts the service immediately. Without
@@ -60,18 +60,22 @@ MAX_BACKOFF=${PF_MAX_BACKOFF_SECONDS:-60}
 fails=0
 [ -r "$FAIL_FILE" ] && fails=$(cat "$FAIL_FILE" 2>/dev/null || echo 0)
 case "$fails" in ''|*[!0-9]*) fails=0 ;; esac
+[ "$fails" -le 32 ] 2>/dev/null || fails=32
 
 if [ -r "$START_FILE" ]; then
     last=$(cat "$START_FILE" 2>/dev/null || echo 0)
     case "$last" in ''|*[!0-9]*) last=0 ;; esac
     now=$(date +%s)
     ran=$((now - last))
-    if [ "$last" -gt 0 ] && [ "$ran" -ge "$FAST_FAIL_SECONDS" ]; then
-        # The previous run was healthy for a while; this is a new incident.
-        fails=0
-        printf '0' >"$FAIL_FILE" 2>/dev/null
+    if [ "$last" -gt 0 ]; then
+        if [ "$ran" -ge 0 ] && [ "$ran" -lt "$FAST_FAIL_SECONDS" ]; then
+            [ "$fails" -ge 32 ] || fails=$((fails + 1))
+        else
+            fails=0
+        fi
     fi
 fi
+printf '%s\n' "$fails" >"$FAIL_FILE" || die "cannot persist restart count"
 
 if [ "$fails" -ge 2 ]; then
     backoff=$((1 << (fails - 2)))
@@ -80,7 +84,7 @@ if [ "$fails" -ge 2 ]; then
     sleep "$backoff"
 fi
 
-date +%s >"$START_FILE" 2>/dev/null
+date +%s >"$START_FILE" || die "cannot persist start time"
 
 # ---- environment -----------------------------------------------------------
 # ADSP_LIBRARY_PATH is what lets the adsp daemon find the DSP skeleton
@@ -110,6 +114,9 @@ fi
 if [ -n "${PF_MAX_WS_SESSIONS:-}" ]; then
     set -- "$@" --max-ws-sessions "$PF_MAX_WS_SESSIONS"
 fi
+if [ "${PF_REALTIME_PUNCTUATE:-0}" = "1" ]; then
+    set -- "$@" --realtime-punctuate
+fi
 if [ "${PF_ALLOW_CPU_FALLBACK:-0}" = "1" ]; then
     set -- "$@" --allow-cpu-fallback
 fi
@@ -126,12 +133,21 @@ fi
 if [ -n "${PF_WEB_DIR:-}" ] && [ -d "$PF_WEB_DIR" ]; then
     set -- "$@" --web-dir "$PF_WEB_DIR"
 fi
-if [ -n "${PF_HOTWORDS:-}" ] && [ -r "$PF_HOTWORDS" ]; then
+if [ -n "${PF_HOTWORDS:-}" ]; then
+    [ -r "$PF_HOTWORDS" ] || die "cannot read hotword profile $PF_HOTWORDS"
     # The engine reads these from the environment, not from argv; there is no
     # --hotwords on the API server (that flag exists on the CLI only).
     export PF_HOTWORDS
 fi
-if [ -n "${PF_TEXT_RULES:-}" ] && [ -r "$PF_TEXT_RULES" ]; then
+if [ -n "${PF_CONTEXT:-}" ]; then
+    [ -r "$PF_CONTEXT" ] || die "cannot read context profile $PF_CONTEXT"
+    export PF_CONTEXT
+    if [ "${PF_CONTEXT_MAX_LOGIT_GAP+x}" = x ]; then
+        export PF_CONTEXT_MAX_LOGIT_GAP
+    fi
+fi
+if [ -n "${PF_TEXT_RULES:-}" ]; then
+    [ -r "$PF_TEXT_RULES" ] || die "cannot read text rules $PF_TEXT_RULES"
     export PF_TEXT_RULES
 fi
 if [ -n "${PF_SPEAKER_MODEL:-}" ] && [ -r "$PF_SPEAKER_MODEL" ] && [ -n "${PF_ENROLL_DIR:-}" ] && [ -d "$PF_ENROLL_DIR" ]; then
@@ -140,7 +156,8 @@ if [ -n "${PF_SPEAKER_MODEL:-}" ] && [ -r "$PF_SPEAKER_MODEL" ] && [ -n "${PF_EN
     # has to survive a restart.
     set -- "$@" --voiceprint-file "${PF_VOICEPRINT_FILE:-$PF_WORKDIR/voiceprint.bin}"
 fi
-if [ -n "${PF_VAD_MODEL:-}" ] && [ -r "$PF_VAD_MODEL" ]; then
+if [ -n "${PF_VAD_MODEL:-}" ]; then
+    [ -r "$PF_VAD_MODEL" ] || die "cannot read VAD model $PF_VAD_MODEL"
     set -- "$@" --vad-model "$PF_VAD_MODEL"
 fi
 # Prefer the HTP worker while it is free. Without this a single stream alternates

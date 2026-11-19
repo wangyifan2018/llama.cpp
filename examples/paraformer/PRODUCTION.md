@@ -1,5 +1,29 @@
 # Paraformer production work log
 
+## Mainline audit on SM6650 (2026-11-19)
+
+The reviewed `master` was `5c06d3074e39e01c4ac40e21a7067c8881aabfb7`. The running test service matched the local Android server binary SHA-256 `ac088c7ec17077fdd206d0b2d73b00619afd8060744b9b0aa76815eb78b66e4f` at audit start. It used one HTP and one CPU engine, four threads, HTP-first scheduling, decomposed HTP attention, server VAD available and previews and speaker scoring disabled. Warmup placement was 1704/1704 encoder and 639/639 decoder compute nodes on HTP. The running hotword file was the exact version at `0b2989564^`, before the seven Mandarin conditional additions. The current checked-in hotword file and device test package are separate identities.
+
+| Replay | Requests | Running service P95 | Isolated candidate P95 |
+|---|---:|---:|---:|
+| REST one lane | 8 | 296 ms | 291 ms |
+| REST two lanes | 16 | 309 ms | 301 ms |
+| REST four lanes | 32 | 601 ms | 580 ms |
+| WS client commit, four aligned | 12 | 613 ms | 611 ms |
+| WS client commit, four staggered | 12 | 286 ms | 306 ms |
+| WS client commit, four mixed lengths | 12 | 1210 ms | 1173 ms |
+| WS server VAD, 32 Tingting clips | 32 | 735 ms (one lane) | 741 ms (four staggered lanes) |
+
+The regression gate previously hid errors when a smoke test failed through `tail` or a REST batch completed partly. It now saves and checks each test exit status and request outcome. A deliberate smoke mismatch on the running console stopped the audit until its check used the current `tail_ms` field. The subsequent replay passed all 24 smoke checks. REST with punctuation scored 28/32 on the locked fixture set. The candidate's four-lane Realtime automatic VAD scored 20/32 with one wrong direction on the same WAV bytes, reproducing the result from the single-lane running service. See [Realtime hotword evaluation](HOTWORDS.md) for the comparison and next accuracy experiments.
+
+The review found that automatic VAD assigned a second sequence of item IDs, acknowledged only after inference, and generated an extra `flush` acknowledgement. It also retained the detector after a session closed. The patch puts automatic and manual endpoints through shared admission, enforces the same pending cap and deadline, releases the per-session detector, and charges the configured silence estimate only for an automatic endpoint. Realtime accepted work is included in the shutdown drain until the error or success metrics have been sent. Updated contracts and the dedicated validator are in [the API reference](../../docs/backend/snapdragon/api-reference.md) and [`tools/check_realtime_vad.py`](tools/check_realtime_vad.py).
+
+The vendor package now contains the exact Q8_0 model, Silero VAD model, warmup WAV, hotword profile, literal text rules, ARM64 libraries and v73 DSP skeleton. It uses a private library directory and a checksummed package manifest. `reproduce_deployment.sh` packages before creating an isolated device instance. It stops before launching if an existing Paraformer service owns HTP. Android verified all 22 package digests. The isolated CPU run passed 25/25 smoke checks and the isolated HTP plus CPU candidate passed 24/24 with zero failed requests in the recorded load scenarios. The staged candidate used the current checked-in hotwords. It also scored 28/32 on the REST fixture with zero direction errors. The two HTP instances coexisted on this firmware during the isolated check, so their measurements describe this test environment.
+
+The Realtime VAD replay verified automatic and explicit acknowledgements, mode switching, clear and terminal status on CPU and HTP. The CPU replay with a 20 ms deadline returned three correlated terminal errors. For shutdown, SIGTERM after acknowledging one 9.288 s segment allowed its final and timing payload to reach the client before the socket closed. Target-image init, SELinux and release SLO still require their own test. See [deployment and reproduction](DEPLOY.md).
+
+Raw logs, artifact digests, toolchain identity and both endpoint-level JSONL traces are in `$PF_RUN/mainline-5c06d3074.WOjAJd`.
+
 The deployed form (OpenAI server, HTP default, init service or supervisor loop,
 configuration and acceptance) is defined in [DEPLOY.md](DEPLOY.md). This file is
 the experiment log behind those numbers.

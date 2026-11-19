@@ -26,7 +26,7 @@ CPU 引擎与声纹/VAD 是可选件。
 | 3 | 调度：`--prefer-idle-htp`，CPU worker 只作第二路溢出 | 共享队列让单路每隔一次落 CPU，P95 抖动 |
 | 4 | 引擎数 2、线程 4（`PF_ENGINES=2 PF_THREADS=4`） | 4 线程比 2 线程快 35 ms，RSS 只差 1 MB |
 | 5 | 实时：**服务端 VAD 断句**为默认，`silence_duration_ms=300` | 客户端自切端点会丢末字（16 条里 15 条）；250 ms 会把一句切成两段（11 段 vs 8 段） |
-| 6 | 段落事件：每段先 `x.pf.partial`（累积+本段），再 `committed`+`completed` | 一行不断变长的字幕 + 每段可独立计分 |
+| 6 | `committed` 表示已接收，每个 `item_id` 对应一次 `completed` 或终态 `error` | 自动断句与显式提交使用同一队列、截止时间和编号 |
 | 7 | 段尾静音裁到 150 ms 再推理（不 padding、不补齐整块） | 静音纯解码开销（约 7 ms/60 ms）；补齐不提升精度 |
 | 8 | 精度档随服务部署：`PF_HOTWORDS` + `PF_TEXT_RULES` + 标点 | 同接口无档 65.6%，带档 87.5% |
 | 9 | 声纹：**默认关闭**，只上报 `speaker_score/ok`，不拦截 | TTS 声纹不足以决定拦截；开启后 1–2 路无尾延迟代价（见 §4.2） |
@@ -47,20 +47,20 @@ CPU 引擎与声纹/VAD 是可选件。
 | 测试（无 root） | 现役测试机 | `/data/local/tmp/llama.cpp` 下同一套 launcher + supervisor 循环，`tools/install_local.sh` 安装 |
 
 两者跑的是**同一个 launcher**（`deploy/paraformer-asr.sh`），差别只在谁能提供 init 级重启。
-launcher 负责：读配置、设环境（`LD_LIBRARY_PATH`/`ADSP_LIBRARY_PATH`/`GGML_HEXAGON_*`）、
-拼参数、崩溃退避（连续快速失败指数退避，最长 60 s），最后 `exec` 二进制，让 SIGTERM 直接进入
-服务的优雅退出（先排空已接受请求再关监听）。
+launcher 负责读配置、设环境、设置参数和连续快速重启退避，最后 `exec` 二进制。用 SIGTERM 启动服务的协作排空。整车镜像需要验证其 init 停止时限、SELinux 域和 DSP 权限。 [Android init 语义](https://android.googlesource.com/platform/system/core/+/refs/heads/main/init/README.md)
 
 ### 生产安装
 
 ```sh
 # 1) 打包（不接触设备，只组装 /vendor 树 + manifest + 安装脚本）
-PF_MODELS=$HOME/models/paraformer examples/paraformer/tools/package_device.sh /tmp/pf-pkg
+PF_MODELS=$HOME/models/paraformer PF_VAD_FILE=$HOME/models/paraformer/silero_vad.onnx \
+    examples/paraformer/tools/package_device.sh /tmp/pf-pkg
 
 # 2) 设备（需 root 与可写 /vendor）
 adb root && adb remount
-adb push /tmp/pf-pkg/system/vendor /vendor
-adb shell restorecon -R /vendor/bin /vendor/lib64 /vendor/etc/paraformer
+adb push /tmp/pf-pkg/system/vendor/. /vendor/
+adb shell restorecon -R /vendor/bin/paraformer-asr /vendor/bin/llama-paraformer-api \
+    /vendor/lib64/paraformer /vendor/etc/paraformer /vendor/etc/init/paraformer-asr.rc
 adb shell start paraformer_asr        # 或重启，rc 里 class main 会带起
 adb shell 'cat /data/vendor/paraformer/paraformer-asr.log'
 ```
@@ -90,6 +90,7 @@ examples/paraformer/tools/install_local.sh --with-capabilities   # 加 VAD + 声
 | `PF_ENGINES` | 2 | HTP + CPU 两引擎；无 root 测试机内存紧张时用 1 |
 | `PF_THREADS` | **4** | 见 §4，2 线程会慢 35 ms |
 | `PF_HOTWORDS` | 无 | **必须部署**，否则命令字段从 87.5% 掉到 65.6% |
+| `PF_CONTEXT` / `PF_CONTEXT_MAX_LOGIT_GAP` | 空 | 实验短语表和声学 logit 差值限制，见 [Realtime 热词评测](HOTWORDS.md) |
 | `PF_TEXT_RULES` | 空 | 英文模板/专名重写（`never get to` → `Navigate to`） |
 | `PF_VAD_MODEL` / `PF_SPEAKER_MODEL` + `PF_ENROLL_DIR` | 空 | 可选，各约 +60 MB |
 | `PF_WEB_DIR` | 空 | 测试台目录；生产可不部署 |
@@ -122,8 +123,7 @@ device/state/value 90.5/90.5/100%，zh CER 0.60%，en WER 6.87%，wrong=0。
 
 其它资源事实：
 
-- 单个 HTP 会话**按设备独占**（v73）：服务运行时再起 CLI 会挂在初始化之后，不会报错；
-  要跑 `reproduce.sh device` 先停服务。
+- v73 的第二实例表现取决于固件和系统资源。这个 SM6650 固件能在隔离端口启动第二个实例，旧记录也有第二实例预热卡住的情况。复现脚本默认预留独立测试时段，已有服务可直接用 `accept.sh` 做回放。
 - 设备整机只剩 ~1 GB 时，第二个 HTP 实例会被低内存回收（日志末尾是 `Killed`）。
   一个实例两引擎约 426 MB RSS，HTP 会话另有 3.1 GB vmem 预留。
 
@@ -181,17 +181,16 @@ embedding（约 80 ms，只取前 1.5 s）在 CPU 上并行完成，被 280 ms �
 ```sh
 export PF_MODELS=$HOME/models/paraformer
 python3 examples/paraformer/tools/fetch_models.py --out "$PF_MODELS"   # 首次：取权重并校验 sha256
-examples/paraformer/tools/install_local.sh --with-capabilities          # 首次：铺设备目录（含 VAD/声纹模型）
-examples/paraformer/tools/reproduce_deployment.sh 8899                  # 构建 -> 安装 -> 重启 -> 验收
+export PF_VAD_FILE=$PF_MODELS/silero_vad.onnx
+export PF_SHERPA_SDK=/tmp/sherpa   # inc/c-api.h、lib/libonnxruntime.so、lib/libsherpa-onnx-c-api.so
+examples/paraformer/tools/reproduce_deployment.sh                     # 构建、打包、验哈希、隔离回放
 ```
 
-`reproduce_deployment.sh` 会重编 Android 二进制、安装 launcher 与配置、重启服务，最后跑
-`tools/accept.sh`；后者就是门禁：健康与 HTP 检查、23 项契约、OpenAI 接口精度、1/2 路延迟。
-在 SM6650 上应当看到（与 §4 一致）：
+`reproduce_deployment.sh` 会输出独立运行目录，包含包、源版本、工具链摘要和验收原始结果。已有 Paraformer HTP 进程时，复测脚本退出并保留包。可用 `PF_PACKAGE_ONLY=1` 在主机只构建与打包。`accept.sh` 可直接验收已有服务，校验 32 条夹具哈希并保存 REST 1/2/4 路和 WS 单路、四路同步、错峰、长短混合结果。28/32 和零方向反转为 Tingting 夹具回归门槛。延迟在报告中记录 P95/P99，整车 SLO 由目标环境单独验收。
 
 | 项 | 期望 |
 |---|---|
-| 契约 | 23 checks, 0 failed |
+| 契约 | 普通烟测与自动断句、显式 flush、切换模式和截止时间检查通过 |
 | 命令字段 | 87.5%（device 90.5%，value 100%，zh CER 0.60%，en WER 6.87%） |
 | 1 路 | wall p50/p95 ≈ 280/287 ms |
 | 2 路 | wall p50/p95 ≈ 292/306 ms |
@@ -214,8 +213,7 @@ examples/paraformer/tools/reproduce_deployment.sh 8899                  # 构建
 两种用法，**推荐第一种**：
 
 **a) 连续流 + 服务端断句**（`session.update` 带 `turn_detection.type = "server_vad"`）：
-客户端只推 `input_audio_buffer.append`，服务端 VAD 判定声学停顿后，每次发一对
-`input_audio_buffer.committed` + `...transcription.completed`。结果延迟 = 停顿阈值
+客户端只推 `input_audio_buffer.append`，服务端 VAD 判定声学停顿后，入队即返回 `input_audio_buffer.committed`。客户端按 `item_id` 匹配一次终态和相应的计时。结果延迟包含停顿阈值
 （默认 **300 ms**，`--vad-silence-ms` 或 `silence_duration_ms` 可配）+ 推理（约 280 ms）。
 段落音频含尾部静音，因此不会出现客户端切太早导致的末尾丢字。
 

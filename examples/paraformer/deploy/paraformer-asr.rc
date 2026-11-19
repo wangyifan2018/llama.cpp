@@ -19,24 +19,16 @@
 #     persistent failure from becoming a tight loop that recompiles DSP graphs
 #     forever.
 #
-#   - SIGTERM starts the server's drain: accepted requests finish before the
-#     listener closes. That is why the launcher execs the binary rather than
-#     running it as a child.
+#   - The launcher execs the binary so a supervisor can send SIGTERM for a
+#     cooperative drain. The product image must validate its stop grace.
 
 service paraformer_asr /vendor/bin/paraformer-asr
     class main
     user system
     group system readproc
     priority -10
-    writepid /dev/cpuset/foreground/tasks
-    # Logcat gets the startup lines; the launcher also appends to a file,
-    # because a support engineer reads that after the car has been out all day.
-    stdout_log_level I
-    stderr_log_level I
-    # Restart forever. init has its own backoff for fast crashes; the launcher
-    # adds a longer ramp for repeated HTP init failures.
-    restarts 0
-    restart_period 0
+    # The launcher writes a file. init and the launcher both limit fast retries.
+    restart_period 5
     # A boot-time thermal or DSP hiccup must not take the rest of the boot down
     # with it: the car can be started in a cold garage.
     shutdown critical
