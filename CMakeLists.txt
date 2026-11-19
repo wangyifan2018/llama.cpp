@@ -270,6 +270,10 @@ if (LLAMA_BUILD_MTMD AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
     add_subdirectory(tools/mtmd)
 endif()
 
+if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_EXAMPLES AND TARGET mtmd AND NOT EMSCRIPTEN)
+    add_subdirectory(examples/qwen3-asr-0.6b)
+endif()
+
 llama_apply_app_manifests()
 
 #
