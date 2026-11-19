@@ -154,15 +154,18 @@ ADB=$ANDROID_SDK/platform-tools/adb QWEN_SCHEDULE=idle QWEN_BUDGET_MS=-1 \
 
 两条关键结论：
 
-- **每次图派发约 209 ms**（5026/24）。解码每个 token 一次图，所以 decode 的 10 次约 1.0 s 基本就是
-  派发开销，而不是算力。这也是两路 batching 的收益来源：同样的 token 数，派发次数减半。
-- **`SET_ROWS` 出现 1234 次、每次约 0.6 ms**，累计 750 ms，与 decoder prefill 的 1043 ms 高度重合。
-  音频 embedding 是逐行写进 KV 位置的，每行一次算子。把连续行合成一次 `SET_ROWS`（或直接喂
-  连续 embd 指针块）预计能把 prefill 从约 1.0 s 压到 0.3 s 量级——这是目前单请求最大的一个杠杆，
-  比量化大一个数量级。
+- **派发成本按图区分**：两次 prefill 的 `OPBATCH` 分别是 **0.76 s 和 0.96 s**，而 22 次 decode 的
+  `OPBATCH` 是 **50–100 ms 每次**。单请求 2.7 s 的构成因此是：音频 encoder 图约 0.78 s、prefill 图约
+  0.96 s、10 个 decode 步约 0.7–1.0 s——**解码基本是派发受限，不是算力受限**。
+- **`SET_ROWS` 是 KV cache 的逐行写入，不是音频 embedding**（先前记错，此处更正）：形状直方图显示
+  560 次 `1:1024 x 1024:1 x 1:2097152` 与 560 次 `1024:1 x 1:1 x 1024:2048`，正好是 28 层 x 2（K/V）
+  x 20 个 decode 步；另有 56 次 `1024:54`，是两次 prefill 的 54 行 K/V 写入。也就是每层每 token
+  一次散布写，单行约 0.6 ms、54 行一次约 10 ms。
 
 ### 下一步（按收益排序）
 
-1. 合并音频 embedding 的 `SET_ROWS`（预计 −700 ms prefill，需改 llama-graph 的 embd 行写入）。
-2. 让解码少派发：两路共享一次图（已有），进一步把 prefill 与 decode 合并进同一次派发。
+1. **降低每 token 的派发开销**（当前 50–100 ms/步）：单请求最大的一块，方向是同一形状的 decode 图
+   跨步复用、以及 `GGML_HEXAGON_OPBATCH` 一类批处理参数；每步 `OPBATCH` 时间可直接用 profile 量到。
+2. **把 prefill 的 KV 写入变连续**：54 行是连续 idxs，用一次连续拷贝代替 56 次散布写，目标是压
+   0.96 s 的 prefill 图。
 3. 量化维持 Q4_K（−27% decode），但要用 F16 源重量化，避免 q8→q4 的二次损失。
