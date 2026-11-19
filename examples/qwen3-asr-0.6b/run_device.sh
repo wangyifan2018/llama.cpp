@@ -51,22 +51,52 @@ trap 'exit 143' TERM
 "${adb[@]}" push "$out/device-expected.sha256" "$remote/"
 "${adb[@]}" shell -T "cd '$remote' && sha256sum -c device-expected.sha256 && chmod 755 llama-qwen3-asr-batch" >"$out/device-verified.txt"
 
+# Batch 2 adds a scheduling dimension. QWEN_SCHEDULE picks the policy and
+# QWEN_BUDGET_MS bounds one round of prefill (only used by "interleaved").
+SCHEDULE="${QWEN_SCHEDULE:-blocking}"
+BUDGET_MS="${QWEN_BUDGET_MS:--1}"
+
 run() {
-    local slots=$1 trace=$2 prefix=$3 mode=$4
-    "${adb[@]}" shell -T "cd '$remote' && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=\$PWD GGML_HEXAGON_DEVICES=HTP0:0 $mode ./llama-qwen3-asr-batch model.gguf projector.gguf HTP0:0 $slots $trace.tsv" \
+    local variant=$1 trace=$2 prefix=$3 profile_env=$4
+    local slots=2 policy=eager conv=im2col
+    case "$variant" in
+        1) slots=1 ;;
+        2) ;;
+        windowed) policy=windowed ;;
+        weight-first) conv=weight-first ;;
+        windowed-weight-first) policy=windowed; conv=weight-first ;;
+        packed) policy=packed ;;
+        gather) conv=gather ;;
+        packed-gather) policy=packed; conv=gather ;;
+    esac
+    "${adb[@]}" shell -T "cd '$remote' && LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=\$PWD GGML_HEXAGON_DEVICES=HTP0:0 MTMD_QWEN3A_CONV=$conv $profile_env ./llama-qwen3-asr-batch model.gguf projector.gguf HTP0:0 $slots $trace.tsv 96 $policy $SCHEDULE $BUDGET_MS" \
         >"$out/$prefix.jsonl" 2>"$out/$prefix.log"
 }
 
+modes=(1 2)
+case "${QWEN_PHASE2:-0}" in
+    0) ;;
+    1) modes+=(windowed weight-first windowed-weight-first) ;;
+    packed) modes+=(packed) ;;
+    gather) modes+=(packed gather packed-gather) ;;
+    *) echo 'QWEN_PHASE2 must be 0, 1, packed, or gather' >&2; exit 2 ;;
+esac
 for ((round=1; round <= rounds; round++)); do
     for trace in simultaneous staggered refill; do
-        order=(1 2)
-        if ((round % 2 == 0)); then order=(2 1); fi
-        for slots in "${order[@]}"; do
-            echo "$trace slots=$slots round=$round"
-            run "$slots" "$trace" "$trace.$slots.$round" ""
+        for ((i=0; i<${#modes[@]}; i++)); do
+            index=$i
+            if ((round % 2 == 0)); then index=$((${#modes[@]} - 1 - i)); fi
+            variant=${modes[index]}
+            echo "$trace $variant round=$round"
+            run "$variant" "$trace" "$trace.$variant.$round" ""
         done
     done
 done
 if [[ "${QWEN_PROFILE:-0}" == 1 ]]; then
     run 2 simultaneous profile "GGML_HEXAGON_PROFILE=1 GGML_SCHED_DEBUG=2"
+    case "${QWEN_PHASE2:-0}" in
+        1) run weight-first simultaneous profile.weight-first "GGML_HEXAGON_PROFILE=1 GGML_SCHED_DEBUG=2" ;;
+        packed) run packed simultaneous profile.packed "GGML_HEXAGON_PROFILE=1 GGML_SCHED_DEBUG=2" ;;
+        gather) run packed-gather simultaneous profile.packed-gather "GGML_HEXAGON_PROFILE=1 GGML_SCHED_DEBUG=2" ;;
+    esac
 fi

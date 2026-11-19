@@ -40,3 +40,81 @@ rg 'HTP0:0 profile-op MUL_MAT\|output\.weight.*x 1024:2 ->' profile.log
 ```sh
 python3 examples/qwen3-asr-0.6b/compare.py /path/to/extracted/device-final 3
 ```
+## 第二批：调度策略与首个终稿延迟（2026-11-19）
+
+基线是第一批的 blocking 调度（两路档，同一二进制/权重/夹具）。本批加了三件事：把一次请求的
+prefill 拆成可计时的三段、把“两次 decode 之间算谁的”变成可选策略、用同一 trace 做四档对照。
+
+### 分阶段分解（每请求中位数，SM6650）
+
+| 轨迹 | 策略 | log-Mel | 音频 encoder | decoder prefill | prefill 合计 |
+|---|---|---:|---:|---:|---:|
+| simultaneous | blocking | 7 | 789 | 1044 | 1840 |
+| staggered | blocking | 6 | 792 | 1039 | 1837 |
+| refill | blocking | 8 | 800 | 1045 | 1835 |
+| simultaneous | idle | 6 | 789 | 1044 | 1842 |
+
+结论：**log-Mel 可以忽略（约 7 ms）**，一次请求的阻塞几乎都由音频 encoder（约 790 ms，占 43%）
+和 decoder prefill（约 1040 ms，占 57%）构成。音频 encoder 在 mtmd 里是**整块**的：一个 chunk
+交进去，出来才返回，所以它是当前不可切分的地板。
+### 四档对照（2 轮，capacity 2，串行对照做 token 校验）
+
+| 轨迹 | 策略 | 总耗时 ms | 首条终稿 ms | P50 | P95 | P99 | decode 次数 | 配对次数 | token 一致 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---|
+| simultaneous | blocking | 5408 | 5055 | 5235 | 5417 | 5420 | 13 | 9 | ok |
+| simultaneous | decode-first | 5417 (+8 / +10) | 5065 | 5244 | 5419 | 5420 | 13 | 9 | ok |
+| simultaneous | interleaved | 5681 (+273 / −69) | 4986 | 5332 | 5696 | 5701 | 16 | 6 | ok |
+| simultaneous | **idle** | 6162 (+754 / **−2087**) | **2968** | 4568 | 6163 | 6164 | 22 | 0 | ok |
+| staggered | blocking | 5642 | 5071 | 5206 | 5347 | 5348 | 15 | 9 | ok |
+| staggered | decode-first | 5512 (−131 / −114) | 4957 | 5073 | 5282 | 5306 | 15 | 9 | ok |
+| staggered | interleaved | 5893 (+251 / −79) | 4992 | 5294 | 5602 | 5605 | 18 | 6 | ok |
+| staggered | **idle** | 6380 (+738 / **−2131**) | **2940** | 4510 | 6083 | 6083 | 24 | 0 | ok |
+| refill | blocking | 13313 | 9477 | 12974 | 13022 | 13029 | 27 | 23 | ok |
+| refill | decode-first | 13331 (+18 / +15) | 9492 | 12970 | 13060 | 13070 | 27 | 23 | ok |
+| refill | interleaved | 13777 (+464 / +339) | 9816 | 12766 | 13527 | 13566 | 33 | 17 | ok |
+| refill | **idle** | 15182 (+1869 / −917) | **8560** | 11752 | 14894 | 14903 | 50 | 0 | ok |
+
+括号内是相对 blocking 的 (总耗时 / 首条终稿)。
+### 结论
+
+1. **首条终稿延迟是被“新请求的整段 prefill”顶起来的**，不是解码慢。blocking 下新请求的 1.84 s
+   prefill 插在活跃序列两次 decode 之间，首条约 5.0 s；`idle` 让新请求等活跃序列结束再开始，
+   首条降到 **2.94–2.97 s（−41%）**，P50 也从 5.24 s 降到 4.57 s。
+2. **代价是吞吐**：`idle` 的配对次数为 0（完全没有 continuous batching），总耗时 +14%，
+   P95/P99 反而变差（6163 对 5417）。
+3. **`interleaved`（每轮只推进一个 prefill chunk）只省 70–80 ms**，因为最大的一块是 790 ms 的
+   音频 encoder，chunk 粒度上它依然不可分；它把 decoder prefill 摊开，但对首条帮助有限，
+   refill 轨迹下总耗时还多 464 ms。
+4. **`decode-first` 基本中性**（staggered 上 −131 ms，其余 ±10 ms）：只是把一次 decode 提到
+   prefill 之前，改变不了 1.84 s 的阻塞长度。
+5. 四档 **逐 token 与串行对照完全一致**；补位（refill 中第三条与活跃序列配对）在 blocking /
+   decode-first / interleaved 下都发生（配对次数 17–23），idle 下按定义不发生。
+
+### 适用区间与取舍
+
+- 适用：2 slot、2–3 条请求、约 2 s 音频、SM6650（v73、2 HVX、无 HMX）。超过 3 条请求、
+  长音频或 4 slot 未测。
+- 产品取舍：要“第一声尽快有答案”（唤醒后立刻回）就用 `idle`，接受总耗时 +14% 与 P95 变差；
+  要吞吐就留在 `blocking`；`interleaved` 只有在音频 encoder 可切分之后才有意义。
+- 下一步的结构性杠杆是 **把音频 encoder 切成可中断的 chunk**：那 790 ms 是目前唯一挡在
+  “首条更快”前面的东西，文本 prefill 已经可以摊开。
+### 留档与复算
+
+`~/Library/Caches/qwen3-asr-htp/qwen3-asr-0.6b-batch2-schedule-sm6650-2026-11-19.tar.gz`（796 KB，
+SHA-256 `25ef540d8b263566e0aa84c612260b0be93eb6d31c392b016f0d8e029a59b3c6`）包含四档目录、
+每条 trace 的 capacity 1/2 JSONL 与 stderr、`schedule-report.json`、设备指纹与 `host.sha256`。
+
+```sh
+mkdir -p /tmp/qwen-b2 && tar -xzf <archive> -C /tmp/qwen-b2
+python3 examples/qwen3-asr-0.6b/compare_schedules.py --dir /tmp/qwen-b2   # 重算上面两张表
+```
+
+设备段（换 `QWEN_SCHEDULE` 即换档，`QWEN_BUDGET_MS` 只对 interleaved 生效，-1 表示每轮一个 chunk）：
+
+```sh
+ADB=$ANDROID_SDK/platform-tools/adb QWEN_SCHEDULE=idle QWEN_BUDGET_MS=-1 \
+  examples/qwen3-asr-0.6b/run_device.sh build-android-xasr \
+    "$CACHE/Qwen3-ASR-0.6B-Q8_0.gguf" "$CACHE/mmproj-Qwen3-ASR-0.6B-Q8_0-convout-q8.gguf" \
+    "$NDK/toolchains/llvm/prebuilt/darwin-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" \
+    /tmp/qwen-b1/fixtures /tmp/qwen-b2/idle 2
+```

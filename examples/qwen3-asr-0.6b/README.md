@@ -70,3 +70,23 @@ python3 "$QA_EX/compare.py" "$QA_OUT/device" 3 >"$QA_OUT/device/summary.json"
 基准覆盖同时到达、300 ms 错峰和第三条等待后补位。比较器检查 slot 生命周期、两路真实 decode 调用、第三条确实与仍活跃的序列组成 batch，以及每个请求的输出 token 一致性。按到达至终稿计算延迟和 P50/P95/P99。总时长从 trace 开始至全部完成，吞吐为请求数除以总时长的中位数。每轮用新进程和同一预热语段，单双路执行顺序交替。profiling 单独执行。
 
 [SM6650 实测记录](BENCHMARK.md)包含串行与双路的 A/B 结果、调度与 HTP 算子证据，以及可解包复测的夹具和原始日志位置。
+
+## 调度策略（第二批）
+
+第 9、10 个参数选择“两次 decode 之间算谁的”：
+
+```text
+llama-qwen3-asr-batch MODEL MMPROJ CPU|HTP0:0 SLOTS TRACE.tsv \
+    [MAX_TOKENS [eager|windowed|packed [blocking|decode-first|interleaved|idle [PREFILL_BUDGET_MS]]]]
+```
+
+| 策略 | 行为 |
+|---|---|
+| `blocking` | 默认，第一批的行为：新请求的整段 prefill 插在活跃序列两次 decode 之间 |
+| `decode-first` | 先 decode 再 prefill，prefill 仍整段 |
+| `interleaved` | 每轮只推进一个 prefill chunk（`PREFILL_BUDGET_MS` 为毫秒预算，-1 表示一个 chunk） |
+| `idle` | 有活跃序列时不启动新 prefill，只在其结束后开始 |
+
+实测（SM6650，2 slot，2–3 条请求）：`idle` 把首条终稿从 5.07 s 降到 2.94 s（−41%），代价是总耗时
++14%、P95 变差、配对次数归零；`interleaved` 只省 70–80 ms，因为 790 ms 的音频 encoder 在 mtmd 里
+仍是一块。完整对照与分阶段分解见 [BENCHMARK.md](BENCHMARK.md#第二批调度策略与首个终稿延迟2026-11-19)。
