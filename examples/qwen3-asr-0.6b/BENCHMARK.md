@@ -210,3 +210,32 @@ encoder 的 1366 ms 里，**三层 conv2d 占 654 ms**：`a.conv2d.1` 82 ms、`a
 
 flash 开把 prefill 砍掉 282 ms；再叠 Q4_K（decode −27%），单请求从 2.98 s 降到 **2.35 s（−21%）**。
 `QWEN_FLASH_ATTN=0` 可回到旧档。
+
+### OPBATCH 是什么，静态图/补齐有没有用（2026-11-20）
+
+`OPBATCH` 是 Hexagon 后端把**一张图的所有计算算子打包成一条 FastRPC 消息**交给 DSP 执行，
+profile 打出的 `n-ops` 与 `usec` 就是这次打包执行在 DSP 上的时间。它**不是**因为图尺寸变化而重发：
+后端按 `graph->uid` 缓存了 op 节点（`GGML_HEXAGON_TIMING=1` 里 `cached 1`），CPU 侧 enqueue 一张
+734 op 的 decode 图只要 **2.6 ms**，process 之后的 synchronize 只有 **0.01 ms**，而每步 `llama_process`
+是 100–115 ms，profile 里对应步的 `OPBATCH` 是 50–100 ms——时间在 DSP 执行里。
+
+所以“静态图 + 补齐”对这版栈没有收益：
+
+| 设想 | 实际情况 | 结论 |
+|---|---|---|
+| decode 用固定形状图，省重建 | 同一 trace 跑两轮总耗时 2980 / 2987 ms（<1%）；op 节点已缓存 | 已经是静态的，没有可省的 |
+| encoder 补齐到固定长度 | encoder 耗时随帧数线性：2.65 s 音频 778 ms，8.3 s 音频 **3190 ms**（4.1×） | 短音频被补齐后要付最长音频的钱，**负收益** |
+| 固定形状省调度重规划 | enqueue 2.6 ms，占每步 100 ms 的 2.6% | 可忽略 |
+
+长音频的对照（同一条命令重复 3 次拼成 8.3 s，Q8_0 + flash）：encode 3190 ms、decoder prefill 2017 ms、
+终稿 7526 ms——两个阶段都线性于音频长度，这也说明“补齐到定长”只会让短请求变慢。
+
+### 量化精度：q8 源二次量化到 Q4_K 的对照
+
+| 夹具 | Q8_0 | Q4_K | 一致 |
+|---|---|---|---|
+| zh | 请导航到上海虹桥机场。 | 同左 | ✓ |
+| en | Set the cabin temperature to twenty-two degrees. | 同左 | ✓ |
+| de | Navigiere bitte zum Berliner Hauptbahnhof. | 同左 | ✓ |
+
+三条夹具逐字一致（注意这是从 Q8_0 再量化，不是 F16 源；F16 源需要原始 checkpoint，本机没有）。
