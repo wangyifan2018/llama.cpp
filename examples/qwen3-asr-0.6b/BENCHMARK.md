@@ -118,3 +118,51 @@ ADB=$ANDROID_SDK/platform-tools/adb QWEN_SCHEDULE=idle QWEN_BUDGET_MS=-1 \
     "$NDK/toolchains/llvm/prebuilt/darwin-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" \
     /tmp/qwen-b1/fixtures /tmp/qwen-b2/idle 2
 ```
+
+## 单请求优化：量化、打包与 HTP 算子剖析（2026-11-20）
+
+基线：一条 2.2 s 中文命令，`blocking`、capacity 2、单请求，SM6650。
+
+| 权重 / 打包 | 终稿 ms | 首 token ms | 音频 encoder | decoder prefill | decode 合计 |
+|---|---:|---:|---:|---:|---:|
+| Q8_0 / eager | 2980 | 1853 | 792 | 1043 | 1024 |
+| Q8_0 / packed | 2892 | 1766 | 786 | 969 | 1036 |
+| Q5_K / eager | 2958 | 2037 | 790 | 1235 | 835 |
+| Q4_K / eager | 2766 | 1942 | 791 | 1142 | **744** |
+| **Q4_K / packed** | **2710** | 1884 | 779 | 1096 | 743 |
+| Q8_0 + Q4_K projector | 2949 | 1839 | 786 | 1040 | 1023 |
+
+结论：
+
+1. **量化只赚解码**：Q4_K 把 decode 从 1024 ms 降到 744 ms（−27%，解码是权重带宽受限），
+   但 decoder prefill 反而 +99 ms（GEMM 变慢）。净收益 −214 ms（−7%）。这跟 Paraformer 上
+   看到的“4-bit 只在 M=1 有利”是同一个规律。
+2. **projector 量化无效**（786 对 792 ms）：requant 只量化了 19 个张量，其余仍是 F16，音频 encoder
+   是计算受限而不是带宽受限。
+3. **packed 打包**把 decoder prefill 从 1043 降到 969 ms（−74 ms），首 token 提前 87 ms。
+
+### HTP 算子剖析（`GGML_HEXAGON_PROFILE=1`，一次完整运行）
+
+| 算子 | 次数 | 累计 ms | 占比 |
+|---|---:|---:|---:|
+| OPBATCH（每次图的派发） | 24 | 5026 | 50.1% |
+| MUL_MAT | 1740 | 2564 | 25.5% |
+| SET_ROWS | **1234** | **750** | 7.5% |
+| MUL_MAT_NX | 1158 | 620 | 6.2% |
+| MUL_MAT+ADD | 1214 | 490 | 4.9% |
+| IM2COL | 6 | 290 | 2.9% |
+
+两条关键结论：
+
+- **每次图派发约 209 ms**（5026/24）。解码每个 token 一次图，所以 decode 的 10 次约 1.0 s 基本就是
+  派发开销，而不是算力。这也是两路 batching 的收益来源：同样的 token 数，派发次数减半。
+- **`SET_ROWS` 出现 1234 次、每次约 0.6 ms**，累计 750 ms，与 decoder prefill 的 1043 ms 高度重合。
+  音频 embedding 是逐行写进 KV 位置的，每行一次算子。把连续行合成一次 `SET_ROWS`（或直接喂
+  连续 embd 指针块）预计能把 prefill 从约 1.0 s 压到 0.3 s 量级——这是目前单请求最大的一个杠杆，
+  比量化大一个数量级。
+
+### 下一步（按收益排序）
+
+1. 合并音频 embedding 的 `SET_ROWS`（预计 −700 ms prefill，需改 llama-graph 的 embd 行写入）。
+2. 让解码少派发：两路共享一次图（已有），进一步把 prefill 与 decode 合并进同一次派发。
+3. 量化维持 Q4_K（−27% decode），但要用 F16 源重量化，避免 q8→q4 的二次损失。
