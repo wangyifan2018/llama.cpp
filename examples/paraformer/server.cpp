@@ -317,7 +317,7 @@ int main(int argc, char** argv) {
     if (!device_set) {
         const bool htp = pf_htp_present();
         device = pf_default_device();
-        pf_report_device(device, htp, false);
+        pf_report_device(device, htp, false, /*service=*/true);
     }
     const bool device_accel = std::strcmp(device, "CPU") != 0;
 

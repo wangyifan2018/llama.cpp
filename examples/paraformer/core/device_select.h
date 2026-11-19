@@ -38,11 +38,19 @@ inline const char* pf_default_device() {
 // Report the choice once. `have_htp` is separate from the returned name so the
 // message can distinguish "no HTP device registered" from "HTP disabled by a
 // flag", which are different failures to debug.
-inline void pf_report_device(const char* device, bool htp_present, bool suppressed) {
+inline void pf_report_device(const char* device, bool htp_present, bool suppressed, bool service = false) {
     if (std::strcmp(device, "CPU") != 0) {
         std::fprintf(stderr, "pf: --device not given, using %s (pass --device CPU to force CPU)\n", device);
     } else if (htp_present && suppressed) {
         std::fprintf(stderr, "pf: --device not given, staying on CPU (HTP available but suppressed)\n");
+    } else if (service) {
+        // The server refuses to start without an HTP engine unless
+        // --allow-cpu-fallback is given, so on a host build this line is
+        // followed by that refusal. Say why, otherwise the two lines look
+        // contradictory: "using CPU" and then "refusing to serve on CPU only".
+        std::fprintf(stderr,
+                     "pf: --device not given, using CPU (no HTP device registered; "
+                     "a service run needs --allow-cpu-fallback on this host)\n");
     } else {
         std::fprintf(stderr, "pf: --device not given, using CPU (no HTP device registered)\n");
     }
