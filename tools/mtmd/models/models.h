@@ -386,8 +386,8 @@ struct mtmd_graph_qwen3tts_spkenc : mtmd_graph {
 };
 
 struct mtmd_graph_qwen3tts_gen : mtmd_graph {
-    mtmd_graph_qwen3tts_gen(mtmd_subcontext * ctx, const mtmd_image_f32 & img, mtmd_subctx_gen_process gen_process, int top_k, float top_p)
-        : mtmd_graph(ctx, img), gen_process(gen_process), top_k(top_k), top_p(top_p) {}
+    mtmd_graph_qwen3tts_gen(mtmd_subcontext * ctx, const mtmd_image_f32 & img, mtmd_subctx_gen_process gen_process, int top_k, float top_p, int n_frames)
+        : mtmd_graph(ctx, img), gen_process(gen_process), top_k(top_k), top_p(top_p), n_frames(n_frames) {}
     ggml_cgraph * build() override;
 
     // which sub-graph build() constructs, fixed at graph-build time
@@ -396,6 +396,10 @@ struct mtmd_graph_qwen3tts_gen : mtmd_graph {
     // sampling params, fixed at graph-build time (GEN_CODE only)
     int   top_k;
     float top_p;
+
+    // GEN_WAV only: frames decoded per graph. the attention window stays hparams.wav_tfm_swa,
+    // only the batch of new frames shrinks, so the graph no longer computes the whole window
+    int n_frames;
 
     //
     // code_gen: backbone hidden state + sampled code0 -> 16 RVQ codes
@@ -413,18 +417,16 @@ struct mtmd_graph_qwen3tts_gen : mtmd_graph {
         ggml_tensor * do_sampling(ggml_tensor * logits, ggml_tensor * inp_rand) const;
 
         ggml_tensor * const_i32(ggml_tensor * anchor, float value) const;
-        ggml_tensor * causal_mask_row(int64_t n_kv_pad, int pos) const;
         ggml_tensor * project_in(ggml_tensor * cur) const;
 
+        // k/v grow by one row per position, so the attention sees exactly the valid prefix and
+        // needs no mask; k_acc/v_acc are nullptr until the first position writes them
         ggml_tensor * layer_forward(
                 ggml_tensor * cur,
                 const mtmd_layer & layer,
                 ggml_tensor * inp_pos,
-                ggml_tensor * kq_mask,
-                ggml_tensor *& k_cache_layer,
-                ggml_tensor *& v_cache_layer,
-                int64_t n_kv_pad,
-                int pos,
+                ggml_tensor *& k_acc,
+                ggml_tensor *& v_acc,
                 int il) const;
 
         void prefill(
@@ -456,7 +458,9 @@ struct mtmd_graph_qwen3tts_gen : mtmd_graph {
         mutable std::vector<std::pair<std::string, ggml_tensor *>> state_out;
 
         // stateful conv ops: read/update their state via state_in/state_out[state_name]
-        ggml_tensor * causal_conv1d(ggml_tensor * x, ggml_tensor * w, ggml_tensor * b, int dilation, const std::string & state_name) const;
+        ggml_tensor * causal_conv1d(ggml_tensor * x, ggml_tensor * w, ggml_tensor * b, int dilation, const std::string & state_name, int K_hint = 0) const;
+    // kernel folded to [K*IC, OC], K passed explicitly (7 for the residual convs, 1 for the pointwise)
+    ggml_tensor * causal_conv1d_folded(ggml_tensor * x, ggml_tensor * w, ggml_tensor * b, int K, int dilation, const std::string & state_name) const;
         ggml_tensor * causal_conv1d_dw(ggml_tensor * x, ggml_tensor * w, ggml_tensor * b, const std::string & state_name) const;
         ggml_tensor * causal_conv_transpose1d(ggml_tensor * x, ggml_tensor * w, ggml_tensor * b, int stride, const std::string & state_name) const;
         ggml_tensor * snake(ggml_tensor * x, ggml_tensor * alpha, ggml_tensor * beta) const;

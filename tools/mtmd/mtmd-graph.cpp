@@ -1048,7 +1048,10 @@ std::unique_ptr<mtmd_graph> mtmd_get_graph_builder(mtmd_subcontext * ctx, const 
                 const auto  gen_process = params ? params->gen_process : MTMD_SUBCTX_GEN_PROCESS_GEN_CODE;
                 const int   top_k = params ? params->top_k : 50;
                 const float top_p = params ? params->top_p : 1.0f;
-                builder = std::make_unique<mtmd_graph_qwen3tts_gen>(ctx, img, gen_process, top_k, top_p);
+                const int64_t n_cb = ctx->model.gen_code_head_w->ne[2] + 1;
+                const int   n_frames = params && params->codes && gen_process == MTMD_SUBCTX_GEN_PROCESS_GEN_WAV
+                                     ? (int) (params->codes->size() / n_cb) : 1;
+                builder = std::make_unique<mtmd_graph_qwen3tts_gen>(ctx, img, gen_process, top_k, top_p, n_frames);
             } break;
         case PROJECTOR_TYPE_SOPRANO:
             {

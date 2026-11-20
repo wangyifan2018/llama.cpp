@@ -8,8 +8,10 @@
 #include "mtmd-helper.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 /**
  * Please note that this is NOT a production-ready binary.
@@ -148,6 +150,8 @@ int main(int argc, char ** argv) {
     inp.prompt_len  = prompt.size();
     inp.speaker_ref = speaker_bitmap.get();
     inp.lang        = params.tts_lang.c_str();
+    // TTS_STREAM=1 emits audio as soon as a chunk is ready, for latency measurements
+    inp.stream      = getenv("TTS_STREAM") != nullptr;
     inp.top_k       = params.sampling.top_k;
     inp.top_p       = params.sampling.top_p;
     inp.seed        = params.sampling.seed;
@@ -180,8 +184,12 @@ int main(int argc, char ** argv) {
 
     // note: some pipelines ignore this token and use the hidden state instead
     auto sample_semantic_code = [&]() -> llama_token {
+        const int64_t t0 = ggml_time_us();
         llama_token t = common_sampler_sample(smpl, lctx, -1);
         common_sampler_accept(smpl, t, true);
+        if (getenv("TTS_TRACE")) {
+            LOG_WRN("[trace] sample %.2f ms\n", (ggml_time_us() - t0) / 1e3);
+        }
         return t;
     };
 
@@ -193,15 +201,23 @@ int main(int argc, char ** argv) {
     tts_timings timings;
     const int64_t t_gen_start_us = ggml_time_us();
 
+    std::vector<char> streamed;
+    int64_t t_first_audio_us = 0;
+    int64_t n_samples_total  = 0;
+
     bool stop = false;
     while (!stop && n_frames < max_new) {
         const float * h_next = nullptr;
 
         // stage 2+3: semantic --> acoustic details --> audio waveform
         //            step_gen() runs both stages and returns new h_state for next step
+        const int64_t t_step0 = ggml_time_us();
         if (gen.step_gen(sampled, h_state, &h_next, &stop) != 0) {
             LOG_ERR("step_gen failed at frame %d\n", n_frames);
             return 1;
+        }
+        if (getenv("TTS_TRACE")) {
+            LOG_WRN("[trace] step_gen total %.2f ms\n", (ggml_time_us() - t_step0) / 1e3);
         }
         if (!h_next) {
             break; // stopped without generating a frame
@@ -211,6 +227,25 @@ int main(int argc, char ** argv) {
         h_state = h_next;
         sampled = sample_semantic_code();
         timings.report(n_frames);
+
+        if (inp.stream) {
+            int32_t      sr  = 0;
+            const char * d   = nullptr;
+            size_t       len = 0;
+            int64_t      ns  = 0;
+            if (gen.get_output(&sr, &d, &len, &ns) != 0) {
+                LOG_ERR("get_output failed at frame %d\n", n_frames);
+                return 1;
+            }
+            if (ns > 0) { // ns counts real PCM samples, the first chunk in stream mode is a bare WAV header
+                if (t_first_audio_us == 0) {
+                    t_first_audio_us = ggml_time_us();
+                    LOG_INF("[trace] first audio at frame %d (%zu bytes, %lld samples)\n", n_frames, len, (long long) ns);
+                }
+                streamed.insert(streamed.end(), d, d + len);
+                n_samples_total += ns;
+            }
+        }
     }
     const double t_gen_s = (ggml_time_us() - t_gen_start_us) / 1e6;
 
@@ -219,11 +254,27 @@ int main(int argc, char ** argv) {
     size_t       data_len    = 0;
     int64_t      n_samples   = 0;
     const int64_t t_wav_start_us = ggml_time_us();
+    if (inp.stream && gen.flush() != 0) {
+        LOG_ERR("flush failed\n");
+        return 1;
+    }
     if (gen.get_output(&sample_rate, &data, &data_len, &n_samples) != 0) {
         LOG_ERR("get_output failed\n");
         return 1;
     }
     const double t_wav_s = (ggml_time_us() - t_wav_start_us) / 1e6;
+    if (inp.stream) {
+        if (n_samples > 0) {
+            if (t_first_audio_us == 0) {
+                t_first_audio_us = ggml_time_us();
+            }
+            streamed.insert(streamed.end(), data, data + data_len);
+            n_samples_total += n_samples;
+        }
+        data     = streamed.data();
+        data_len = streamed.size();
+        n_samples = n_samples_total;
+    }
 
     LOG_INF("generated %d frames, %zu bytes of WAV audio (%d Hz)\n", n_frames, data_len, sample_rate);
 
@@ -233,6 +284,11 @@ int main(int argc, char ** argv) {
     LOG_INF("timings: prompt eval %.2fs + generation %.2fs + vocoder %.2fs = total %.2fs\n",
             t_prompt_s, t_gen_s, t_wav_s, t_total_s);
     LOG_INF("         output audio = %.2fs (audio time = %.2fx process time)\n", audio_s, t_total_s > 0 ? audio_s / t_total_s : 0.0);
+    if (t_first_audio_us > 0) {
+        const double ttfa_s = (t_first_audio_us - t_prompt_start_us) / 1e6;
+        LOG_INF("         TTFA = %.3fs, RTF = %.3f%s\n", ttfa_s, t_total_s > 0 ? t_total_s / audio_s : 0.0,
+                inp.stream ? " (streaming)" : "");
+    }
     FILE * f = fopen(params.out_file.c_str(), "wb");
     if (!f) {
         LOG_ERR("failed to open %s\n", params.out_file.c_str());

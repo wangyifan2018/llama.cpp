@@ -273,6 +273,9 @@ public:
 
         pos = 0;
         const mtmd_gen_inp def = mtmd_gen_inp_default(mctx);
+        if (getenv("TTS_CHUNK")) {
+            LOG_WRN("[trace] chunk = %zu frames\n", window_frames);
+        }
         top_k = inp->top_k > 0 ? inp->top_k : def.top_k;
         top_p = inp->top_p > 0 ? inp->top_p : def.top_p;
         out_type = inp->out_type;
@@ -331,6 +334,7 @@ public:
         }
 
         mtmd_gen_inp inp = mtmd_gen_inp_default(mctx);
+        const int64_t t_gen_code_us = ggml_time_us();
         inp.type  = MTMD_GEN_PROCESS_TYPE_GEN_CODE;
         inp.code0 = sampled - codec_0;
         inp.embd  = const_cast<float *>(h_state_in);
@@ -342,6 +346,9 @@ public:
             return 1;
         }
 
+        if (getenv("TTS_TRACE")) {
+            LOG_WRN("[trace] gen_code %.1f ms\n", (ggml_time_us() - t_gen_code_us) / 1e3);
+        }
         codes_buf.insert(codes_buf.end(), out.codes, out.codes + out.n_codes);
         if (out.n_codes > 0 && codes_buf.size() / out.n_codes >= window_frames) {
             if (!flush_gen_wav()) {
@@ -359,9 +366,13 @@ public:
         batch_embd.logits[0] = 1;
         pos++;
 
+        const int64_t t_decode_us = ggml_time_us();
         if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch_embd.render(lctx, 0, 1)) != 0) {
             LOG_ERR("mtmd_helper_gen_audio: decode failed\n");
             return 1;
+        }
+        if (getenv("TTS_TRACE")) {
+            LOG_WRN("[trace] talker decode %.1f ms\n", (ggml_time_us() - t_decode_us) / 1e3);
         }
 
         const float * he = llama_get_embeddings_ith(lctx, -1);
@@ -463,7 +474,18 @@ private:
         return true;
     }
 
-    // one GEN_WAV process() call over the buffered codes, state is carried across batches
+    // chunk size for code2wav; 72 = the whole attention window in one call (the old behaviour)
+static size_t tts_chunk_frames() {
+    if (const char * s = getenv("TTS_CHUNK")) {
+        const int v = atoi(s);
+        if (v > 0 && v <= 72) {
+            return (size_t) v;
+        }
+    }
+    return 72;
+}
+
+// one GEN_WAV process() call over the buffered codes, state is carried across batches
     bool flush_gen_wav() {
         if (codes_buf.empty()) {
             return true;
@@ -496,8 +518,9 @@ private:
     llama_token tts_eos    = LLAMA_TOKEN_NULL;
     std::vector<float> tok_embd; // whole token embedding matrix, n_vocab * n_embd
 
-    // must match hparams.wav_tfm_swa hardcoded in mtmd-model.cpp
-    size_t window_frames = 72;
+    // frames of new audio each code2wav call decodes; the attention window itself is fixed by
+    // hparams.wav_tfm_swa (72). TTS_CHUNK overrides it, for measuring smaller chunks
+    size_t window_frames = tts_chunk_frames();
 
     // per-generation state, cleared by reset()
     llama_seq_id seq_id = 0;

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Callable, Iterable, TYPE_CHECKING
 
@@ -268,11 +269,15 @@ class Qwen3TTSSpeakerEncoderModel(MmprojModel):
         return self._wav_config_cache
 
     def tensor_force_quant(self, name, new_name, bid, n_dims):
+        # QWEN3TTS_WAV_CONV_QUANT lets the DAC residual convs (94% of the vocoder MACs) be
+        # quantized like any other tensor, for measuring whether int8 pays off there
+        const_conv_quant = os.environ.get("QWEN3TTS_WAV_CONV_QUANT", "f16")
         # conv1d/conv1d_dw kernels must be F16, ggml_conv_1d(_dw) has no BF16 path
         if new_name.endswith(".weight") and (
             new_name in ("a.gen.wav.pre_conv.weight", "a.gen.wav.dac.entry.weight", "a.gen.wav.dac.post_conv.weight")
             or (".up.blk." in new_name and new_name.endswith(".dwconv.weight"))
-            or (".dac.blk." in new_name and (new_name.endswith(".conv1.weight") or new_name.endswith(".conv2.weight")))
+            or (const_conv_quant == "f16" and ".dac.blk." in new_name and
+                (new_name.endswith(".conv1.weight") or new_name.endswith(".conv2.weight")))
         ):
             return gguf.GGMLQuantizationType.F16
         # ConvTranspose1d kernels: only F16/F32 are implemented, no BF16
@@ -371,6 +376,14 @@ class Qwen3TTSSpeakerEncoderModel(MmprojModel):
             # fold SnakeBeta's exp()/reciprocal here, so the graph is only mul/sin/sqr/mul/add
             return torch.exp(alpha), 1.0 / (torch.exp(beta) + 1e-9)
 
+        def fold_conv(w: Tensor) -> Tensor:
+            # torch conv1d kernel is [OC, IC, K]; ggml sees it as [K, IC, OC] with K fastest.
+            # write [OC, K*IC] so ggml reads ne = [K*IC, OC], rows ordered as ki*IC + ic, which is
+            # what the runtime builds with a concat of K shifted views. ne[0] is now a multiple of
+            # the quant block size, so the kernel can be quantized.
+            OC, IC, K = w.shape
+            return w.permute(0, 2, 1).reshape(OC, K * IC)
+
         def rvq_codebook(prefix: str, n_layers: int) -> Tensor:
             # checkpoint has EMA accumulators, so codebook[i] = embedding_sum[i] / cluster_usage[i]
             books = []
@@ -451,7 +464,10 @@ class Qwen3TTSSpeakerEncoderModel(MmprojModel):
             yield (self.format_tensor_name(T.A_GEN_WAV_DAC_UP_CONV, bid, suffix=".weight"), get(f"decoder.decoder.{py}.block.1.conv.weight"))
             yield (self.format_tensor_name(T.A_GEN_WAV_DAC_UP_CONV, bid, suffix=".bias"), get(f"decoder.decoder.{py}.block.1.conv.bias"))
 
-            for xid in range(3):
+            # QWEN3TTS_WAV_RES=2 emits the P2b-1 structure (the 3rd residual unit dropped); the runtime
+            # picks up whatever count the file holds, so no code change is needed there
+            n_res = int(os.environ.get("QWEN3TTS_WAV_RES", "3"))
+            for xid in range(n_res):
                 ridx = xid + 2  # block.2/3/4 are the 3 residual units
 
                 a1, b1 = snake_fold(get(f"decoder.decoder.{py}.block.{ridx}.act1.alpha"), get(f"decoder.decoder.{py}.block.{ridx}.act1.beta"))
@@ -460,7 +476,7 @@ class Qwen3TTSSpeakerEncoderModel(MmprojModel):
                 yield (name1 + ".beta", b1)
 
                 name_conv1 = gguf.TENSOR_NAMES[T.A_GEN_WAV_DAC_RES_CONV1].format(bid=bid, xid=xid)
-                yield (name_conv1 + ".weight", get(f"decoder.decoder.{py}.block.{ridx}.conv1.conv.weight"))
+                yield (name_conv1 + ".weight", fold_conv(get(f"decoder.decoder.{py}.block.{ridx}.conv1.conv.weight")))
                 yield (name_conv1 + ".bias", get(f"decoder.decoder.{py}.block.{ridx}.conv1.conv.bias"))
 
                 a2, b2 = snake_fold(get(f"decoder.decoder.{py}.block.{ridx}.act2.alpha"), get(f"decoder.decoder.{py}.block.{ridx}.act2.beta"))
@@ -469,7 +485,7 @@ class Qwen3TTSSpeakerEncoderModel(MmprojModel):
                 yield (name2 + ".beta", b2)
 
                 name_conv2 = gguf.TENSOR_NAMES[T.A_GEN_WAV_DAC_RES_CONV2].format(bid=bid, xid=xid)
-                yield (name_conv2 + ".weight", get(f"decoder.decoder.{py}.block.{ridx}.conv2.conv.weight"))
+                yield (name_conv2 + ".weight", fold_conv(get(f"decoder.decoder.{py}.block.{ridx}.conv2.conv.weight")))
                 yield (name_conv2 + ".bias", get(f"decoder.decoder.{py}.block.{ridx}.conv2.conv.bias"))
 
         a5, b5 = snake_fold(get("decoder.decoder.5.alpha"), get("decoder.decoder.5.beta"))

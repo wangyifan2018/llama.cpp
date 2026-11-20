@@ -12,6 +12,25 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <sys/resource.h>
+#include <sched.h>
+#include <map>
+
+// current cpufreq of a cpu, -1 if unavailable (used by the TTS_TRACE line)
+static int tts_cpu_khz(int cpu) {
+    char path[80];
+    snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", cpu);
+    FILE * f = fopen(path, "r");
+    if (!f) {
+        return -1;
+    }
+    int v = -1;
+    if (fscanf(f, "%d", &v) != 1) {
+        v = -1;
+    }
+    fclose(f);
+    return v;
+}
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -552,8 +571,10 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
     }
 
     // build the inference graph
+    const int64_t t_enc_build0 = ggml_time_us();
     ggml_backend_sched_reset(backends.sched.get());
     ggml_cgraph * gf = mtmd_get_graph_builder(this, imgs, params)->build();
+    const int64_t t_enc_build1 = ggml_time_us();
 
     // the last node is the embedding tensor, code2wav has no out_embd
     // read it before scheduling: backends may reorder the nodes of graphs with several outputs (Metal)
@@ -563,6 +584,7 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
         LOG_ERR("%s: failed to allocate compute graph\n", __func__);
         return false;
     }
+    const int64_t t_enc_alloc1 = ggml_time_us();
 
     // set inputs
     const auto & hparams = model.hparams;
@@ -1847,9 +1869,10 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
 
                     // frame-major input to group-major, rear-padded with code 0 up to one window
                     const int64_t n_codes  = model.gen_code_head_w->ne[2] + 1;
-                    const int64_t n_frames_w = hparams.wav_tfm_swa;
                     const int64_t n_frames   = (int64_t) params->codes->size() / n_codes;
-                    GGML_ASSERT(n_frames > 0 && n_frames <= n_frames_w);
+                    // the graph is built for exactly this many frames, no rear padding
+                    const int64_t n_frames_w = n_frames;
+                    GGML_ASSERT(n_frames > 0 && n_frames <= hparams.wav_tfm_swa);
 
                     // codes are used as ggml_get_rows indices, so check them against the codebook vocab
                     const int64_t vocab_first = model.c2w.quant_first_cb_w->ne[1];
@@ -2342,10 +2365,35 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
 
     mtmd_backend_cpu_set_n_threads(backends.backend_cpu, params->n_threads);
 
+    const int64_t t_enc_inp1 = ggml_time_us();
     auto status = ggml_backend_sched_graph_compute(backends.sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LOG_ERR("%s: ggml_backend_sched_graph_compute failed with error %d\n", __func__, status);
         return false;
+    }
+    if (getenv("TTS_TRACE_OPS")) {
+        std::map<std::string, int> hist;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+            hist[ggml_op_name(ggml_graph_node(gf, i)->op)]++;
+        }
+        std::string s;
+        for (const auto & kv : hist) {
+            s += kv.first + "=" + std::to_string(kv.second) + " ";
+        }
+        LOG_WRN("[ops] n=%d %s\n", ggml_graph_n_nodes(gf), s.c_str());
+    }
+    if (getenv("TTS_TRACE")) {
+        const int64_t t_enc_done = ggml_time_us();
+        struct rusage ru;
+        getrusage(RUSAGE_SELF, &ru);
+        int cpu = -1;
+#if defined(__linux__)
+        cpu = sched_getcpu();
+#endif
+        LOG_WRN("[trace] encode build=%.1f alloc=%.1f input=%.1f compute=%.1f ms (nodes=%d cpu=%d kHz=%d minflt=%ld majflt=%ld)\n",
+                (t_enc_build1 - t_enc_build0) / 1e3, (t_enc_alloc1 - t_enc_build1) / 1e3,
+                (t_enc_inp1 - t_enc_alloc1) / 1e3, (t_enc_done - t_enc_inp1) / 1e3,
+                ggml_graph_n_nodes(gf), cpu, tts_cpu_khz(cpu), (long) ru.ru_minflt, (long) ru.ru_majflt);
     }
 
     if (embeddings != nullptr) {
@@ -2623,7 +2671,8 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
         }
 
         // drop the tail audio that comes from the code-0 rear padding, drama3 has no padding
-        if (model.proj_type != PROJECTOR_TYPE_DRAMA3_GEN) {
+        // qwen3-tts builds its graph for exactly the frames it was given, so there is no padding to drop
+        if (model.proj_type != PROJECTOR_TYPE_DRAMA3_GEN && model.proj_type != PROJECTOR_TYPE_QWEN3TTS_GEN) {
             const int64_t n_codes    = params->codes ? model.gen_code_head_w->ne[2] + 1 : 0;
             const int64_t n_frames_w = hparams.wav_tfm_swa;
             const int64_t n_frames   = params->codes ? (int64_t) params->codes->size() / n_codes : n_frames_w;

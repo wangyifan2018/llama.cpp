@@ -103,19 +103,6 @@ ggml_tensor * mtmd_graph_qwen3tts_gen::code_gen::const_i32(ggml_tensor * anchor,
     return ggml_cast(ctx0, ggml_scale_bias(ctx0, v, 0.0f, value), GGML_TYPE_I32);
 }
 
-// causal keep-mask row for a query at position pos, window size n_kv_pad
-ggml_tensor * mtmd_graph_qwen3tts_gen::code_gen::causal_mask_row(int64_t n_kv_pad, int pos) const {
-    ggml_tensor * ones = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv_pad, n_kv_pad), 1.0f);
-    ggml_tensor * keep = ggml_tri(ctx0, ones, GGML_TRI_TYPE_LOWER_DIAG);
-    ggml_tensor * row  = ggml_view_1d(ctx0, keep, n_kv_pad, (size_t) pos * keep->nb[1]);
-    ggml_tensor * mask = ggml_log(ctx0, row); // 0 = keep, -inf = masked
-    mask = ggml_reshape_4d(ctx0, mask, n_kv_pad, 1, 1, 1);
-    if (flash_attn_type == MTMD_FLASH_ATTN_TYPE_ENABLED) {
-        mask = ggml_cast(ctx0, mask, GGML_TYPE_F16);
-    }
-    return mask;
-}
-
 // talker hidden size -> predictor hidden size (small_to_mtp_projection)
 ggml_tensor * mtmd_graph_qwen3tts_gen::code_gen::project_in(ggml_tensor * cur) const {
     if (!model.gen_code_proj_in_w) {
@@ -128,16 +115,14 @@ ggml_tensor * mtmd_graph_qwen3tts_gen::code_gen::project_in(ggml_tensor * cur) c
     return cur;
 }
 
-// one transformer layer at position pos; writes k/v into k_cache_layer/v_cache_layer at row pos
+// one transformer layer; k/v are appended to the running prefix, so the attention below sees
+// exactly the valid positions and needs no causal mask
 ggml_tensor * mtmd_graph_qwen3tts_gen::code_gen::layer_forward(
         ggml_tensor * cur,
         const mtmd_layer & layer,
         ggml_tensor * inp_pos,
-        ggml_tensor * kq_mask,
-        ggml_tensor *& k_cache_layer,
-        ggml_tensor *& v_cache_layer,
-        int64_t n_kv_pad,
-        int pos,
+        ggml_tensor *& k_acc,
+        ggml_tensor *& v_acc,
         int il) const {
     const int     n_head    = hparams.n_head;
     const int     n_head_kv = hparams.n_head_kv;
@@ -166,16 +151,17 @@ ggml_tensor * mtmd_graph_qwen3tts_gen::code_gen::layer_forward(
     k = ggml_rope_ext(ctx0, k, inp_pos, nullptr, (int) d_head, GGML_ROPE_TYPE_NEOX, 0,
                       hparams.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
-    // write k/v into the cache at row pos, flat layout
-    ggml_tensor * k_flat = ggml_reshape_1d(ctx0, k, d_head * n_head_kv);
-    k_cache_layer = cache_set(k_cache_layer, pos, k_flat);
-    v_cache_layer = cache_set(v_cache_layer, pos, v);
+    ggml_tensor * k_flat = ggml_reshape_2d(ctx0, k, d_head * n_head_kv, 1);
+    ggml_tensor * v_flat = ggml_reshape_2d(ctx0, v, d_head * n_head_kv, 1);
+    k_acc = k_acc ? ggml_concat(ctx0, k_acc, k_flat, 1) : k_flat;
+    v_acc = v_acc ? ggml_concat(ctx0, v_acc, v_flat, 1) : v_flat;
 
+    const int64_t n_kv = k_acc->ne[1];
     ggml_tensor * q_cur = ggml_reshape_4d(ctx0, q, d_head, n_head, 1, 1);
-    ggml_tensor * k_cur = ggml_reshape_4d(ctx0, k_cache_layer, d_head, n_head_kv, n_kv_pad, 1);
-    ggml_tensor * v_cur = ggml_reshape_4d(ctx0, v_cache_layer, d_head, n_head_kv, n_kv_pad, 1);
+    ggml_tensor * k_cur = ggml_reshape_4d(ctx0, k_acc, d_head, n_head_kv, n_kv, 1);
+    ggml_tensor * v_cur = ggml_reshape_4d(ctx0, v_acc, d_head, n_head_kv, n_kv, 1);
 
-    ggml_tensor * attn_out = build_attn(layer.o_w, layer.o_b, q_cur, k_cur, v_cur, kq_mask, kq_scale, il);
+    ggml_tensor * attn_out = build_attn(layer.o_w, layer.o_b, q_cur, k_cur, v_cur, nullptr, kq_scale, il);
 
     cur = ggml_add(ctx0, residual, attn_out);
 
@@ -199,24 +185,20 @@ void mtmd_graph_qwen3tts_gen::code_gen::prefill(
         ggml_tensor * h_state,
         ggml_tensor * code0_embd,
         ggml_tensor * inp_rand) const {
-    const int64_t n_kv_pad = k_cache[0]->ne[1];
-
     {
         ggml_tensor * cur     = project_in(h_state);
-        ggml_tensor * kq_mask = causal_mask_row(n_kv_pad, 0);
-        ggml_tensor * inp_pos = const_i32(k_cache[0], 0.0f);
+        ggml_tensor * inp_pos = const_i32(h_state, 0.0f);
         for (size_t il = 0; il < model.layers.size(); il++) {
-            cur = layer_forward(cur, model.layers[il], inp_pos, kq_mask, k_cache[il], v_cache[il], n_kv_pad, 0, (int) il);
+            cur = layer_forward(cur, model.layers[il], inp_pos, k_cache[il], v_cache[il], (int) il);
         }
-        // position 0's output is unused, it only seeded the cache
+        // position 0's output is unused, it only seeds the prefix
     }
 
     {
         ggml_tensor * cur     = project_in(code0_embd);
-        ggml_tensor * kq_mask = causal_mask_row(n_kv_pad, 1);
-        ggml_tensor * inp_pos = const_i32(k_cache[0], 1.0f);
+        ggml_tensor * inp_pos = const_i32(code0_embd, 1.0f);
         for (size_t il = 0; il < model.layers.size(); il++) {
-            cur = layer_forward(cur, model.layers[il], inp_pos, kq_mask, k_cache[il], v_cache[il], n_kv_pad, 1, (int) il);
+            cur = layer_forward(cur, model.layers[il], inp_pos, k_cache[il], v_cache[il], (int) il);
         }
 
         cur = ggml_rms_norm(ctx0, cur, hparams.eps);
@@ -248,8 +230,7 @@ ggml_tensor * mtmd_graph_qwen3tts_gen::code_gen::step(
     GGML_ASSERT(k_cache.size() == model.layers.size());
     GGML_ASSERT(v_cache.size() == model.layers.size());
 
-    const int64_t n_kv_pad = k_cache[0]->ne[1];
-    const int     pos      = step_idx + 1; // new cache row and RoPE position
+    const int     pos      = step_idx + 1; // next RoPE position
 
     // embed the previous code via this step's codebook table (rows are already scalars)
     ggml_tensor * code_in = ggml_view_1d(ctx0, out_code_cache, 1, (size_t) step_idx * out_code_cache->nb[1]);
@@ -264,11 +245,10 @@ ggml_tensor * mtmd_graph_qwen3tts_gen::code_gen::step(
     cur = project_in(cur);
     cb(cur, "step_proj_in", step_idx);
 
-    ggml_tensor * kq_mask = causal_mask_row(n_kv_pad, pos);
-    ggml_tensor * inp_pos = const_i32(k_cache[0], (float) pos);
+    ggml_tensor * inp_pos = const_i32(cur, (float) pos);
 
     for (size_t il = 0; il < model.layers.size(); il++) {
-        cur = layer_forward(cur, model.layers[il], inp_pos, kq_mask, k_cache[il], v_cache[il], n_kv_pad, pos, (int) il);
+        cur = layer_forward(cur, model.layers[il], inp_pos, k_cache[il], v_cache[il], (int) il);
         cb(cur, "step_layer_out", (int) il);
     }
 
@@ -288,9 +268,56 @@ ggml_tensor * mtmd_graph_qwen3tts_gen::code_gen::step(
     return cache_set(out_code_cache, pos, sampled);
 }
 
+// env override with a default, for measurement knobs
+static int atoi_env(const char * name, int def) {
+    const char * s = getenv(name);
+    return s ? atoi(s) : def;
+}
+
 // causal conv1d, stride 1: prepend persisted left-context instead of zero-padding, then a plain conv
 // x: [T, IC] (T-first). w: [K, IC, OC]. state_name empty means K == 1 (no left-context). returns [T, OC]
-ggml_tensor * mtmd_graph_qwen3tts_gen::code2wav::causal_conv1d(ggml_tensor * x, ggml_tensor * w, ggml_tensor * b, int dilation, const std::string & state_name) const {
+// true when the converter folded the kernel to [K*IC, OC] (see fold_conv in conversion/qwen3tts.py)
+static bool conv_is_folded(const ggml_tensor * w) {
+    return w->ne[2] == 1 && w->ne[1] > 1 && w->ne[0] > 64;
+}
+
+// folded kernel [K*IC, OC]: im2col by stacking K shifted views (C-first), then one mul_mat.
+// the same math as ggml_conv_1d, but the kernel is a plain 2D matrix and can be quantized
+ggml_tensor * mtmd_graph_qwen3tts_gen::code2wav::causal_conv1d_folded(ggml_tensor * x, ggml_tensor * w, ggml_tensor * b, int K, int dilation, const std::string & state_name) const {
+    const int     pad = (K - 1) * dilation;
+    const int64_t IC  = w->ne[0] / K;
+
+    ggml_tensor * x_full = x;
+    if (pad > 0) {
+        ggml_tensor * left = state_in.at(state_name); // [pad, IC]
+        x_full = ggml_concat(ctx0, left, x, 0);
+    }
+    const int64_t T = x->ne[0];
+
+    ggml_tensor * xc = ggml_cont(ctx0, ggml_transpose(ctx0, x_full)); // [IC, T+pad]
+    ggml_tensor * col = nullptr;
+    for (int ki = 0; ki < K; ki++) {
+        ggml_tensor * v = ggml_view_2d(ctx0, xc, IC, T, xc->nb[1], (size_t) (ki * dilation) * xc->nb[1]);
+        col = col ? ggml_concat(ctx0, col, v, 0) : v;
+    }
+    ggml_tensor * y = ggml_mul_mat(ctx0, w, col);       // [OC, T]
+    y = ggml_cont(ctx0, ggml_transpose(ctx0, y));       // [T, OC]
+    if (b) {
+        y = ggml_add(ctx0, y, ggml_reshape_2d(ctx0, b, 1, b->ne[0]));
+    }
+    if (pad > 0) {
+        ggml_tensor * new_left = ggml_cont(ctx0, ggml_view_2d(ctx0, x_full, pad, x_full->ne[1], x_full->nb[1],
+                                                              (size_t) (x_full->ne[0] - pad) * x_full->nb[0]));
+        state_out.push_back({state_name, new_left});
+    }
+    return y;
+}
+
+ggml_tensor * mtmd_graph_qwen3tts_gen::code2wav::causal_conv1d(ggml_tensor * x, ggml_tensor * w, ggml_tensor * b, int dilation, const std::string & state_name, int K_hint) const {
+    if (conv_is_folded(w)) {
+        GGML_ASSERT(K_hint > 0);
+        return causal_conv1d_folded(x, w, b, K_hint, dilation, state_name);
+    }
     const int K   = (int) w->ne[0];
     const int pad = (K - 1) * dilation;
 
@@ -541,9 +568,9 @@ ggml_tensor * mtmd_graph_qwen3tts_gen::code2wav::convnext_block(ggml_tensor * x,
 ggml_tensor * mtmd_graph_qwen3tts_gen::code2wav::dac_res_unit(ggml_tensor * x, const mtmd_code2wav::dac_res & res, int dilation, const std::string & state_name) const {
     ggml_tensor * residual = x;
     ggml_tensor * h = snake(x, res.act1_alpha, res.act1_beta);
-    h = causal_conv1d(h, res.conv1_w, res.conv1_b, dilation, state_name);
+    h = causal_conv1d(h, res.conv1_w, res.conv1_b, dilation, state_name, 7); // 7 = the DAC kernel
     h = snake(h, res.act2_alpha, res.act2_beta);
-    h = causal_conv1d(h, res.conv2_w, res.conv2_b, 1, ""); // k=1, no left-context needed
+    h = causal_conv1d(h, res.conv2_w, res.conv2_b, 1, "", 1); // k=1, no left-context needed
     return ggml_add(ctx0, residual, h);
 }
 
@@ -596,7 +623,10 @@ ggml_tensor * mtmd_graph_qwen3tts_gen::code2wav::decode(ggml_tensor * inp_codes)
         const std::string blk_name = "dac" + std::to_string(il);
         x = snake(x, blk.snake_alpha, blk.snake_beta);
         x = causal_conv_transpose1d(x, blk.conv_w, blk.conv_b, stride, blk_name + "_tail");
-        for (size_t ir = 0; ir < blk.res.size(); ir++) {
+        // TTS_VOC_RES limits the residual units per DAC block (default 3, the full model), for
+        // measuring what the trim would buy before committing to a retrain
+        const size_t n_res = std::min<size_t>(blk.res.size(), (size_t) std::max(0, atoi_env("TTS_VOC_RES", 3)));
+        for (size_t ir = 0; ir < n_res; ir++) {
             x = dac_res_unit(x, blk.res[ir], DAC_DILATIONS[ir], blk_name + "_res" + std::to_string(ir));
         }
         cb(x, "wav_dac_block_out", (int) il);
@@ -649,10 +679,13 @@ std::vector<c2w_state_slot> list_c2w_state_slots(const mtmd_hparams & hparams, c
         const int64_t stride = blk.conv_w->ne[0] / 2; // kernel == 2*stride for all 4 blocks
         const std::string blk_name = "dac" + std::to_string(il);
         slots.push_back({blk_name + "_tail", stride, blk.conv_w->ne[1]});
-        for (size_t ir = 0; ir < blk.res.size(); ir++) {
+        // must match the TTS_VOC_RES trim in decode()
+        const size_t n_res = std::min<size_t>(blk.res.size(), (size_t) std::max(0, atoi_env("TTS_VOC_RES", 3)));
+        for (size_t ir = 0; ir < n_res; ir++) {
             const auto & res = blk.res[ir];
+            const int64_t k_res = conv_is_folded(res.conv1_w) ? 7 : res.conv1_w->ne[0];
             slots.push_back({blk_name + "_res" + std::to_string(ir),
-                              (res.conv1_w->ne[0] - 1) * DAC_DILATIONS[ir], res.conv1_w->ne[1]});
+                              (k_res - 1) * DAC_DILATIONS[ir], res.conv1_w->ne[1]});
         }
     }
 
@@ -689,18 +722,12 @@ ggml_cgraph * mtmd_graph_qwen3tts_gen::build() {
 
     const int64_t n_acoustic = model.gen_code_head_w->ne[2]; // 15
     const int     n_codes    = (int) n_acoustic + 1;         // 16
-    const int64_t n_kv_pad   = n_codes;
     const int     n_layer    = (int) model.layers.size();
     const int     n_head     = hparams.n_head;
-    const int     n_head_kv  = hparams.n_head_kv;
-    const int64_t d_head     = model.layers[0].q_w->ne[1] / n_head;
 
-    // zero-filled per layer k/v caches, so masked-out rows can't hold garbage
-    std::vector<ggml_tensor *> k_cache(n_layer), v_cache(n_layer);
-    for (int il = 0; il < n_layer; il++) {
-        k_cache[il] = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_head * n_head_kv, n_kv_pad), 0.0f);
-        v_cache[il] = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_head * n_head_kv, n_kv_pad), 0.0f);
-    }
+    // the predictor's k/v grow by one row per position: no preallocated cache, no mask, and the
+    // attention path only sees valid rows
+    std::vector<ggml_tensor *> k_cache(n_layer, nullptr), v_cache(n_layer, nullptr);
 
     code_gen cg(*this, top_k, top_p);
 
@@ -711,13 +738,42 @@ ggml_cgraph * mtmd_graph_qwen3tts_gen::build() {
     ggml_set_name(inp_rand0, "inp_rand_0");
     ggml_set_input(inp_rand0);
 
-    cg.prefill(k_cache, v_cache, out_code_cache, h_state, code0_embd, inp_rand0);
+    if (getenv("TTS_FAKE_NAR")) {
+        // structural stand-in for the parallel predictor (P2a): one pass through the 5 layers from
+        // the talker hidden, then all 15 heads in one batched matmul. the weights are the AR ones,
+        // so the codes are meaningless -- this only measures the node count and time of the 1-pass
+        // shape, which is what decides whether the retrain is worth it.
+        ggml_tensor * cur = cg.project_in(h_state);
+        ggml_tensor * pos = cg.const_i32(h_state, 0.0f);
+        for (int il = 0; il < n_layer; il++) {
+            cur = cg.layer_forward(cur, model.layers[il], pos, k_cache[il], v_cache[il], il);
+        }
+        cur = ggml_rms_norm(ctx0, cur, hparams.eps);
+        cur = ggml_mul(ctx0, cur, model.gen_code_norm_w);
 
-    for (int g = 1; g < n_acoustic; g++) {
-        ggml_tensor * inp_rand = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
-        ggml_set_name(inp_rand, ("inp_rand_" + std::to_string(g)).c_str());
-        ggml_set_input(inp_rand);
-        out_code_cache = cg.step(k_cache, v_cache, out_code_cache, inp_rand, g);
+        // [n_embd] -> [n_embd, 1, 15] so the 3D head table batches all 15 codebooks at once
+        ggml_tensor * h3d = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, cur->ne[0], 1, n_acoustic);
+        h3d = ggml_repeat(ctx0, ggml_reshape_3d(ctx0, cur, cur->ne[0], 1, 1), h3d);
+        ggml_tensor * logits = ggml_mul_mat(ctx0, model.gen_code_head_w, h3d); // [vocab, 1, 15]
+        cb(logits, "nar_logits", -1);
+
+        for (int g = 1; g <= n_acoustic; g++) {
+            ggml_tensor * inp_rand = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
+            ggml_set_name(inp_rand, ("inp_rand_" + std::to_string(g - 1)).c_str());
+            ggml_set_input(inp_rand);
+            ggml_tensor * col = ggml_cont(ctx0, ggml_view_1d(ctx0, logits, logits->ne[0], (size_t) (g - 1) * logits->nb[2]));
+            ggml_tensor * sampled = cg.do_sampling(col, inp_rand);
+            out_code_cache = cg.cache_set(out_code_cache, g, sampled);
+        }
+    } else {
+        cg.prefill(k_cache, v_cache, out_code_cache, h_state, code0_embd, inp_rand0);
+
+        for (int g = 1; g < n_acoustic; g++) {
+            ggml_tensor * inp_rand = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
+            ggml_set_name(inp_rand, ("inp_rand_" + std::to_string(g)).c_str());
+            ggml_set_input(inp_rand);
+            out_code_cache = cg.step(k_cache, v_cache, out_code_cache, inp_rand, g);
+        }
     }
 
     // output 1: this frame's 16 sampled codes, for the caller's code2wav window
@@ -741,7 +797,8 @@ ggml_cgraph * mtmd_graph_qwen3tts_gen::build() {
     cb(out_embd, "gen_audio_out", -1);
 
     // ---- MTMD_SUBCTX_GEN_PROCESS_GEN_WAV: 16 RVQ codes -> raw PCM ----
-    const int n_frames = hparams.wav_tfm_swa; // frames per batch, == the attention window
+    // the attention window stays hparams.wav_tfm_swa, the batch is only the frames the caller has
+    const int n_frames = this->n_frames;
 
     ggml_tensor * inp_codes = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_frames, n_codes);
     ggml_set_name(inp_codes, "inp_codes");
