@@ -174,3 +174,20 @@ python3 examples/qwen3-asr-0.6b/compare_schedules.py --dir /tmp/qwen-b2
 - **F16 源重量化未做**：本机只有 Q8_0 GGUF，Q4_K 是从 Q8_0 二次量化；要真正的 F16→Q4_K 需要原始 checkpoint。
 - **样本量**：调度 2 轮、其余 1 轮，P95/P99 的样本数只有 6–12；结论方向可靠，绝对数字会有几 % 浮动。
 - **工作区仍有他人未提交改动**：`conversion/qwen3tts.py`、`examples/qwen3-asr-0.6b/compare.py`，本批未触碰。
+
+### 清理与保留（2026-11-20）
+
+磁盘曾被打满（可用空间 1.5 GB），已清理本批产生的中间件，可用空间回到约 12 GB。
+
+**删除（可再生成或已归档）**：`/tmp` 下的 `pf-*`、`qwen-*`、`qwen-single`、探针脚本与日志；
+`/tmp/pf-release`、`/tmp/pf-pkg`（发布包的重复副本）；`~/pf-release/models`（发布 tarball 的展开副本）；
+CAM++ 导出的 `sta*.onnx` 探针；`Qwen3-ASR-0.6B-q5k.gguf`（只需 `llama-quantize`/`requant` 重跑即可再生成）；
+`seaco/`（944 MB 研究用权重，ModelScope 可重新下载）；`qwen-batch2.HjqJ5i`（早前运行残留）。
+
+**保留（复现需要）**：`~/pf-release/paraformer-zh-htp-v1.tar.gz` 及 `MANIFEST.md`/`SHA256SUMS`；
+`~/Library/Caches/qwen3-asr-htp/` 下的 `Qwen3-ASR-0.6B-Q8_0.gguf`、`Qwen3-ASR-0.6B-q4k.gguf`、
+`mmproj-*`、两份运行归档（batch-1 与 batch-2-schedule）、`paraformer-models`（Paraformer 文档与夹具）、
+`vad/`、`speaker-models/`；`/tmp/sherpa`（Android 构建链接 sherpa/onnxruntime 需要）。
+
+**未动（属于其他工作线）**：`paraformer-production`（6.6 GB）、`build-adb`、`build-android-tts-cpu`、
+`build-android-paraformer`、`/tmp/pred_patch.safetensors`。需要时由它们的所有者决定。
