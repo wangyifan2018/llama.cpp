@@ -1,0 +1,18 @@
+train frames=320 early_teacher_top1=0.266406 early_sampled=0.088281 exact_sampled_prefix=0.000000
+train teacher_raw late_overlap=0.249728 late_teacher_top1=0.170739 late_sampled=0.068466 code5_overlap=1.000000
+train student_raw late_overlap=0.040263 late_teacher_top1=0.008807 late_sampled=0.007102 code5_overlap=0.068546
+train teacher_KL late_overlap=0.266434 late_teacher_top1=0.186648 late_sampled=0.078693 code5_overlap=1.000000
+train student_teacher_KL late_overlap=0.044005 late_teacher_top1=0.012216 late_sampled=0.010511 code5_overlap=0.068546
+train student_self_KL late_overlap=0.050358 late_teacher_top1=0.014773 late_sampled=0.011648 code5_overlap=0.068546
+eval frames=160 early_teacher_top1=0.262500 early_sampled=0.117188 exact_sampled_prefix=0.000000
+eval teacher_raw late_overlap=0.253952 late_teacher_top1=0.180114 late_sampled=0.068182 code5_overlap=1.000000
+eval student_raw late_overlap=0.040509 late_teacher_top1=0.009659 late_sampled=0.009659 code5_overlap=0.074406
+eval teacher_KL late_overlap=0.269302 late_teacher_top1=0.190341 late_sampled=0.071591 code5_overlap=1.000000
+eval student_teacher_KL late_overlap=0.044493 late_teacher_top1=0.015909 late_sampled=0.010795 code5_overlap=0.074406
+eval student_self_KL late_overlap=0.049772 late_teacher_top1=0.012500 late_sampled=0.009659 code5_overlap=0.074406
+regression frames=96 early_teacher_top1=0.270833 early_sampled=0.091146 exact_sampled_prefix=0.000000
+regression teacher_raw late_overlap=0.250730 late_teacher_top1=0.173295 late_sampled=0.057765 code5_overlap=1.000000
+regression student_raw late_overlap=0.043359 late_teacher_top1=0.016098 late_sampled=0.009470 code5_overlap=0.081048
+regression teacher_KL late_overlap=0.266027 late_teacher_top1=0.183712 late_sampled=0.059659 code5_overlap=1.000000
+regression student_teacher_KL late_overlap=0.047227 late_teacher_top1=0.020833 late_sampled=0.012311 code5_overlap=0.081048
+regression student_self_KL late_overlap=0.052527 late_teacher_top1=0.023674 late_sampled=0.014205 code5_overlap=0.081048

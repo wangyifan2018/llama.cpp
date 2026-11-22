@@ -1,0 +1,1 @@
+Repeat summary, depth CSV and all fitted arrays are byte-identical.

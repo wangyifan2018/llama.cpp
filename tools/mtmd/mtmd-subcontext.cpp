@@ -2639,6 +2639,65 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
             ggml_backend_tensor_get(codes, out_codes.data(), 0, ggml_nbytes(codes));
         }
     }
+    // TTS_DRAFT_STATS: free-draft probe for speculative decoding, see qwen3tts-gen.cpp draft_row()
+    if (getenv("TTS_DRAFT_STATS") && params->out_codes != nullptr) {
+        ggml_tensor * dr = ggml_graph_get_tensor(gf, "out_draft");
+        if (dr != nullptr) {
+            // column 0 is the true head's own pick, columns 1..3 are the free drafts t=1..3
+            static int64_t n_pos = 0;
+            static int64_t hit[4][5] = {{0}}; // hit[t][delta] for delta = 0..4
+            static int64_t n_cmp[4][5] = {{0}};
+            static int64_t n_hit[4] = {0,0,0,0};
+            std::vector<int32_t> draft(ggml_nelements(dr));
+            ggml_backend_tensor_get(dr, draft.data(), 0, ggml_nbytes(dr));
+            const auto & codes = *params->out_codes;
+            const int64_t n_codes = (int64_t) codes.size();
+            const int64_t n_row   = (int64_t) dr->ne[1]; // row r holds position p = r + 1
+            const int64_t n_t     = (int64_t) dr->ne[0]; // columns, ne[0] is the fast axis
+            auto at = [&](int64_t r, int64_t c) { return draft[(size_t) c + (size_t) r * (size_t) n_t]; };
+            for (int64_t r = 0; r < n_row; r++) {
+                const int64_t p = r + 1;
+                int run = 0;
+                for (int64_t t = 1; t < n_t; t++) {
+                    if (p + t >= n_codes) break;
+                    if (at(r, t) != codes[(size_t) (p + t)]) break;
+                    run++;
+                }
+                n_hit[run]++;
+                n_pos++;
+                // alignment scan: which code does each column actually point at?
+                for (int64_t t = 1; t < n_t; t++) {
+                    for (int64_t d = 0; d <= 4; d++) {
+                        const int64_t q = p + d;
+                        if (q >= n_codes) continue;
+                        n_cmp[t][d]++;
+                        if (at(r, t) == codes[(size_t) q]) hit[t][d]++;
+                    }
+                }
+            }
+            static int64_t n_printed = 0;
+            if (n_pos - n_printed >= 64) {
+                n_printed = n_pos;
+                double A[4] = {0,0,0,0};
+                for (int k = 2; k <= 4; k++) {
+                    int64_t acc = 0;
+                    for (int r = 0; r <= 3; r++) acc += n_hit[r] * (1 + (r < k - 1 ? r : k - 1));
+                    A[k - 2] = (double) acc / (double) n_pos;
+                }
+                LOG_WRN("[draft] positions=%lld  run0=%.1f%% run1=%.1f%% run2=%.1f%%  A(3)=%.2f A(4)=%.2f\n",
+                        (long long) n_pos, 100.0*n_hit[0]/n_pos, 100.0*n_hit[1]/n_pos, 100.0*n_hit[2]/n_pos,
+                        A[1], A[2]);
+                for (int64_t t = 1; t < n_t; t++) {
+                    LOG_WRN("[draft]   col t=%lld:", (long long) t);
+                    for (int64_t d = 0; d <= 4; d++) {
+                        if (n_cmp[t][d] == 0) continue;
+                        LOG_WRN("  p+%lld:%.1f%%", (long long) d, 100.0 * hit[t][d] / n_cmp[t][d]);
+                    }
+                    LOG_WRN("\n");
+                }
+            }
+        }
+    }
     if (params->out_feats != nullptr) {
         ggml_tensor * feats = ggml_graph_get_tensor(gf, "out_feats");
         if (feats != nullptr) {

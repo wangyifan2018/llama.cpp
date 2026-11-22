@@ -1,0 +1,17 @@
+mac_forced_eval down-f16 frames=160 top1=0.999167 exact_prefix4=0.993750 exact_frame=0.987500 overlap=0.999761 mean_abs_logits=0.000418
+mac_forced_eval down-q8 frames=160 top1=0.959583 exact_prefix4=0.893750 exact_frame=0.550000 overlap=0.976568 mean_abs_logits=0.048104
+mac_forced_eval all-q8 frames=160 top1=0.934583 exact_prefix4=0.831250 exact_frame=0.293750 overlap=0.956522 mean_abs_logits=0.119136
+mac_forced_eval keep-down-q8 frames=160 top1=0.949583 exact_prefix4=0.881250 exact_frame=0.418750 overlap=0.963020 mean_abs_logits=0.099833
+mac_forced_regression down-f16 frames=96 top1=1.000000 exact_prefix4=1.000000 exact_frame=1.000000 overlap=0.999762 mean_abs_logits=0.000392
+mac_forced_regression down-q8 frames=96 top1=0.958333 exact_prefix4=0.916667 exact_frame=0.500000 overlap=0.976373 mean_abs_logits=0.050382
+mac_forced_regression all-q8 frames=96 top1=0.929167 exact_prefix4=0.822917 exact_frame=0.239583 overlap=0.956867 mean_abs_logits=0.120076
+mac_forced_regression keep-down-q8 frames=96 top1=0.942361 exact_prefix4=0.864583 exact_frame=0.333333 overlap=0.963838 mean_abs_logits=0.099044
+android_free_eval down-f16 frames=40 top1=1.000000 exact_prefix4=1.000000 exact_frame=1.000000 overlap=0.999813 mean_abs_logits=0.000356
+android_free_eval down-q8 frames=40 top1=0.821667 exact_prefix4=0.875000 exact_frame=0.650000 overlap=0.842592 mean_abs_logits=0.278655
+android_free_eval all-q8 frames=40 top1=0.731667 exact_prefix4=0.875000 exact_frame=0.400000 overlap=0.766695 mean_abs_logits=0.441543
+android_free_eval keep-down-q8 frames=40 top1=0.740000 exact_prefix4=0.875000 exact_frame=0.425000 overlap=0.773556 mean_abs_logits=0.424015
+android original block1_median_ms=183.189869 block2_median_ms=186.450443 median_ms=184.905833 speedup=1.000000x min_ms=180.304062 max_ms=200.515782
+android down-f16 block1_median_ms=159.083516 block2_median_ms=154.399115 median_ms=157.517292 speedup=1.173876x min_ms=152.047916 max_ms=169.959375
+android down-q8 block1_median_ms=144.678308 block2_median_ms=141.446666 median_ms=142.967605 speedup=1.293341x min_ms=139.594167 max_ms=156.595834
+android all-q8 block1_median_ms=84.332604 block2_median_ms=84.746719 median_ms=84.455729 speedup=2.189382x min_ms=82.887708 max_ms=92.113697
+android keep-down-q8 block1_median_ms=126.336536 block2_median_ms=126.832318 median_ms=126.625000 speedup=1.460263x min_ms=124.322657 max_ms=145.330416

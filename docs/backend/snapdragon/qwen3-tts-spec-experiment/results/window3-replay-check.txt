@@ -1,0 +1,7 @@
+android_frame0_width2_vs_width1_max_absolute_logit_difference=0
+android_frame0_width3_vs_width1_max_absolute_logit_difference=0
+mac_export_first_offset_and_target_logits_match_e29_for_576_frames=true
+trained_first_offset_matches_e29_kl_offset_byte_for_byte=true
+android_timing_groups=39
+android_timed_samples_per_group=72
+Repeat summary, depth CSV and both offset arrays are byte-identical.

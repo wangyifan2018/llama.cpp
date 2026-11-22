@@ -1,0 +1,12 @@
+train frozen frames=320 overlap=0.174701 top1=0.087813
+train shared_KL frames=320 overlap=0.193077 top1=0.105313
+train low_rank frames=320 overlap=0.241964 top1=0.133125
+eval_sampled frozen frames=160 overlap=0.179348 top1=0.098125
+eval_sampled shared_KL frames=160 overlap=0.196232 top1=0.109375
+eval_sampled low_rank frames=160 overlap=0.213926 top1=0.121250
+regression frozen frames=96 overlap=0.175803 top1=0.090625
+regression shared_KL frames=96 overlap=0.192629 top1=0.102083
+regression low_rank frames=96 overlap=0.213713 top1=0.104167
+eval_greedy frozen frames=160 overlap=0.166774 top1=0.076875
+eval_greedy shared_KL frames=160 overlap=0.181689 top1=0.093750
+eval_greedy low_rank frames=160 overlap=0.198855 top1=0.108125

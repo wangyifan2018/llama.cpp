@@ -413,6 +413,9 @@ struct mtmd_graph_qwen3tts_gen : mtmd_graph {
         int   top_k;
         float top_p;
 
+        // TTS_DRAFT_STATS: also emit one row of free-draft proposals per position
+        bool draft_stats = false;
+
         ggml_tensor * cache_set(ggml_tensor * cache, int row_idx, ggml_tensor * value) const;
         ggml_tensor * do_sampling(ggml_tensor * logits, ggml_tensor * inp_rand) const;
 
@@ -429,10 +432,14 @@ struct mtmd_graph_qwen3tts_gen : mtmd_graph {
                 ggml_tensor *& v_acc,
                 int il) const;
 
+        // TTS_DRAFT_STATS: free-draft probe, one GEMV per (position, lookahead) pair
+        ggml_tensor * draft_row(ggml_tensor * cur, int pos) const;
+
         void prefill(
                 std::vector<ggml_tensor *> & k_cache,
                 std::vector<ggml_tensor *> & v_cache,
                 ggml_tensor *& out_code_cache,
+                ggml_tensor *& out_draft,
                 ggml_tensor * h_state,
                 ggml_tensor * code0_embd,
                 ggml_tensor * inp_rand) const;
@@ -441,6 +448,7 @@ struct mtmd_graph_qwen3tts_gen : mtmd_graph {
                 std::vector<ggml_tensor *> & k_cache,
                 std::vector<ggml_tensor *> & v_cache,
                 ggml_tensor * out_code_cache,
+                ggml_tensor *& out_draft,
                 ggml_tensor * inp_rand,
                 int step_idx) const;
     };

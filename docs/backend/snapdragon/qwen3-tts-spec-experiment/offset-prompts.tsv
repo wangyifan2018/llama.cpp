@@ -1,0 +1,13 @@
+split	id	lang	seed	prompt
+train	tr01	english	7101	The bakery opens early on Fridays, and the first batch of bread is already in the oven.
+train	tr02	english	7102	Please put the blue notebook beside the window before you leave this afternoon.
+train	tr03	english	7103	I thought the museum was closed, but the front door was open and the staff waved us in.
+train	tr04	english	7104	Nobody expected the little dog to cross the river without getting its paws wet.
+train	tr05	chinese	7105	等雨停了，我们再去河边散步，顺便看看新开的那家书店。
+train	tr06	chinese	7106	请把桌上的两张照片收好，后面那张是去年夏天拍的。
+train	tr07	chinese	7107	周末的菜市场很热闹，卖水果的阿姨给了我几个熟透的桃子。
+train	tr08	chinese	7108	爷爷以前每天骑车去上班，现在更喜欢坐在阳台上读报纸。
+eval	ev01	english	7201	When the lights went out, everyone in the room stopped talking for a moment.
+eval	ev02	english	7202	She wrote the address on a yellow envelope and handed it back to the clerk.
+eval	ev03	chinese	7203	小猫找不到自己的玩具，最后在沙发下面叼出了一个红球。
+eval	ev04	chinese	7204	明天的会议改到了三楼，请大家提前十分钟到接待处集合。

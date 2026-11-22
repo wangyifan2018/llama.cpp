@@ -1,0 +1,14 @@
+Corrected host runtime max absolute logit delta 5.722046e-06
+eval forced_raw overlap=0.102033 top1=0.038333 code1_top1=0.218750 exact_prefix4=nan exact_frame=nan
+eval forced_fit overlap=0.143165 top1=0.072917 code1_top1=0.368750 exact_prefix4=nan exact_frame=nan
+eval free_raw overlap=0.054523 top1=0.022917 code1_top1=0.218750 exact_prefix4=0.000000 exact_frame=0.000000
+eval free_fit overlap=0.082957 top1=0.038750 code1_top1=0.368750 exact_prefix4=0.000000 exact_frame=0.000000
+regression forced_raw overlap=0.107512 top1=0.058333 code1_top1=0.302083 exact_prefix4=nan exact_frame=nan
+regression forced_fit overlap=0.146311 top1=0.063889 code1_top1=0.229167 exact_prefix4=nan exact_frame=nan
+regression free_raw overlap=0.057712 top1=0.029167 code1_top1=0.302083 exact_prefix4=0.000000 exact_frame=0.000000
+regression free_fit overlap=0.084274 top1=0.028472 code1_top1=0.229167 exact_prefix4=0.000000 exact_frame=0.000000
+eval forced_layers_014 overlap=0.029820 top1=0.006667 code1_top1=0.000000
+eval forced_layers_0134 overlap=0.047611 top1=0.011667 code1_top1=0.018750
+android ar median_ms=183.068568 speedup=1.000000x min_ms=180.316979 max_ms=219.060000
+android small median_ms=111.057995 speedup=1.648405x min_ms=109.665105 max_ms=129.895573
+android fit median_ms=113.445704 speedup=1.613711x min_ms=110.746094 max_ms=118.752656

@@ -1,0 +1,6 @@
+original hot_predictor_p50_ms=198.700000 ttfa_s=2.588000 rtf=3.925500 request_s=11.395000 audio_s=2.920000
+q8 hot_predictor_p50_ms=97.675000 ttfa_s=1.820500 rtf=2.677000 request_s=8.885000 audio_s=3.320000
+p01 hot_predictor_p50_ms=198.600->97.600 ttfa_s=2.580->1.787 rtf=3.885->2.648 request_s=12.430->10.590 audio_s=3.200->4.000
+p02 hot_predictor_p50_ms=202.100->99.700 ttfa_s=2.596->1.853 rtf=4.014->2.731 request_s=9.630->6.990 audio_s=2.400->2.560
+p03 hot_predictor_p50_ms=197.700->96.900 ttfa_s=2.647->1.837 rtf=3.966->2.690 request_s=10.470->7.750 audio_s=2.640->2.880
+p04 hot_predictor_p50_ms=198.800->97.750 ttfa_s=2.563->1.804 rtf=3.849->2.664 request_s=12.320->10.020 audio_s=3.200->3.760

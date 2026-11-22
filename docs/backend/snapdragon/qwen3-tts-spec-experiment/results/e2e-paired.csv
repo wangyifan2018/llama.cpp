@@ -1,0 +1,9 @@
+sample,language,mode,frames,frame_cap_hit,audio_s,request_s,ttfa_s,first_audio_frame,rtf,first_predictor_ms,hot_predictor_p50_ms
+p01,english,original,40,False,3.2,12.43,2.58,8,3.885,203.4,198.6
+p01,english,q8,50,False,4.0,10.59,1.787,8,2.648,102.7,97.6
+p02,chinese,original,30,False,2.4,9.63,2.596,8,4.014,201.1,202.1
+p02,chinese,q8,32,False,2.56,6.99,1.853,8,2.731,116.7,99.7
+p03,english,original,33,False,2.64,10.47,2.647,8,3.966,196.8,197.7
+p03,english,q8,36,False,2.88,7.75,1.837,8,2.69,94.9,96.9
+p04,chinese,original,40,False,3.2,12.32,2.563,8,3.849,199.0,198.8
+p04,chinese,q8,47,False,3.7600000000000002,10.02,1.804,8,2.664,94.3,97.75

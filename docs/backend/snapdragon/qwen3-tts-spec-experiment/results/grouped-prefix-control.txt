@@ -1,0 +1,5 @@
+stage1_match_vs_full_ar_greedy 1.000000 0.043750 0.000000 0.006250
+stage1_exact_prefix_match_vs_full_ar_greedy 0.0
+sampled_ar_prefix vs_sampled_ar=0.253952 vs_greedy_ar=0.068360 code5_vs_sampled_ar=1.000000 code5_vs_greedy_ar=0.145262
+greedy_ar_prefix vs_sampled_ar=0.077169 vs_greedy_ar=0.242522 code5_vs_sampled_ar=0.145262 code5_vs_greedy_ar=1.000000
+grouped_student_prefix vs_sampled_ar=0.040509 vs_greedy_ar=0.043580 code5_vs_sampled_ar=0.074406 code5_vs_greedy_ar=0.081470

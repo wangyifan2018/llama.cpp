@@ -1,0 +1,8 @@
+one_tail code5to15_overlap=0.271686 code10_overlap=0.184802 code10to15_overlap=0.123176 code11to15_overlap=0.110850 code10to15_top1=0.045833
+two_groups_raw code5to15_overlap=0.261442 code10_overlap=0.158380 code10to15_overlap=0.104395 code11to15_overlap=0.093598 code10to15_top1=0.040625
+two_groups_self_fit code5to15_overlap=0.270582 code10_overlap=0.158380 code10to15_overlap=0.121152 code11to15_overlap=0.113706 code10to15_top1=0.047917
+two_groups_oracle_fit_at_self code5to15_overlap=0.265922 code10_overlap=0.158380 code10to15_overlap=0.112608 code11to15_overlap=0.103453 code10to15_top1=0.046875
+two_groups_oracle_raw code5to15_overlap=0.436709 code10_overlap=1.000000 code10to15_overlap=0.425719 code11to15_overlap=0.310862 code10to15_top1=0.320833
+two_groups_oracle_fit code5to15_overlap=0.446558 code10_overlap=1.000000 code10to15_overlap=0.443775 code11to15_overlap=0.332530 code10to15_top1=0.330208
+first_group_top1 [1.      0.3125  0.2625  0.13125 0.1    ]
+first_group_exact_prefix 0.0

@@ -1,0 +1,22 @@
+--- a/tools/mtmd/mtmd-subcontext.cpp
++++ b/tools/mtmd/mtmd-subcontext.cpp
+@@ -64,6 +64,19 @@
+     }
+     ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads);
+     tpp.poll = 0; // the pool is idle most of the time, don't take CPU away from the text model
++    if (const char * cores = std::getenv("TTS_SPEC_PIN_MASK")) {
++        char * end = nullptr;
++        const uint64_t mask = std::strtoull(cores, &end, 16);
++        int count = 0;
++        for (unsigned i = 0; i < 64; ++i) {
++            tpp.cpumask[i] = (mask >> i) & 1;
++            count += tpp.cpumask[i];
++        }
++        if (end == cores || *end != '\0' || count != n_threads) {
++            throw std::runtime_error("pin mask must specify one core per mtmd worker");
++        }
++        tpp.strict_cpu = true;
++    }
+     ggml_threadpool_t threadpool = new_fn(&tpp);
+     if (!threadpool) {
+         throw std::runtime_error("failed to create threadpool");

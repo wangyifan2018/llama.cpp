@@ -1,0 +1,5 @@
+Host and Android match same-backend AR at code1–5. Host late argmax matches NumPy.
+Host late max absolute logit delta 5.2452087e-06
+ar n=30 median_ms=176.559740 min_ms=174.703021 max_ms=189.781406
+tail n=30 median_ms=62.826718 min_ms=62.539531 max_ms=64.875052
+compute_speedup=2.810265

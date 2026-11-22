@@ -1,0 +1,5 @@
+en-1234.bin: OK
+zh-1234.bin: OK
+en-5678.bin: OK
+zh-5678.bin: OK
+frames.bin: OK

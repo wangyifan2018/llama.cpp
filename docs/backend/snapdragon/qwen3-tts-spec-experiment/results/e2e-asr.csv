@@ -1,0 +1,9 @@
+sample,mode,language,reference,transcript,edits,units,error_rate
+p01,original,english,The red train leaves at seven thirty.,The red train leaves at seven thirty.,0,7,0.0
+p01,q8,english,The red train leaves at seven thirty.,The red train leaves at seven thirty.,0,7,0.0
+p02,original,chinese,请把蓝色的雨伞放在门口。,请把蓝色的雨伞放在门口。,0,11,0.0
+p02,q8,chinese,请把蓝色的雨伞放在门口。,请把蓝色的雨伞放在门口。,0,11,0.0
+p03,original,english,Please leave the keys by the front door.,Please leave the keys by the front door.,0,8,0.0
+p03,q8,english,Please leave the keys by the front door.,Please leave the keys by the front door.,0,8,0.0
+p04,original,chinese,今天下午，我们一起去河边散步。,今天下午，我们一起去河边散步。,0,13,0.0
+p04,q8,chinese,今天下午，我们一起去河边散步。,今天下午，我们一起去河边散步。,0,13,0.0

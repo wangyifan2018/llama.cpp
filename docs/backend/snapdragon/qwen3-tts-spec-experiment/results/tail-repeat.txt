@@ -1,0 +1,1 @@
+Rank-32 repeat is byte-identical for weights, depth metrics, and greedy logits.

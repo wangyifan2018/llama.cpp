@@ -1,0 +1,39 @@
+rank=8
+train frozen frames=320 overlap=0.174701 top1=0.087813
+train shared_KL frames=320 overlap=0.193077 top1=0.105313
+train low_rank frames=320 overlap=0.205610 top1=0.117188
+eval_sampled frozen frames=160 overlap=0.179348 top1=0.098125
+eval_sampled shared_KL frames=160 overlap=0.196232 top1=0.109375
+eval_sampled low_rank frames=160 overlap=0.199089 top1=0.121250
+regression frozen frames=96 overlap=0.175803 top1=0.090625
+regression shared_KL frames=96 overlap=0.192629 top1=0.102083
+regression low_rank frames=96 overlap=0.201875 top1=0.109375
+eval_greedy frozen frames=160 overlap=0.166774 top1=0.076875
+eval_greedy shared_KL frames=160 overlap=0.181689 top1=0.093750
+eval_greedy low_rank frames=160 overlap=0.184422 top1=0.092500
+rank=32
+train frozen frames=320 overlap=0.174701 top1=0.087813
+train shared_KL frames=320 overlap=0.193077 top1=0.105313
+train low_rank frames=320 overlap=0.241964 top1=0.133125
+eval_sampled frozen frames=160 overlap=0.179348 top1=0.098125
+eval_sampled shared_KL frames=160 overlap=0.196232 top1=0.109375
+eval_sampled low_rank frames=160 overlap=0.213926 top1=0.121250
+regression frozen frames=96 overlap=0.175803 top1=0.090625
+regression shared_KL frames=96 overlap=0.192629 top1=0.102083
+regression low_rank frames=96 overlap=0.213713 top1=0.104167
+eval_greedy frozen frames=160 overlap=0.166774 top1=0.076875
+eval_greedy shared_KL frames=160 overlap=0.181689 top1=0.093750
+eval_greedy low_rank frames=160 overlap=0.198855 top1=0.108125
+rank=64
+train frozen frames=320 overlap=0.174701 top1=0.087813
+train shared_KL frames=320 overlap=0.193077 top1=0.105313
+train low_rank frames=320 overlap=0.279296 top1=0.164375
+eval_sampled frozen frames=160 overlap=0.179348 top1=0.098125
+eval_sampled shared_KL frames=160 overlap=0.196232 top1=0.109375
+eval_sampled low_rank frames=160 overlap=0.215298 top1=0.117500
+regression frozen frames=96 overlap=0.175803 top1=0.090625
+regression shared_KL frames=96 overlap=0.192629 top1=0.102083
+regression low_rank frames=96 overlap=0.212041 top1=0.112500
+eval_greedy frozen frames=160 overlap=0.166774 top1=0.076875
+eval_greedy shared_KL frames=160 overlap=0.181689 top1=0.093750
+eval_greedy low_rank frames=160 overlap=0.202270 top1=0.108750

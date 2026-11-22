@@ -1,0 +1,1 @@
+Refitted correction.bin is byte-identical. Host forced logits agree with offline correction within 0.000005723 and argmax agrees everywhere.

@@ -1,0 +1,81 @@
+diff --git a/tools/mtmd/models/models.h b/tools/mtmd/models/models.h
+index 2c0426a2f..4867c8a64 100644
+--- a/tools/mtmd/models/models.h
++++ b/tools/mtmd/models/models.h
+@@ -427,7 +427,7 @@ struct mtmd_graph_qwen3tts_gen : mtmd_graph {
+                 ggml_tensor * inp_pos,
+                 ggml_tensor *& k_acc,
+                 ggml_tensor *& v_acc,
+-                int il) const;
++                int il, ggml_tensor * mask = nullptr) const;
+ 
+         void prefill(
+                 std::vector<ggml_tensor *> & k_cache,
+diff --git a/tools/mtmd/models/qwen3tts-gen.cpp b/tools/mtmd/models/qwen3tts-gen.cpp
+index 829fbb7b8..d883bee32 100644
+--- a/tools/mtmd/models/qwen3tts-gen.cpp
++++ b/tools/mtmd/models/qwen3tts-gen.cpp
+@@ -123,7 +123,8 @@ ggml_tensor * mtmd_graph_qwen3tts_gen::code_gen::layer_forward(
+         ggml_tensor * inp_pos,
+         ggml_tensor *& k_acc,
+         ggml_tensor *& v_acc,
+-        int il) const {
++        int il, ggml_tensor * mask) const {
++    const int64_t n_pos = cur->ne[1];
+     const int     n_head    = hparams.n_head;
+     const int     n_head_kv = hparams.n_head_kv;
+     const int64_t d_head    = layer.q_w->ne[1] / n_head; // real head_dim, not n_embd / n_head
+@@ -138,8 +139,8 @@ ggml_tensor * mtmd_graph_qwen3tts_gen::code_gen::layer_forward(
+     ggml_tensor * k = ggml_mul_mat(ctx0, layer.k_w, h);
+     ggml_tensor * v = ggml_mul_mat(ctx0, layer.v_w, h);
+ 
+-    q = ggml_reshape_3d(ctx0, q, d_head, n_head, 1);
+-    k = ggml_reshape_3d(ctx0, k, d_head, n_head_kv, 1);
++    q = ggml_reshape_3d(ctx0, q, d_head, n_head, n_pos);
++    k = ggml_reshape_3d(ctx0, k, d_head, n_head_kv, n_pos);
+ 
+     q = ggml_rms_norm(ctx0, q, hparams.eps);
+     q = ggml_mul(ctx0, q, layer.q_norm);
+@@ -151,17 +152,17 @@ ggml_tensor * mtmd_graph_qwen3tts_gen::code_gen::layer_forward(
+     k = ggml_rope_ext(ctx0, k, inp_pos, nullptr, (int) d_head, GGML_ROPE_TYPE_NEOX, 0,
+                       hparams.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+ 
+-    ggml_tensor * k_flat = ggml_reshape_2d(ctx0, k, d_head * n_head_kv, 1);
+-    ggml_tensor * v_flat = ggml_reshape_2d(ctx0, v, d_head * n_head_kv, 1);
++    ggml_tensor * k_flat = ggml_reshape_2d(ctx0, k, d_head * n_head_kv, n_pos);
++    ggml_tensor * v_flat = ggml_reshape_2d(ctx0, v, d_head * n_head_kv, n_pos);
+     k_acc = k_acc ? ggml_concat(ctx0, k_acc, k_flat, 1) : k_flat;
+     v_acc = v_acc ? ggml_concat(ctx0, v_acc, v_flat, 1) : v_flat;
+ 
+     const int64_t n_kv = k_acc->ne[1];
+-    ggml_tensor * q_cur = ggml_reshape_4d(ctx0, q, d_head, n_head, 1, 1);
++    ggml_tensor * q_cur = ggml_reshape_4d(ctx0, q, d_head, n_head, n_pos, 1);
+     ggml_tensor * k_cur = ggml_reshape_4d(ctx0, k_acc, d_head, n_head_kv, n_kv, 1);
+     ggml_tensor * v_cur = ggml_reshape_4d(ctx0, v_acc, d_head, n_head_kv, n_kv, 1);
+ 
+-    ggml_tensor * attn_out = build_attn(layer.o_w, layer.o_b, q_cur, k_cur, v_cur, nullptr, kq_scale, il);
++    ggml_tensor * attn_out = build_attn(layer.o_w, layer.o_b, q_cur, k_cur, v_cur, mask, kq_scale, il);
+ 
+     cur = ggml_add(ctx0, residual, attn_out);
+ 
+diff --git a/tools/mtmd/mtmd-subcontext.cpp b/tools/mtmd/mtmd-subcontext.cpp
+index 655b7b294..fc5b20eec 100644
+--- a/tools/mtmd/mtmd-subcontext.cpp
++++ b/tools/mtmd/mtmd-subcontext.cpp
+@@ -2637,6 +2637,16 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
+             auto & out_codes = *params->out_codes;
+             out_codes.resize(ggml_nelements(codes));
+             ggml_backend_tensor_get(codes, out_codes.data(), 0, ggml_nbytes(codes));
++            if (model.proj_type == PROJECTOR_TYPE_QWEN3TTS_GEN) {
++                if (const char * path = getenv("TTS_SPEC_CAPTURE")) {
++                    const auto & hidden = imgs.entries[0].get_ro_buf();
++                    FILE * file = fopen(path, "ab");
++                    GGML_ASSERT(file != nullptr);
++                    GGML_ASSERT(fwrite(hidden.data(), sizeof(float), hidden.size(), file) == hidden.size());
++                    GGML_ASSERT(fwrite(out_codes.data(), sizeof(int32_t), out_codes.size(), file) == out_codes.size());
++                    GGML_ASSERT(fclose(file) == 0);
++                }
++            }
+         }
+     }
+     if (params->out_feats != nullptr) {

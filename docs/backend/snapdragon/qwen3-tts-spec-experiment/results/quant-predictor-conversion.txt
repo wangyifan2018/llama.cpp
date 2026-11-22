@@ -1,0 +1,4 @@
+down-f16 verified modified=5 all_other_tensors_byte_equal=true modified_bytes_before=62914560 modified_bytes_after=31457280 file_bytes=589381440
+down-q8 verified modified=5 all_other_tensors_byte_equal=true modified_bytes_before=62914560 modified_bytes_after=16711680 file_bytes=574635840
+all-q8 verified modified=35 all_other_tensors_byte_equal=true modified_bytes_before=188743680 modified_bytes_after=83558400 file_bytes=515653440
+keep-down-q8 verified modified=30 all_other_tensors_byte_equal=true modified_bytes_before=125829120 modified_bytes_after=66846720 file_bytes=561856320

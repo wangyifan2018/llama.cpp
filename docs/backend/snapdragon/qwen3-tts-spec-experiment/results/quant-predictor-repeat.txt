@@ -1,0 +1,2 @@
+all-q8 verified modified=35 all_other_tensors_byte_equal=true modified_bytes_before=188743680 modified_bytes_after=83558400 file_bytes=515653440
+Repeated all-q8 GGUF is byte-identical.

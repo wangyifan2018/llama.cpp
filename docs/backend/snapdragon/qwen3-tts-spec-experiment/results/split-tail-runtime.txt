@@ -1,0 +1,3 @@
+Mac adjusted max absolute logit delta 5.2452087e-06
+Mac AR9 max absolute late logit delta 3.33786e-06
+Repeated second adapter and summary are byte-identical.

@@ -115,6 +115,26 @@ ggml_tensor * mtmd_graph_qwen3tts_gen::code_gen::project_in(ggml_tensor * cur) c
     return cur;
 }
 
+// TTS_DRAFT_STATS: free-draft probe for speculative decoding. at the position that produced
+// code p, apply head[p-1+t] to the same hidden state (all heads read the same residual stream) and
+// record its argmax -- a proposal for code p+t at the cost of one GEMV. the host compares the
+// proposals against the codes this frame actually produced.
+ggml_tensor * mtmd_graph_qwen3tts_gen::code_gen::draft_row(ggml_tensor * cur, int p) const {
+    ggml_tensor * heads = model.gen_code_head_w; // [n_embd, vocab, n_acoustic]
+    const int n_acoustic = (int) heads->ne[2];
+
+    ggml_tensor * row = nullptr;
+    for (int t = 1; t <= 3; t++) {
+        const int g = std::min(p - 1 + t, n_acoustic - 1);
+        ggml_tensor * head_g = ggml_view_2d(ctx0, heads, heads->ne[0], heads->ne[1], heads->nb[1],
+                                           (size_t) g * heads->nb[2]);
+        ggml_tensor * logits = ggml_mul_mat(ctx0, head_g, cur);
+        ggml_tensor * am     = ggml_argmax(ctx0, logits); // i32, [1]
+        row = row ? ggml_concat(ctx0, row, am, 0) : am;
+    }
+    return ggml_reshape_2d(ctx0, row, 3, 1); // [3, 1]
+}
+
 // one transformer layer; k/v are appended to the running prefix, so the attention below sees
 // exactly the valid positions and needs no causal mask
 ggml_tensor * mtmd_graph_qwen3tts_gen::code_gen::layer_forward(
@@ -182,6 +202,7 @@ void mtmd_graph_qwen3tts_gen::code_gen::prefill(
         std::vector<ggml_tensor *> & k_cache,
         std::vector<ggml_tensor *> & v_cache,
         ggml_tensor *& out_code_cache,
+        ggml_tensor *& out_draft,
         ggml_tensor * h_state,
         ggml_tensor * code0_embd,
         ggml_tensor * inp_rand) const {
@@ -210,6 +231,11 @@ void mtmd_graph_qwen3tts_gen::code_gen::prefill(
 
         ggml_tensor * sampled = do_sampling(logits, inp_rand);
         out_code_cache = cache_set(out_code_cache, 1, sampled);
+
+        if (draft_stats) {
+            ggml_tensor * row = draft_row(cur, 1);
+            out_draft = out_draft ? ggml_concat(ctx0, out_draft, row, 1) : row;
+        }
     }
 }
 
@@ -223,6 +249,7 @@ ggml_tensor * mtmd_graph_qwen3tts_gen::code_gen::step(
         std::vector<ggml_tensor *> & k_cache,
         std::vector<ggml_tensor *> & v_cache,
         ggml_tensor * out_code_cache,
+        ggml_tensor *& out_draft,
         ggml_tensor * inp_rand,
         int step_idx) const {
     const int64_t n_acoustic = model.gen_code_head_w->ne[2];
@@ -264,6 +291,11 @@ ggml_tensor * mtmd_graph_qwen3tts_gen::code_gen::step(
 
     ggml_tensor * sampled = do_sampling(logits, inp_rand);
     cb(sampled, "step_sampled", step_idx);
+
+    if (draft_stats) {
+        ggml_tensor * row = draft_row(cur, pos);
+        out_draft = out_draft ? ggml_concat(ctx0, out_draft, row, 1) : row;
+    }
 
     return cache_set(out_code_cache, pos, sampled);
 }
@@ -730,9 +762,13 @@ ggml_cgraph * mtmd_graph_qwen3tts_gen::build() {
     std::vector<ggml_tensor *> k_cache(n_layer, nullptr), v_cache(n_layer, nullptr);
 
     code_gen cg(*this, top_k, top_p);
+    cg.draft_stats = getenv("TTS_DRAFT_STATS") != nullptr;
 
     ggml_tensor * out_code_cache = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_codes);
     out_code_cache = cg.cache_set(out_code_cache, 0, code0);
+
+    // TTS_DRAFT_STATS only: one row per position that sampled a code, 3 free-draft proposals each
+    ggml_tensor * out_draft = nullptr;
 
     ggml_tensor * inp_rand0 = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
     ggml_set_name(inp_rand0, "inp_rand_0");
@@ -766,13 +802,13 @@ ggml_cgraph * mtmd_graph_qwen3tts_gen::build() {
             out_code_cache = cg.cache_set(out_code_cache, g, sampled);
         }
     } else {
-        cg.prefill(k_cache, v_cache, out_code_cache, h_state, code0_embd, inp_rand0);
+        cg.prefill(k_cache, v_cache, out_code_cache, out_draft, h_state, code0_embd, inp_rand0);
 
         for (int g = 1; g < n_acoustic; g++) {
             ggml_tensor * inp_rand = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
             ggml_set_name(inp_rand, ("inp_rand_" + std::to_string(g)).c_str());
             ggml_set_input(inp_rand);
-            out_code_cache = cg.step(k_cache, v_cache, out_code_cache, inp_rand, g);
+            out_code_cache = cg.step(k_cache, v_cache, out_code_cache, out_draft, inp_rand, g);
         }
     }
 
@@ -780,6 +816,12 @@ ggml_cgraph * mtmd_graph_qwen3tts_gen::build() {
     ggml_tensor * out_codes = ggml_cont(ctx0, out_code_cache);
     ggml_set_name(out_codes, "out_codes");
     ggml_set_output(out_codes);
+
+    if (out_draft != nullptr) {
+        out_draft = ggml_cont(ctx0, out_draft); // [3, 16]
+        ggml_set_name(out_draft, "out_draft");
+        ggml_set_output(out_draft);
+    }
 
     // output 2: sum of all 16 codebook embeddings, fed back to the talker for the next frame
     ggml_tensor * out_embd = code0_embd;
@@ -829,6 +871,12 @@ ggml_cgraph * mtmd_graph_qwen3tts_gen::build() {
         outs[0] = out_codes; outs[1] = slot.second;
         ggml_build_forward_select(gf, outs, 2, idx);
     }
+    // the draft probe is a side output; it has to be expanded before the final select, because
+    // the host reads the embedding back as "the last node of the graph"
+    if (idx == 0 && out_draft != nullptr) {
+        ggml_build_forward_expand(gf, out_draft);
+    }
+
     outs[0] = out_embd; outs[1] = out_audio;
     ggml_build_forward_select(gf, outs, 2, idx);
 

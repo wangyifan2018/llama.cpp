@@ -1,0 +1,14 @@
+diagnostic_prompt=en-1234
+frames=12
+predictor_flash_attention=enabled
+top_k=50
+top_p=0.8
+raw_ar_to_flash_replay_depth_positions=180
+raw_ar_to_flash_replay_max_absolute_logit_difference=0.0
+example_softmax_replay_depth_position=frame_8_code15
+example_token_id=845
+actual_sampler_token_rank=20
+actual_sampler_top_p_cutoff_rank=21
+softmax_replay_token_rank=22
+softmax_replay_top_p_cutoff_rank=21
+raw_ar_to_softmax_replay_example_max_absolute_logit_difference=0.027932167053222656

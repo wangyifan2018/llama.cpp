@@ -1,0 +1,11 @@
+Android verified unchanged grouped prefix and exact AR9 logits through code10.
+ar n=30 median_ms=184.851041 min_ms=182.156980 max_ms=197.712448
+base n=30 median_ms=65.738047 min_ms=64.718177 max_ms=68.005313
+split-raw n=30 median_ms=92.101094 min_ms=90.754688 max_ms=105.216979
+split-fit n=30 median_ms=92.325443 min_ms=91.467656 max_ms=100.565208
+ar9 n=30 median_ms=125.824870 min_ms=122.877969 max_ms=146.170624
+ar vs_ar=1.000000x
+base vs_ar=2.811934x
+split-raw vs_ar=2.007045x
+split-fit vs_ar=2.002168x
+ar9 vs_ar=1.469114x

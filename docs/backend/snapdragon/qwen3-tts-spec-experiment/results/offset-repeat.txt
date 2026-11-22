@@ -1,0 +1,1 @@
+Repeat summary, per-frame CSV and all six NumPy arrays are byte-identical.
