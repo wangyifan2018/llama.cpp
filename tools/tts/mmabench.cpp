@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <string>
 
 static const int N_EMBD  = 1024;
 static const int N_FF    = 3072;
@@ -128,10 +129,12 @@ static int run_equiv(ggml_backend_t backend, int steps) {
 }
 int main(int argc, char ** argv) {
     int n_threads = 4, steps = N_BOOK, reps = 8;
+    std::string device = "CPU";
     bool equiv = false;
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "-t")) n_threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--equiv")) equiv = true;
+        else if (!strcmp(argv[i], "-dev")) device = argv[++i];
         else if (!strcmp(argv[i], "-s")) steps     = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-r")) reps      = atoi(argv[++i]);
         else { printf("usage: %s [-t threads] [-s steps] [-r reps]\n", argv[0]); return 1; }
@@ -141,8 +144,24 @@ int main(int argc, char ** argv) {
                              + 3 * (size_t) N_FF * N_EMBD;
     const size_t w_bytes = (size_t) N_LAYER * bytes_layer + (size_t) N_HEAD * N_EMBD;
 
-    ggml_backend_t backend = ggml_backend_cpu_init();
-    ggml_backend_cpu_set_n_threads(backend, n_threads);
+    ggml_backend_load_all();   // picks up dynamic backends, e.g. ggml-hexagon on a device
+
+    ggml_backend_t backend = nullptr;
+    if (device == "CPU") {
+        backend = ggml_backend_cpu_init();
+        ggml_backend_cpu_set_n_threads(backend, n_threads);
+    } else {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_name(device.c_str());
+        if (dev == nullptr) {
+            fprintf(stderr, "unknown device %s\n", device.c_str());
+            return 1;
+        }
+        backend = ggml_backend_dev_init(dev, nullptr);
+        if (backend == nullptr) {
+            fprintf(stderr, "failed to init %s\n", device.c_str());
+            return 1;
+        }
+    }
 
     if (equiv) { const int rc = run_equiv(backend, steps); ggml_backend_free(backend); return rc; }
 
